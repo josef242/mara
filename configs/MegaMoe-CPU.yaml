@@ -1,0 +1,143 @@
+# 
+run_name: MegaMoe-CPU
+
+# Training settings
+ga_schedule:
+  - [0, 125_000]
+  - [2_000, 250_000]
+  - [4_000, 500_000]
+  - [5_000, 750_000]
+  - [6_000, 1_000_000]
+  - [10_000, 1_500_000]
+  - [12_000, 2_000_000]
+  - [14_000, 3_000_000]
+  - [16_000, 4_000_000]
+
+B: 4                          # Batch size per GPU
+T: 4096                       # Context size (sequence length)
+max_steps: 200_000            # Maximum number of training steps
+eval_iters: 2                 # Number of iterations for evaluation x ranks
+val_step: 100                 # Validation step frequency in steps
+save_step: 250                # Checkpoint saving frequency in steps
+
+# Data type settings
+data_type: bf16
+FSDP_param_dtype: bf16
+FSDP_reduce_dtype: bf16
+FSDP_buffer_dtype: bf16
+
+cpu_offload: true           # Whether to offload parameters to CPU when not in use (saves GPU memory at the cost of speed))
+
+# Resume training settings
+resume_training: false
+resume_step: 0
+resume_data_reset: continue         # Modes are: continue (no reset), soft (reset pct window - change in pct), hard (reset all)
+
+# Gradient clipping
+clip_warmup: 1.0
+clip_standard: 1.0                # for bf16 1.0 is recommended instead of the old 0.3-0.7
+
+# Tokenizer settings
+tok_kind: tiktoken
+tok_path: cl100k_base
+special_tokens: ../../notebooks/datasets/tokenized/cl100k/tokenizer_config.json  # Optional: add conversation special tokens
+
+# Model architecture
+cfg_layers: 42
+cfg_heads: 32
+cfg_kv_heads: 8                  # NEW SETTING
+cfg_embd: 2048
+cfg_intermediate: null
+multiple_of: 128
+norm_eps: 1.0e-05
+dropout: 0.0
+use_activation_checkpointing: true
+qk_norm_mode: "before_rope"       # None, "before_rope", "after_rope_legacy", "after_rope_fixed"
+tie_word_embeddings: false         # Whether to tie word embeddings - false gives a small boost in quality but increases model size
+rope_theta: 500000.0              # # NEW SETTING: RoPE base frequency (higher = longer context support)
+
+
+# MoE configuration
+moe_enabled: true
+moe_num_experts: 16             # Must be divisible by ep_degree
+moe_top_k: 2                    # Each token routed to 2 experts
+moe_num_shared_experts: 1       # 1 shared expert (always active)
+moe_score_func: sigmoid         # DeepSeek-style sigmoid scoring
+moe_load_balance_coeff: 0.001   # Aux-loss-free load balancing
+moe_n_dense_layers: 3           # First layer stays dense
+moe_n_tail_dense_layers: 3      # Last few layers stay dense to coalesce experts before output
+moe_interleave_step: 1          # Every remaining layer is MoE
+#moe_inner_dim: 2048            # Expert hidden dim (half of cfg_intermediate, divisible by 7)
+moe_inner_dim: 4096             # Expert hidden dim (half of cfg_intermediate, divisible by 7)
+ep_degree: null                 # Expert Parallel: Defaults to world size. Num Experts must be divisible by ep_degree.
+moe_shared_overlap: true        # Optimization for cards with more SMs
+moe_aux_balance_coeff: 0.0001   # DeepSeek-V3-style balance loss (factor * E * sum(f_i * P_i)) that backpropagated through the router, giving it a direct gradient signal to diversify
+moe_bias_before_score: false    # DO NOT USE! expert_bias added to logits before sigmoid, shifting the sigmoid's decision boundary and affecting gradient magnitude
+moe_capacity_factor: 1.25       # Capacity factor for MoE layers (default 0.0, >1.0 allows more tokens per expert but increases memory)
+
+# Compilation settings
+compile_model: true
+compile_mode: default
+
+# Learning rate schedule - Conservative Plateau with adjusted max_lr
+lr_schedule_type: "plateau"       
+max_lr: 3.5e-04                   # Higher max_lr for math only - model won't see this (trained on 3.0e-04 before)
+min_lr: 3.5e-05                   # 10% floor (Moonlight), was 1%                  
+warmup_steps: 1500
+# First plateau - conservative for continuous learning
+decay_to_first_plat_pct: 0.08     # 16k steps to decay (1k to 17k)
+first_plat_lr: 0.8e-04            # Conservative plateau (45% of configured max, 60% of original 3.0e-04)
+first_plat_len_pct: 0.50          # 100k steps at plateau (17k to 117k)
+# Second plateau - fine refinement
+decay_to_second_pct: 0.10         # 20k steps to decay (117k to 137k)
+second_plat_lr: 6.0e-05           # 20% of original 3.0e-04
+second_plat_len_pct: 0.20         # 40k steps at plateau (137k to 177k)
+
+# Optimizer settings
+optimizer_type: normuon_fsdp2
+beta1: 0.9
+beta2: 0.95
+weight_decay: 0.1
+muon_momentum: 0.95
+muon_ns_steps: 5
+normuon_beta2: 0.99               # 0.95 - Aggressive, ~20 step window | 0.99 - Moderate, ~100 step window | 0.999 - Conservative, ~1000 step window
+
+## Optimizer settings
+#optimizer_type: adamc_8bit
+#beta1: 0.9
+#beta2: 0.95
+#weight_decay: 0.1
+
+
+# Data configuration
+data_root_path: ../../notebooks/datasets/tokenized/cl100k/
+groups:
+  - [stories,      [[0, 100]]]           # Curated, fictional stories dataset
+#  - [stories,      [[0, 30.0]]]           # Curated, fictional stories dataset
+#  - [ao3,          [[0, 30.0]]]               # Archive of Our Own (AO3) fanfiction dataset - unfiltered
+#  - [preselect, 13.0]         # https://huggingface.co/datasets/hkust-nlp/PreSelect-100B
+#  #- [code_python, 8.0]       # From: https://huggingface.co/datasets/bigcode/the-stack-dedup
+#  #- [code_c, 8.0]            # From: https://huggingface.co/datasets/bigcode/the-stack-dedup
+#  - [books, 10.0]             # book.jsonl from RedPajama-Data-1T https://huggingface.co/datasets/togethercomputer/RedPajama-Data-1T
+#  - [fineweb-edu,  [[0, 10.0]]]        # https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu
+#  - [eai_stem, 4.0]          # https://huggingface.co/datasets/EssentialAI/eai-taxonomy-stem-w-fm
+#  - [mid_smoltalk, [[0, 3.0]]]        #
+#  #- [finepdfs-edu, 3.0]      # https://huggingface.co/datasets/HuggingFaceFW/finepdfs-edu
+#  #- [code_haskell, 0.0]       # From: https://huggingface.co/datasets/bigcode/the-stack-dedup
+#  #- [eai_med, 0.0]           # https://huggingface.co/datasets/EssentialAI/eai-taxonomy-med-w-fm
+  
+
+# Logging settings
+gen_log_file: gen_log.txt           # Will be saved in nas_root
+train_log_file: train_log.txt       # Will be saved in nas_root
+val_log_file: val_log.txt           # Will be saved in nas_root
+# server_host: localhost            # Will be derived from ddp
+server_port: 8888
+
+
+# Checkpoint Paths
+nas_root: ../ckpt/mara_fsdp2/                                   # Defaults to ./log/ if not specified
+local_checkpoint_root: ~/checkpoints/                           # Defaults to ~/checkpoints/ if not specified
+# nas_path: ./log/4B-T-AC/                                      # Automatically derived from nas_root/run_name - can be overridden
+# resume_checkpoint_path: ./log/4B-T-AC/model_step_008500.pt    # Automatically derived from nas_root/run_name/model_step_resume_step - can be overridden
+# local_checkpoint_dir: ~/checkpoints/4B-T-AC                   # Automatically derived from local_checkpoint_root/run_name - can be overridden

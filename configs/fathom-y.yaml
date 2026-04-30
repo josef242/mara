@@ -1,0 +1,111 @@
+# Configuration for a KEEL-based ultra-deep model
+run_name: fathom-y
+
+# Training settings
+ga_schedule:
+  - [0, 500_000]
+  - [2_000, 1_000_000]
+  - [4_000, 2_000_000]
+  - [8_000, 3_000_000]
+  - [16_000, 4_000_000]
+B: 8                          # Batch size per GPU
+T: 4096                       # Context size (sequence length)
+max_steps: 200_000            # Maximum number of training steps
+eval_iters: 2                 # Number of iterations for evaluation x ranks
+val_step: 100                 # Validation step frequency in steps
+save_step: 250                # Checkpoint saving frequency in steps
+
+# Data type settings
+data_type: bf16
+FSDP_param_dtype: bf16
+FSDP_reduce_dtype: bf16
+FSDP_buffer_dtype: bf16
+
+# Resume training settings
+resume_training: true
+resume_step: 1_000
+resume_data_reset: continue         # Modes are: continue (no reset), soft (reset pct window - change in pct), hard (reset all)
+
+# Gradient clipping
+clip_warmup: 1.0
+clip_standard: 1.0                # for bf16 1.0 is recommended instead of the old 0.3-0.7
+
+# Tokenizer settings
+tok_kind: tiktoken
+tok_path: cl100k_base
+special_tokens: ../../notebooks/datasets/tokenized/cl100k/tokenizer_config.json  # Optional: add conversation special tokens
+
+truncation:
+  enabled: true
+  safe_fraction:   [[0, 1.00], [1000, 0.80]]
+  truncation_prob: [[0, 0.00], [1000, 0.00], [2500, 0.20]]
+  depth_power: 1.1
+  loss_weight: 1.0
+
+# Model architecture
+use_keel: true                    # Enable KEEL ultra-deep architecture
+keel_alpha: null                  # Use default alpha value of layers * 2.0
+cfg_layers: 80
+cfg_heads: 32
+cfg_kv_heads: 32                  # NEW SETTING
+cfg_embd: 2048
+cfg_intermediate: 6144
+multiple_of: 128
+norm_eps: 1.0e-05
+dropout: 0.0
+use_activation_checkpointing: true
+qk_norm_mode: null       # null, "before_rope", "after_rope_legacy", "after_rope_fixed"
+tie_word_embeddings: false         # Whether to tie word embeddings - false gives a small boost in quality but increases model size
+rope_theta: 500000.0              # # NEW SETTING: RoPE base frequency (higher = longer context support)
+
+# Compilation settings
+compile_model: true
+compile_mode: default
+
+# Learning rate schedule - Conservative Plateau with adjusted max_lr
+lr_schedule_type: "plateau"       
+max_lr: 4.5e-03                   
+min_lr: 4.5e-05                   # 1% floor
+warmup_steps: 2000                # Match paper's deep runs
+
+decay_to_first_plat_pct: 0.08     
+first_plat_lr: 0.5e-03            # 
+first_plat_len_pct: 0.50          
+
+decay_to_second_pct: 0.10         
+second_plat_lr: 2.0e-04           # Refinement
+second_plat_len_pct: 0.20
+
+# Optimizer settings
+optimizer_type: normuon_fsdp2
+beta1: 0.9
+beta2: 0.95
+weight_decay: 0.01                 # Note: with KEEL, weight decay should be used carefully, they set it to 0.01 in the paper
+muon_momentum: 0.95
+muon_ns_steps: 5
+normuon_beta2: 0.99               # 0.95 - Aggressive, ~20 step window | 0.99 - Moderate, ~100 step window | 0.999 - Conservative, ~1000 step window
+
+# Data configuration
+data_root_path: ../../notebooks/datasets/tokenized/cl100k/
+groups:
+  - [ao3, 15.0]               # Archive of Our Own (AO3) fanfiction dataset - unfiltered
+  - [preselect, 15.0]         # https://huggingface.co/datasets/hkust-nlp/PreSelect-100B
+  - [stories, 15.0]           # 10% Curated, fictional stories dataset
+  - [books, 15.0]             # book.jsonl from RedPajama-Data-1T https://huggingface.co/datasets/togethercomputer/RedPajama-Data-1T
+  - [fineweb-edu, 8.0]        # https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu
+  - [code_python, 8.0]       # From: https://huggingface.co/datasets/bigcode/the-stack-dedup
+  - [code_c, 8.0]            # From: https://huggingface.co/datasets/bigcode/the-stack-dedup
+  - [finepdfs-edu, 4.0]      # https://huggingface.co/datasets/HuggingFaceFW/finepdfs-edu
+  - [eai_stem, 4.0]          # https://huggingface.co/datasets/EssentialAI/eai-taxonomy-stem-w-fm
+  - [eai_math, 4.0]          # https://huggingface.co/datasets/EssentialAI/eai-taxonomy-math-w-fm
+  - [mid_smoltalk, 4.0]      # https://huggingface.co/datasets/mosaicml/mid_smoltalk_full
+
+# Logging settings
+gen_log_file: gen_log.txt           # Will be saved in nas_root
+train_log_file: train_log.txt       # Will be saved in nas_root
+val_log_file: val_log.txt           # Will be saved in nas_root
+server_port: 8888
+
+# Checkpoint Paths
+nas_root: ../ckpt/mara_fsdp2/                                   # Defaults to ./log/ if not specified
+local_checkpoint_root: ~/checkpoints/                           # Defaults to ~/checkpoints/ if not specified

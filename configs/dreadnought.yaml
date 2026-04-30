@@ -1,0 +1,174 @@
+# Dreadnought-Dense: Deep KEEL dense model — same architecture minus MoE
+run_name: dreadnought
+
+# Training settings
+# ga_schedule:
+#   - [0, 125_000]
+#   - [2_000, 250_000]
+#   - [4_000, 500_000]
+#   - [5_000, 750_000]
+#   - [6_000, 1_000_000]
+#   - [10_000, 1_500_000]
+#   - [12_000, 2_000_000]
+#   - [14_000, 3_000_000]
+#   - [16_000, 4_000_000]
+
+ga_schedule:
+  - [0, 125_000]
+  - [2_000, 250_000]
+  - [4_000, 500_000]
+  - [7_000, 1_000_000]
+  - [10_500, 2_000_000]
+  - [14_500, 3_000_000]
+  - [17_000, 4_000_000]
+
+B: 3
+T: 8192
+max_steps: 200_000
+eval_iters: 2
+val_step: 100
+save_step: 250
+
+# Data type settings
+data_type: bf16
+FSDP_param_dtype: bf16
+FSDP_reduce_dtype: bf16
+FSDP_buffer_dtype: bf16
+reshard_after_forward: true
+
+# Resume training settings
+resume_training: true
+resume_step: 15_250
+resume_data_reset: continue
+
+# Gradient clipping
+clip_warmup: 2.0
+clip_standard: 1.0
+
+# Model architecture — identical to dreadnought MoE minus the MoE
+use_keel: true
+keel_alpha: null                # default: L*2
+cfg_layers: 69
+#cfg_layers: 96
+#cfg_layers: 64
+cfg_heads: 40
+cfg_kv_heads: 20                # GQA 2:1 ratio (matches KEEL paper)
+cfg_embd: 2560
+cfg_intermediate: 7680          # Auto ~2.66x embd if null 
+norm_eps: 1.0e-05
+dropout: 0.0
+use_activation_checkpointing: true
+qk_norm_mode: "before_rope"
+tie_word_embeddings: false      # Untied — expressivity matters at narrow dim
+rope_theta: 500_000.0
+
+# MoE disabled
+moe_enabled: false
+
+# GDN disabled (same as MoE config — reserved for future experiment)
+#gdn_enabled: true
+#gdn_interleave_step: 4
+#n_gdn_heads: 16
+#gdn_head_dim: 128
+#gdn_v_expand: 2.0
+#gdn_short_conv_kernel: 4
+#gdn_mode: chunk
+
+# Compilation settings
+compile_model: true
+compile_mode: default
+
+# Learning rate schedule — Cosine
+# Dense at dim=2048 can likely tolerate higher LR than MoE.
+# KEEL paper used 4.5-9e-3 at dim=1024. Scaling ~inversely with width
+# suggests 2-4.5e-3 at dim=2048. Starting conservative, can bump up.
+lr_schedule_type: "cosine"
+max_lr: 4.0e-04
+min_lr: 4.0e-05
+#warmup_steps: 2500
+warmup_steps: 2000
+
+# Optimizer settings
+optimizer_type: normuon_fsdp2
+beta1: 0.9
+beta2: 0.95
+weight_decay: 0.02                 # Note: with KEEL, weight decay should be used carefully, they set it to 0.01 in the paper
+muon_momentum: 0.95
+muon_ns_steps: 5
+normuon_beta2: 0.99               # 0.95 - Aggressive, ~20 step window | 0.99 - Moderate, ~100 step window | 0.999 - Conservative, ~1000 step window
+muon_adam_state_dtype: fp32
+#muon_adam_state_dtype: mixed      # "fp32"  = standard FP32 Adam states (default)
+                                  # "mixed" = FP16 exp_avg + BF16 exp_avg_sq (recommended 16-bit)
+                                  # "fp16"  = both FP16 (caution: exp_avg_sq may underflow)
+                                  # "bf16"  = both BF16 (safe range, less precision)
+                                  # 16-bit modes use stochastic rounding for BF16 states
+
+# Drop learning rate on output layer
+lr_mods:
+  - [out, [[0, 1.0], [10500, 1.0], [10700, 0.7], [11000, 0.7], [11200, 0.5]]]
+
+weight_decay:
+  - [all, 0.02]
+  - [emb, 0.02]
+  - [out, 0.1]
+
+# Tokenizer settings
+tok_kind: llama
+tok_path: ../tokenizers/llama_tokenizer
+special_tokens: ../../notebooks/datasets/tokenized/llama/tokenizer_config.json  # Optional: add conversation special tokens
+
+data_root_path: ../../notebooks/datasets/tokenized/llama/
+groups:
+ #- [stories,      [[0, 100.0]]]
+  - [stories,      [[0, 21.0], [11000, 21.0], [13000, 15.0], [15000, 15.0], [25000, 19.0]]]
+  - [ao3,          [[0, 21.0], [11000, 21.0], [13000, 15.0], [15000, 15.0], [25000, 19.0]]]
+  - [climb,        [[0, 21.0], [11000, 21.0], [13000, 22.0], [15000, 22.0], [25000, 19.0]]]
+  - [preselect,    [[0, 10.0], [11000, 10.0], [13000, 13.0], [15000, 13.0], [25000, 10.0]]]
+  - [books,        [[0, 10.0], [11000, 10.0], [13000, 13.0], [15000, 13.0], [25000, 15.0]]]
+  - [code_python,  [[0, 8.0], [11000, 8.0], [13000, 8.0]]]
+  - [code_c,       [[0, 8.0], [11000, 8.0], [13000, 8.0]]]
+  - [mid_smoltalk, [[0, 1.0], [11000, 1.0], [13000, 1.0]]]
+  - [edufineweb_1.5TT, [[0, 0.0], [11000, 0.0], [13000, 5.0], [15000, 5.0], [25000, 1.0]]]
+
+# data_root_path: ../../notebooks/datasets/tokenized/llama/
+# groups:
+#  #- [stories,      [[0, 100.0]]]
+#   - [stories,      [[0, 21.0], [11000, 21.0], [13000, 15.0]]]
+#   - [ao3,          [[0, 21.0], [11000, 21.0], [13000, 15.0]]]
+#   - [climb,        [[0, 21.0], [11000, 21.0], [13000, 22.0]]]
+#   - [preselect,    [[0, 10.0], [11000, 10.0], [13000, 13.0]]]
+#   - [books,        [[0, 10.0], [11000, 10.0], [13000, 13.0]]]
+#   - [code_python,  [[0, 8.0], [11000, 8.0], [13000, 8.0]]]
+#   - [code_c,       [[0, 8.0], [11000, 8.0], [13000, 8.0]]]
+#   - [mid_smoltalk, [[0, 1.0], [11000, 1.0], [13000, 1.0]]]
+#   - [edufineweb_1.5TT, [[0, 0.0], [11000, 0.0], [13000, 5.0]]]
+  
+
+# # Tokenizer settings
+# tok_kind: tiktoken
+# tok_path: cl100k_base
+# special_tokens: ../../notebooks/datasets/tokenized/cl100k/tokenizer_config.json
+
+# # Data configuration
+# data_root_path: ../../notebooks/datasets/tokenized/cl100k/
+# groups:
+# #  - [stories,      [[0, 100.0]]]
+#  - [stories,      [[0, 20.0]]]
+#  - [ao3,          [[0, 20.0]]]
+#  - [climb,        [[0, 20.0]]]
+#  - [preselect,    [[0, 10.0]]]
+#  - [books,        [[0, 10.0]]]
+#  - [code_python,  [[0, 8.0]]]
+#  - [code_c,       [[0, 8.0]]]
+#  - [eai_stem,     [[0, 3.0]]]
+#  - [mid_smoltalk, [[0, 1.0]]]
+
+# Logging settings
+gen_log_file: gen_log.txt
+train_log_file: train_log.txt
+val_log_file: val_log.txt
+server_port: 8888
+
+# Checkpoint Paths
+nas_root: ../ckpt/mara_fsdp2/
+local_checkpoint_root: ~/checkpoints/

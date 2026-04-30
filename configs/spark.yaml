@@ -1,0 +1,103 @@
+# Tiny little sparky dude
+run_name: spark
+
+# Training settings
+ga_schedule:
+  - [0, 175_000]
+  - [5_000, 350_000]
+  - [10_000, 700_000]
+  - [15_000, 1_500_000]
+B: 4                          # Batch size per GPU
+T: 4096                       # Context size (sequence length)
+max_steps: 400_000            # Maximum number of training steps
+eval_iters: 2                 # Number of iterations for evaluation x ranks
+val_step: 100                 # Validation step frequency in steps
+save_step: 500                # Checkpoint saving frequency in steps
+
+# Data type settings
+data_type: bf16
+FSDP_param_dtype: bf16
+FSDP_reduce_dtype: bf16
+FSDP_buffer_dtype: bf16
+reshard_after_forward: true
+
+# Resume training settings
+resume_training: true
+resume_step: 21000
+resume_data_reset: continue         # Modes are: continue (no reset), soft (reset pct window - change in pct), hard (reset all)
+
+# Gradient clipping
+clip_warmup: 1.0
+clip_standard: 1.0                # for bf16 1.0 is recommended instead of the old 0.3-0.7
+
+# Tokenizer settings
+tok_kind: llama
+tok_path: ../tokenizers/llama_tokenizer
+special_tokens: ../../notebooks/datasets/tokenized/llama/tokenizer_config.json  # Optional: add conversation special tokens
+
+# Model architecture
+#cfg_layers: 30
+cfg_layers: 25
+cfg_heads: 35
+cfg_kv_heads: 7                    # ratio is 4:1
+
+# cfg_embd and cfg_intermediate MUST be divisible by 7 (world size) for Muon
+cfg_embd: 2240
+cfg_intermediate: 6272   # null for auto calc
+norm_eps: 1.0e-05
+dropout: 0.0
+use_activation_checkpointing: true
+qk_norm_mode: "before_rope"      # None, "before_rope", "after_rope_legacy"
+tie_word_embeddings: true   # default (recommended for memory)
+rope_theta: 500000.0              # # NEW SETTING: RoPE base frequency (higher = longer context support)
+
+# Compilation settings
+compile_model: true
+compile_mode: default
+
+# Learning rate schedule - Conservative Plateau with adjusted max_lr
+lr_schedule_type: "plateau"       
+max_lr: 5.2e-04                   # 
+min_lr: 5.2e-05                   # 10% floor (Moonlight), was 1%                  
+warmup_steps: 1000
+# First plateau - conservative for continuous learning
+decay_to_first_plat_pct: 0.08     # 16k steps to decay (1k to 17k)
+first_plat_lr: 1.8e-04            # Conservative plateau (45% of configured max, 60% of original 3.0e-04)
+first_plat_len_pct: 0.50          # 100k steps at plateau (17k to 117k)
+# Second plateau - fine refinement
+decay_to_second_pct: 0.10         # 20k steps to decay (117k to 137k)
+second_plat_lr: 6.0e-05           # 20% of original 3.0e-04
+second_plat_len_pct: 0.20         # 40k steps at plateau (137k to 177k)
+
+# Optimizer settings
+optimizer_type: normuon_fsdp2
+beta1: 0.9
+beta2: 0.95
+weight_decay: 0.1
+muon_momentum: 0.95
+muon_ns_steps: 5
+normuon_beta2: 0.99               # 0.95 - Aggressive, ~20 step window | 0.99 - Moderate, ~100 step window | 0.999 - Conservative, ~1000 step window
+
+# Data configuration
+data_root_path: ../../notebooks/datasets/tokenized/llama/
+groups:
+  - [stories,        [[0, 70], [20500, 70], [23500, 40]]]
+  - [ao3,            [[0, 30], [20500, 30], [23500, 20]]]
+  - [books,          [[20500, 0], [23500, 20]]]
+  - [preselect,      [[20500, 0], [23500, 10]]]
+  - [edufineweb_10BT, [[20500, 0], [23500, 10]]]
+
+# Logging settings
+gen_log_file: gen_log.txt           # Will be saved in nas_root
+train_log_file: train_log.txt       # Will be saved in nas_root
+val_log_file: val_log.txt           # Will be saved in nas_root
+# server_host: localhost            # Will be derived from ddp
+server_port: 8888
+
+
+# Checkpoint Paths
+nas_root: ../ckpt/mara_fsdp2/                                   # Defaults to ./log/ if not specified
+local_checkpoint_root: ~/checkpoints/                           # Defaults to ~/checkpoints/ if not specified
+# nas_path: ./log/4B-T-AC/                                      # Automatically derived from nas_root/run_name - can be overridden
+# resume_checkpoint_path: ./log/4B-T-AC/model_step_008500.pt    # Automatically derived from nas_root/run_name/model_step_resume_step - can be overridden
+# local_checkpoint_dir: ~/checkpoints/4B-T-AC                   # Automatically derived from local_checkpoint_root/run_name - can be overridden

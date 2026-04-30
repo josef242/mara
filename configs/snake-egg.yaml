@@ -1,0 +1,152 @@
+# Configuration for a KEEL-based ultra-deep model with AdamC optimizer, and adaptive weight decay based on w_rms_target
+run_name: snake-egg   # 🐍🥚
+
+# Training settings
+ga_schedule:
+  - [0, 350_000]
+  - [5_000, 700_000]
+  - [10_000, 1_500_000]
+B: 4                              # Batch size per GPU
+T: 2048                           # Context size (sequence length)
+max_steps: 200_000                # Maximum number of training steps
+eval_iters: 2                     # Number of iterations for evaluation x ranks
+val_step: 100                     # Validation step frequency in steps
+save_step: 500                    # Checkpoint saving frequency in steps
+
+# Data type settings
+data_type: bf16
+FSDP_param_dtype: bf16
+FSDP_reduce_dtype: bf16
+FSDP_buffer_dtype: bf16
+reshard_after_forward: false
+
+# Resume training settings
+resume_training: true
+resume_step: 3_500
+resume_data_reset: continue       # Modes are: continue (no reset), soft (reset pct window - change in pct), hard (reset all)
+
+# Gradient clipping
+clip_warmup: 1.0
+clip_standard: 1.0                # for bf16 1.0 is recommended instead of the old 0.3-0.7
+
+## PTT: Probabilistic Tail Truncation — light gradient injection into early layers
+## Complements backpressure (AWD constrains from above, PTT injects signal from below)
+#truncation:
+#  enabled: true
+#  safe_fraction:   [[0, 1.00], [1500, 0.85]]   # Zone: ~L61-L71 (ramps with warmup)
+#  truncation_prob: [[0, 0.00], [1500, 0.05]]    # 5% of steps — light touch
+#  depth_power: 1.1                                # Near-uniform across zone, slight tail bias
+#  loss_weight: 1.0
+#  bypass_compile: false
+
+# Tokenizer settings
+tok_kind: llama
+tok_path: ../tokenizers/llama_tokenizer
+special_tokens: ../../notebooks/datasets/tokenized/llama/tokenizer_config.json  # Optional: add conversation special tokens
+
+# Model architecture
+use_keel: true                    # Enable KEEL ultra-deep architecture - # smaller alpha makes the output layers grow faster                         
+keel_alpha: null                  # null = layers * 2.0; otherwise, specify a custom alpha value (num_layers * n = alpha)
+cfg_layers: 72
+cfg_heads: 14
+cfg_kv_heads: 14
+cfg_embd: 1344
+cfg_intermediate: 2240
+multiple_of: 128
+norm_eps: 1.0e-05
+dropout: 0.0
+use_activation_checkpointing: true
+qk_norm_mode: "before_rope"       # null, "before_rope", "after_rope_legacy", "after_rope_fixed"
+tie_word_embeddings: false         # Whether to tie word embeddings - false gives a small boost in quality but increases model size
+rope_theta: 500000.0              # # NEW SETTING: RoPE base frequency (higher = longer context support)
+
+# Compilation settings
+compile_model: true
+compile_mode: default
+
+# Learning rate schedule - Conservative Plateau with adjusted max_lr
+lr_schedule_type: "plateau"       
+max_lr: 4.0e-03                   
+min_lr: 4.0e-05                   # 1% floor
+warmup_steps: 2000                # Match paper's deep runs
+
+decay_to_first_plat_pct: 0.08     
+first_plat_lr: 0.5e-03            # 
+first_plat_len_pct: 0.50          
+
+decay_to_second_pct: 0.10         
+second_plat_lr: 2.0e-04           # Refinement
+second_plat_len_pct: 0.20
+
+# Surgical braking — baked in from the start, not emergency surgery
+#lr_mods:
+#  - [emb, [[0, 1.0]]]                          # Adam self-regulates, proven in mf2
+#  - [out, [[0, 1.0], [1500, 0.5]]]             # Ramp brake at peak LR, gentler than 0.3 since alpha helps now
+#  - [71, 71, all, [[0, 1.0], [1500, 0.7]]]     # Terminal layer brake at peak LR
+
+# Optimizer settings
+optimizer_type: adamc
+beta1: 0.9
+beta2: 0.95
+# Scheduled weight decay
+weight_decay:
+  - [all, [[0, 0.05]]]
+  - [out, [[0, 0.05]]]
+  - [emb, [[0, 0.05]]]
+
+adaptive_wd:
+  enabled: true
+  check_interval: 50
+  groups:
+    - target: [54, 71]
+      sublayer: all
+      metric: w_rms_target
+      target_value: 0.3
+      min_wd_multiplier: 0.2
+      max_wd_multiplier: 14.0
+      kp: 90.0                       # High P: react immediately when w_rms crosses target
+      ki: 50.0                        # High I: eliminate steady-state offset fast
+      kd: 0.0                        # No D: w_rms is slow-moving, braking is counterproductive
+      pid_smoothing: 0.0             # No smoothing: w_rms is stable, react to raw signal
+
+    - target: out
+      metric: w_rms_target
+      target_value: 0.3
+      min_wd_multiplier: 0.2
+      max_wd_multiplier: 14.0
+      kp: 90.0
+      ki: 50.0
+      kd: 0.0
+      pid_smoothing: 0.0
+
+    - target: emb
+      metric: w_rms_target
+      target_value: 0.3
+      min_wd_multiplier: 0.2
+      max_wd_multiplier: 14.0
+      kp: 90.0                       # Slightly gentler — embeddings are discrete/shared
+      ki: 50.0
+      kd: 0.0
+      pid_smoothing: 0.0
+
+data_root_path: ../../notebooks/datasets/tokenized/llama/
+groups:
+  - [stories, 23.0]               #
+  - [ao3, 22.0]                   #
+  - [books, 22.0]                 #
+  - [edufineweb_10BT, 15.0]       #
+  - [preselect, 10.0]             #
+  - [mid_smoltalk, 8.0]           #
+# - [mid_mmlu, 1.0]               #
+# - [mid_words, 0.0]              # Danger will robinson!
+
+# Logging settings
+gen_log_file: gen_log.txt         # Will be saved in nas_root
+train_log_file: train_log.txt     # Will be saved in nas_root
+val_log_file: val_log.txt         # Will be saved in nas_root
+# server_host: localhost          # Will be derived from ddp
+server_port: 8888
+
+# Checkpoint Paths
+nas_root: ../ckpt/mara_fsdp2/                                   # Defaults to ./log/ if not specified
+local_checkpoint_root: ~/checkpoints/                           # Defaults to ~/checkpoints/ if not specified

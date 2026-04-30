@@ -1,0 +1,111 @@
+# MoE + KEEL + NorMuon optimizer
+run_name: keel-moe-normuon
+
+# Training settings
+ga_schedule:
+  - [0, 100_000]
+  - [5_000, 500_000]
+  - [10_000, 500_000]
+  - [20_000, 1_000_000]
+B: 4                          # Reduced from 4 for MoE memory
+T: 2048                       # Reduced from 4096 for MoE memory
+max_steps: 200_000                # Quick functional test
+eval_iters: 2                 # Number of iterations for evaluation x ranks
+val_step: 100                  # Frequent validation to verify loss decreases
+save_step: 500                # One checkpoint mid-run
+
+# Data type settings
+data_type: bf16
+FSDP_param_dtype: bf16
+FSDP_reduce_dtype: bf16
+FSDP_buffer_dtype: bf16
+reshard_after_forward: true
+
+# Resume training settings
+resume_training: false
+resume_step: 0
+resume_data_reset: continue
+
+# Gradient clipping
+clip_warmup: 1.0
+clip_standard: 1.0
+
+# Tokenizer settings
+tok_kind: llama
+tok_path: ../tokenizers/llama_tokenizer
+special_tokens: ../../notebooks/datasets/tokenized/llama/tokenizer_config.json
+
+# Model architecture — 12 layers, dim=2240 (divisible by 7)
+use_keel: true
+keel_alpha: null                     #
+cfg_layers: 42
+cfg_heads: 24
+cfg_kv_heads: 6               # GQA heads
+cfg_embd: 1536                # Must be divisible by 7 (world size) for Muon
+cfg_intermediate: 4608         # Dense layer FFN hidden dim (divisible by 7)
+norm_eps: 1.0e-05
+dropout: 0.0
+use_activation_checkpointing: true
+qk_norm_mode: "before_rope"
+tie_word_embeddings: true
+rope_theta: 50_000.0
+
+# MoE configuration — EP=7 (one expert per GPU)
+moe_enabled: true
+moe_num_experts: 7             # Must be divisible by ep_degree
+moe_top_k: 2                  # Each token routed to 2 experts
+moe_num_shared_experts: 1      # 1 shared expert (always active)
+moe_score_func: sigmoid        # DeepSeek-style sigmoid scoring
+moe_load_balance_coeff: 0.001  # Aux-loss-free load balancing
+moe_n_dense_layers: 3          # First layers stays dense
+moe_n_tail_dense_layers: 2     # Last layer stays dense
+moe_interleave_step: 1         # Every remaining layer is MoE
+moe_inner_dim: 768            # Expert hidden dim (half of cfg_intermediate, divisible by 7)
+ep_degree: null                # Expert Parallel: Defaults to world size. Num Experts must be divisible by ep_degree.
+moe_shared_overlap: false      # Optimization for cards with more SMs
+moe_aux_balance_coeff: 0.0001   # DeepSeek-V3-style balance loss (factor * E * sum(f_i * P_i)) that backpropagated through the router, giving it a direct gradient signal to diversify
+moe_bias_before_score: false    # DO NOT USE! expert_bias added to logits before sigmoid, shifting the sigmoid's decision boundary and affecting gradient magnitude
+moe_capacity_factor: 1.5       # Capacity factor for MoE layers (default 0.0, >1.0 allows more tokens per expert but increases memory)
+
+# Compilation settings — per-submodule compile (experts skipped, rest compiled)
+compile_model: true
+compile_mode: default
+
+# Learning rate schedule — simplified for short test
+lr_schedule_type: "cosine"
+max_lr: 3.5e-04
+min_lr: 3.5e-05
+warmup_steps: 1000
+
+# Optimizer settings
+optimizer_type: normuon_fsdp2
+beta1: 0.9
+beta2: 0.95
+weight_decay: 0.01
+muon_momentum: 0.95
+muon_ns_steps: 5
+normuon_beta2: 0.99
+
+# === OPTIMIZER ===
+# Paper S5.3: "AdamW with beta1=0.9, beta2=0.95, weight decay 0.01"
+#optimizer_type: adamw               # CHANGED: was adamc_8bit
+#beta1: 0.9
+#beta2: 0.95
+#weight_decay: 0.01  # Paper S5.3: "weight decay of 0.01" — uniform, constant
+
+# Data configuration
+data_root_path: ../../notebooks/datasets/tokenized/llama/
+groups:
+#  - [stories,        [[0, 100]]]
+  - [stories,        [[0, 50]]]
+  - [ao3,            [[0, 50]]]
+
+# Logging settings
+gen_log_file: gen_log.txt
+train_log_file: train_log.txt
+val_log_file: val_log.txt
+server_port: 8888
+
+# Checkpoint Paths
+nas_root: ../ckpt/mara_fsdp2/
+local_checkpoint_root: ~/checkpoints/

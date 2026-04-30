@@ -1,0 +1,269 @@
+# ============================================================================
+# Optimizer Reference — valid optimizer_type values and their parameters
+# ============================================================================
+# Copy the relevant section into your config file.
+#
+# SHARED PARAMETERS (all optimizer types):
+#   beta1, beta2, max_lr, min_lr
+#
+#   weight_decay: 0.1              # Scalar form: same value for all non-norm params
+#   weight_decay:                  # Rules form: per-target, last rule wins
+#     - [all, 0.01]               #   all transformer layers (not emb/out)
+#     - [emb, 0.1]                #   tok_embeddings (scalar)
+#     - [out, [[0, 0.01], [2500, 0.1]]]   #   output projection (scheduled)
+#     - [0, 0, [[0, 0.01], [2500, 0.05]]] #   layer 0 (scheduled)
+#     - [1, 79, 0.01]             #   layers 1-79 (scalar)
+#   # Norms and biases always get weight_decay=0.0 (hardcoded, not configurable)
+#   # Rules use _wd attribute on params — supports per-layer WD with MuonFSDP2
+#
+# ----------------------------------------------------------------------------
+# ADAM FAMILY
+# ----------------------------------------------------------------------------
+#
+# optimizer_type: adamw              # Standard fused AdamW (32-bit)
+# optimizer_type: adamw_8bit         # TorchAO 8-bit AdamW (saves ~60% optimizer memory)
+# optimizer_type: adamw_16bit        # 16-bit AdamW — FP16/BF16 states (saves ~50% optimizer memory)
+# optimizer_type: adamc              # AdamC — corrected weight decay for normalized layers
+# optimizer_type: adamc_8bit         # AdamC + TorchAO 8-bit (recommended for Adam runs)
+# optimizer_type: adamc_16bit        # AdamC + 16-bit states — for deep models where 8-bit corrupts
+#
+# Adam-only parameters:
+#   cautious_weight_decay: false     # Cautious weight decay (do NOT combine with Muon)
+#
+# 16-bit state dtype (adamw_16bit, adamc_16bit only):
+#   adam16bit_state_dtype: mixed      # "mixed" = FP16 exp_avg + BF16 exp_avg_sq (recommended)
+#                                     # "fp16"  = both FP16 (caution: exp_avg_sq may underflow)
+#                                     # "bf16"  = both BF16 (safe range, less mantissa precision)
+#
+# ----------------------------------------------------------------------------
+# FSDP2-NATIVE MUON FAMILY (samsja implementation)
+# ----------------------------------------------------------------------------
+#
+# optimizer_type: muon_fsdp2         # Muon with Newton-Schulz orthogonalization
+# optimizer_type: normuon_fsdp2      # NorMuon — Muon + neuron-wise normalization (recommended)
+# optimizer_type: muonsphere_fsdp2   # MuonSphere — spectral sphere retraction
+# optimizer_type: normuon_sphere_fsdp2  # NorMuon + MuonSphere combined
+#
+# Muon parameters:
+#   muon_momentum: 0.95              # Momentum for Muon params
+#   muon_ns_steps: 5                 # Newton-Schulz iterations (5=accurate, 3=faster)
+#
+# NorMuon-specific (normuon_fsdp2, normuon_sphere_fsdp2):
+#   normuon_beta2: 0.99              # 0.95=aggressive ~20 steps | 0.99=moderate ~100 | 0.999=conservative ~1000
+#
+# MuonSphere-specific (muonsphere_fsdp2, normuon_sphere_fsdp2):
+#   muonsphere_radius_scale: 2.0     # Spectral radius scale (c)
+#   muonsphere_power_iters: 10       # Power iterations for spectral norm
+#
+# Adam state precision (for non-Muon params: embeddings, output, experts, norms):
+#   muon_adam_state_dtype: fp32       # "fp32"  = standard FP32 Adam states (default)
+#                                     # "mixed" = FP16 exp_avg + BF16 exp_avg_sq (recommended 16-bit)
+#                                     # "fp16"  = both FP16 (caution: exp_avg_sq may underflow)
+#                                     # "bf16"  = both BF16 (safe range, less precision)
+#                                     # 16-bit modes use stochastic rounding for BF16 states
+#
+# ----------------------------------------------------------------------------
+# MICROSOFT DION FAMILY (distributed optimizers)
+# ----------------------------------------------------------------------------
+#
+# optimizer_type: muon_dion          # DION Muon (auto-scales LR)
+# optimizer_type: normuon_dion       # DION NorMuon
+# optimizer_type: dion2              # DION2 (error-feedback compression)
+#
+# DION parameters:
+#   muon_momentum: 0.95              # Momentum (muon_dion, normuon_dion only)
+#   dion_kwargs:                     # Extra kwargs passed to DION constructor
+#     nesterov: true                 #   (see DION docs for full list)
+#
+# Dion2-specific:
+#   dion2_fraction: 0.25             # Fraction of params for error feedback
+#   dion2_ef_decay: 0.95             # Error feedback decay rate
+#
+# ----------------------------------------------------------------------------
+# ADAFACTOR
+# ----------------------------------------------------------------------------
+#
+# optimizer_type: adafactor          # Memory-efficient, FSDP2-compatible
+#
+# Adafactor parameters:
+#   adafactor_beta2: null            # null = auto (1 - step^-0.8), or set manually
+#
+# ----------------------------------------------------------------------------
+# PER-LAYER LR MODIFIERS (lr_mods)
+# ----------------------------------------------------------------------------
+#
+# Fine-tune learning rate per layer, attention vs FFN, embeddings, and output projection.
+# Values are direct multipliers: 1.0 = normal, 0.99 = 1% slower, 0.95 = 5% slower.
+# Schedule uses linear interpolation between steps, holds last value after.
+#
+# Supported optimizers:
+#   FSDP2 Muon family: full support (emb, out, attn, ffn, all)
+#   Adam family:       emb, out, and all only (attn/ffn differentiation unsupported)
+#   DION family:       unsupported (warning logged)
+#
+# lr_mods:
+#   # Special params: [name, schedule]
+#   - [emb, [[0, 1.0], [5000, 0.99]]]         # Slow down embeddings over time
+#   - [out, [[0, 1.0], [5000, 0.95]]]         # Slow down output projection
+#
+#   # All layers shorthand: [all, type, schedule]  (type = attn | ffn | all)
+#   - [all, all,  [[0, 0.99]]]                 # Scale all layers (attn+ffn, not emb/out)
+#   - [all, attn, [[0, 0.98]]]                 # Scale all attention layers
+#   - [all, ffn,  [[0, 0.95]]]                 # Scale all FFN layers
+#
+#   # Layer ranges: [start, end, type, schedule]
+#   - [0, 69, all,  [[0, 1.0]]]                # All layers at normal speed
+#   - [0, 10, ffn,  [[0, 1.0], [5000, 0.95]]]  # Slow down early FFN layers
+#   - [60, 69, attn, [[0, 0.98]]]              # Slow down deep attention layers
+#
+# Overlap: last matching rule wins (CSS-style override).
+# Norms/biases are always unscaled (1.0).
+#
+# ----------------------------------------------------------------------------
+# ADAPTIVE WEIGHT DECAY (adaptive_wd)
+# ----------------------------------------------------------------------------
+#
+# Monitors per-component gradient norms and dynamically increases weight decay
+# for components with disproportionate gradient energy. Multiplies the base WD
+# (from weight_decay rules or scalar) — never replaces it. Multiplier >= 1.0.
+#
+# Components: emb, out, L{i}.attn, L{i}.ffn
+#
+# Five metric modes:
+#   "g_norm"         — absolute gradient norm (for emb/out, fundamentally different scale)
+#   "ratio"          — g_norm / mean_layer_g_norm (for transformer layers, relative concentration)
+#   "growth_rate"    — w_norm growth / mean_layer_w_norm growth (weight accumulation rate)
+#   "out_emb_growth" — out w_norm growth / emb w_norm growth (out/emb divergence)
+#   "w_rms_target"   — setpoint controller: drives each component toward a target w_rms value
+#
+# growth_rate and out_emb_growth track how fast weight norms are *changing* between
+# check intervals, not absolute values. A growth_rate of 2.0 means that component is
+# accumulating weight twice as fast as the average transformer layer.
+# out_emb_growth compares output head growth directly to embedding growth — captures
+# the out/emb divergence pattern seen in deep KEEL models.
+# First check after init records baseline w_norms; adjustments begin on the second check.
+# If mean layer growth (or emb growth) is zero/negative, that interval is skipped.
+#
+# w_rms_target uses a PID setpoint controller. w_rms = w_norm / sqrt(num_params).
+# Computes multiplier DIRECTLY from error state (not incremental updates):
+#   error = (smoothed_w_rms - target_value) / target_value
+#   mult = 1.0 + kp*error + ki*integral + kd*d_pv
+# P term: immediate proportional response to error
+# I term: accumulated error for steady-state correction (anti-windup clamped)
+# D term: derivative of PV (not error) to brake overshoot without setpoint kick
+# With min_wd_multiplier < 1.0, AWD is bidirectional: it can reduce WD to let
+# underdeveloped layers grow, not just increase WD for overactive ones.
+# PID uses its own lighter EMA (pid_smoothing, default 0.6) for faster response.
+# Changing target_value on resume is safe — D term uses prev_pv, not prev_error.
+#
+# Multiplier adjustment (threshold-based metrics: g_norm, ratio, growth_rate, out_emb_growth):
+#   metric > engage_above → mult *= (1 + aggression * (metric - target))   [increase WD]
+#   metric < ease_below   → mult *= recovery                               [decrease WD]
+#   else                  → recover toward 1.0 (dead zone)
+#
+# adaptive_wd:
+#   enabled: true
+#   check_interval: 50              # Compute gradient norms every N steps
+#   smoothing: 0.9                  # EMA smoothing factor (higher = more smoothing)
+#   groups:
+#     # Output head — typically first to blow up in deep models
+#     - target: out                  # "emb", "out", or [start, end] for layer range
+#       metric: g_norm               # "g_norm", "ratio", "growth_rate", "out_emb_growth", or "w_rms_target"
+#       target_value: 0.5            # Target g_norm value (g_norm mode only)
+#       engage_above: 1.0            # Start increasing WD above this
+#       ease_below: 0.3              # Start decreasing WD below this
+#       min_wd_multiplier: 0.2       # Minimum WD multiplier (default 1.0 = one-way ratchet)
+#       max_wd_multiplier: 5.0       # Maximum WD multiplier (clamp)
+#       aggression: 0.15             # How fast mult grows when engaged
+#       recovery: 0.95               # Mult decay rate when easing
+#
+#     # Embedding — usually well-behaved but worth monitoring
+#     - target: emb
+#       metric: g_norm
+#       target_value: 0.05
+#       engage_above: 0.1
+#       ease_below: 0.02
+#       max_wd_multiplier: 3.0
+#       aggression: 0.05
+#       recovery: 0.98
+#
+#     # Terminal layers — where gradient concentration develops in deep models
+#     - target: [65, 71]             # Layer range (inclusive)
+#       sublayer: all                # "all", "attn", or "ffn"
+#       metric: ratio                # Relative to mean layer g_norm
+#       target_ratio: 8.0            # Target ratio value (ratio mode only)
+#       engage_above: 10.0           # Start increasing WD above this ratio
+#       ease_below: 5.0              # Start easing below this ratio
+#       max_wd_multiplier: 10.0
+#       aggression: 0.1
+#       recovery: 0.95
+#
+#     # Output/emb divergence — out growing faster than emb
+#     - target: out
+#       metric: out_emb_growth         # out w_norm growth / emb w_norm growth
+#       target_ratio: 1.5              # Healthy: out grows ~1.5x emb rate
+#       engage_above: 2.5              # Diverging: out growing >2.5x emb
+#       ease_below: 1.0                # Converging: out growing slower than emb
+#       max_wd_multiplier: 5.0
+#       aggression: 0.1
+#       recovery: 0.95
+#
+#     # Terminal layer weight accumulation
+#     - target: [65, 71]
+#       sublayer: all
+#       metric: growth_rate            # w_norm growth / mean layer growth
+#       target_ratio: 1.5              # Healthy: ~1.5x average growth
+#       engage_above: 2.5              # Accumulating >2.5x average
+#       ease_below: 1.0                # Below average growth
+#       max_wd_multiplier: 10.0
+#       aggression: 0.1
+#       recovery: 0.95
+#
+#     # w_rms PID setpoint — drive all layers toward target w_rms
+#     # Tuning validated via closed-loop plant simulation against real training
+#     # diagnostics.  Key insight: normalized error is small (e.g. 0.67 when
+#     # w_rms is 1.5× target), so Kp must be large to generate meaningful
+#     # multiplier force.  High Ki + large integral_max lets the controller
+#     # reach the steady-state multiplier needed.  pid_smoothing=0 avoids the
+#     # control lag that was the #1 failure mode of the old incremental
+#     # controller.  Kd≈0 is optimal — w_rms dynamics are too slow for
+#     # derivative action to help.
+#     - target: [0, 71]
+#       sublayer: all
+#       metric: w_rms_target
+#       target_value: 0.40              # Desired w_rms value
+#       min_wd_multiplier: 0.2          # Can reduce WD to 20% of base
+#       max_wd_multiplier: 14.0         # High ceiling — let PID use full authority
+#       kp: 90.0                        # High P: immediate strong response to error
+#       ki: 50.0                        # High I: fast steady-state correction
+#       kd: 0.0                         # No D: braking is counterproductive for slow signal
+#       integral_max: 50.0              # Anti-windup clamp for I term
+#       pid_smoothing: 0.0              # No smoothing: react to raw w_rms signal
+#
+#     # w_rms PID setpoint — output head
+#     - target: out
+#       metric: w_rms_target
+#       target_value: 0.40
+#       min_wd_multiplier: 0.2
+#       max_wd_multiplier: 14.0
+#       kp: 90.0
+#       ki: 50.0
+#       kd: 0.0
+#       pid_smoothing: 0.0
+#
+#     # w_rms PID setpoint — embeddings
+#     - target: emb
+#       metric: w_rms_target
+#       target_value: 0.40
+#       min_wd_multiplier: 0.2
+#       max_wd_multiplier: 14.0
+#       kp: 90.0
+#       ki: 50.0
+#       kd: 0.0
+#       pid_smoothing: 0.0
+#
+# State is checkpointed (EMA values, multipliers, prev w_norms, PID state) and
+# restored on resume. Changing target_value on resume is safe (D term uses prev_pv).
+# AWD is skipped on truncated steps (no gradients to measure).
+#
+# ============================================================================

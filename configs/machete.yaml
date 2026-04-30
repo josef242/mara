@@ -1,0 +1,115 @@
+# MACHETE - Fast-turnaround KEEL calibration run
+# Purpose: Tune emb/output WD and lr_mods before committing to full Fathom-X (200L)
+# Same width as Fathom-X so emb/output dynamics transfer directly
+run_name: machete2
+
+# Training settings
+ga_schedule:
+  - [0, 500_000]
+  - [2_500, 1_000_000]
+  - [5_000, 2_000_000]
+  - [10_000, 3_000_000]
+  - [20_000, 4_000_000]
+B: 14
+T: 4096
+max_steps: 200_000              # Just need 1000-2000 steps to see weight curves flatten
+eval_iters: 2
+val_step: 100
+save_step: 500
+
+# Data type settings
+data_type: bf16
+FSDP_param_dtype: bf16
+FSDP_reduce_dtype: bf16
+FSDP_buffer_dtype: bf16
+reshard_after_forward: false
+
+# Resume training settings
+resume_training: true
+resume_step: 1_000
+resume_data_reset: continue
+
+# Gradient clipping
+clip_warmup: 1.0
+clip_standard: 1.0
+
+# Tokenizer settings
+tok_kind: tiktoken
+tok_path: cl100k_base
+special_tokens: ../../notebooks/datasets/tokenized/cl100k/tokenizer_config.json
+
+# Model architecture - Same width as Fathom-X, just shallower for speed
+use_keel: true
+keel_alpha: null              # Default = layers * 2.0 = 160
+cfg_layers: 80                # 80L vs Fathom-X's 200L — ~2.5x faster steps
+cfg_heads: 18
+cfg_kv_heads: 18
+cfg_embd: 1152                # Same width — emb/output dynamics transfer directly
+cfg_intermediate: 3456        # Same width
+multiple_of: 128
+norm_eps: 1.0e-05
+dropout: 0.0
+use_activation_checkpointing: true
+qk_norm_mode: null
+tie_word_embeddings: false
+rope_theta: 500000.0
+
+# Compilation settings
+compile_model: true
+compile_mode: default
+
+# Learning rate schedule - same as Fathom-X
+lr_schedule_type: "plateau"
+max_lr: 4.5e-03
+min_lr: 4.5e-05
+warmup_steps: 2500
+
+decay_to_first_plat_pct: 0.08
+first_plat_lr: 0.5e-03
+first_plat_len_pct: 0.50
+
+decay_to_second_pct: 0.10
+second_plat_lr: 2.0e-04
+second_plat_len_pct: 0.20
+
+# LR modifiers — surgical braking on the problem children
+lr_mods:
+  - [emb,  [[0, 1.0],[2500, 0.9]]]                        # Full speed, Adam self-regulates
+  - [out, [[0, 1.0],[2500, 0.7]]]                        # Same
+  - [1,79, all, [[0, 1.0], [2500, 0.85]]]     # Full speed during warmup, brake at peak LR
+  - [0,0, all, [[0, 0.90], [2500, 0.85]]]     # Full speed during warmup, brake at peak LR
+
+# Optimizer settings
+optimizer_type: normuon_fsdp2
+beta1: 0.9
+beta2: 0.95
+
+weight_decay: 0.01
+
+muon_momentum: 0.95
+muon_ns_steps: 5
+normuon_beta2: 0.99
+
+# Data configuration — same mix as Fathom-X
+data_root_path: ../../notebooks/datasets/tokenized/cl100k/
+groups:
+  - [ao3, 20.0]
+  - [preselect, 20.0]
+  - [books, 15.0]
+  - [stories, 10.0]
+  - [code_python, 8.0]
+  - [code_c, 8.0]
+  - [eai_stem, 5.0]
+  - [finepdfs-edu, 5.0]
+  - [eai_math, 5.0]
+  - [mid_smoltalk, 4.0]
+
+# Logging settings
+gen_log_file: gen_log.txt
+train_log_file: train_log.txt
+val_log_file: val_log.txt
+server_port: 8888
+
+# Checkpoint Paths
+nas_root: ../ckpt/mara_fsdp2/
+local_checkpoint_root: ~/checkpoints/
