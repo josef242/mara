@@ -756,8 +756,14 @@ def train_loop(
             # model.grad fields are not touched. One extra val batch consumed.
             if diagnostics is not None:
                 try:
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
                     fb_x, fb_y = val_loader.next_batch(step=step)
-                    fb_x, fb_y = fb_x.to(device), fb_y.to(device)
+                    # Slice down: eval branch materializes [B*T, vocab] logits (no CCE
+                    # fusion), which OOMs at full B*T after train+val have saturated memory.
+                    # 1x256 gives ~33M grad_logits elements per rank — plenty for an RMS ratio.
+                    fb_x = fb_x[:1, :256].to(device)
+                    fb_y = fb_y[:1, :256].to(device)
                     with torch.autocast(device_type=device_type,
                                         dtype=torch.bfloat16 if settings.data_type=="bf16"
                                               else torch.float16 if settings.data_type=="fp16"
