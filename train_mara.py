@@ -2428,16 +2428,19 @@ class Settings:
     def to_yaml(self, yaml_path: str):
         """Save current settings to a YAML file.
 
-        Prefers a verbatim copy of the original YAML the instance was loaded
-        from (stashed by `from_yaml`), with a header comment noting the full
-        command line that was executed. Falls back to a raw dump of the
-        effective settings dict for programmatically-constructed instances
-        that have no source file.
+        Writes a verbatim copy of the original source YAML (preserving
+        comments, key order, and formatting), then appends a trailing block
+        of any keys present on the live settings object but absent from the
+        source. That block captures runtime-derived fields (cfg_voc_sz,
+        total_batch_size, restart_steps, ...) and CLI-injected overrides
+        (resume_step, ...) so dashboards and post-hoc analysis always see
+        a complete record of what the run actually used.
+
+        Falls back to a raw dump of the effective settings dict for
+        programmatically-constructed instances that have no source file.
         """
         source_text = getattr(self, '_source_yaml_text', None)
         if source_text is not None:
-            # Verbatim copy + command-line header. Captures all CLI overrides
-            # (--run-name, --resume-step, etc.) in one readable line.
             try:
                 cmdline = shlex.join(sys.argv)
             except (AttributeError, TypeError):
@@ -2448,11 +2451,32 @@ class Settings:
                 f"# Command: {cmdline}\n"
                 f"\n"
             )
+
+            try:
+                source_dict = yaml.safe_load(source_text) or {}
+            except yaml.YAMLError:
+                source_dict = {}
+            derived = {}
+            for key, value in vars(self).items():
+                if key.startswith('_'):
+                    continue
+                if key in source_dict:
+                    continue
+                if key == "groups" and isinstance(value, list):
+                    value = [[g[0], g[1]] if isinstance(g, tuple) else g for g in value]
+                derived[key] = value
+
             with open(yaml_path, 'w') as f:
                 f.write(header)
                 f.write(source_text)
                 if not source_text.endswith("\n"):
                     f.write("\n")
+                if derived:
+                    f.write("\n# --- Derived fields (computed at runtime, not in source config) ---\n")
+                    try:
+                        yaml.dump(derived, f, default_flow_style=False, sort_keys=False)
+                    except yaml.YAMLError as e:
+                        f.write(f"# (failed to dump derived fields: {e})\n")
             return
 
         # Fallback: raw dump of the effective settings (legacy behavior).
