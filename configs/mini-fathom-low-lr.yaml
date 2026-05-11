@@ -14,7 +14,8 @@ ga_schedule:
 #B: 2                          # Batch size per GPU
 #T: 4096                       # Context size (sequence length)
 B: 1                          # Batch size per GPU
-T: 8192                       # Context size (sequence length)
+#T: 8192                       # Context size (sequence length)
+T: 10240                       # Context size (sequence length)
 max_steps: 200_000            # Maximum number of training steps
 eval_iters: 2                 # Number of iterations for evaluation x ranks
 val_step: 100                 # Validation step frequency in steps
@@ -29,7 +30,7 @@ reshard_after_forward: false
 
 # Resume training settings
 resume_training: true
-resume_step: 25_000
+resume_step: 26_500
 resume_data_reset: continue         # Modes are: continue (no reset), soft (reset pct window - change in pct), hard (reset all)
 
 # Gradient clipping
