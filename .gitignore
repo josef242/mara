@@ -28,6 +28,10 @@ env/
 # Claude Code per-user settings (project-shared settings.json should be committed)
 .claude/settings.local.json
 
+# Chat recovery tooling (operator-side, contains private chat history)
+scripts/recover_chat.py
+scripts/last_chat*.txt
+
 # Local training outputs (defensive — these typically live outside the repo)
 *.log
 gen_log.txt
