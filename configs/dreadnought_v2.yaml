@@ -86,6 +86,27 @@ output_lr_batch_adjust:
   base_mult: 0.8
   exponent: 0.3
 
+
+# Auxiliary prediction heads — distribute readout-shaping pressure across the
+# body so no single late block has to do all the abstract -> token-space
+# translation. RMSNorm + Linear at each tap layer; full Muon LR, no
+# output_lr_batch_adjust scaling. Per-head weight is scalar (constant) or a
+# [[step, val], ...] schedule with linear interpolation between waypoints.
+# Layer indices are 0-based; the head taps the output of layers[i].
+# See Rook Nexus messages #92/#93/#94/#96 for design and rationale.
+auxiliary_heads:
+  enabled: true
+  share_lm_head: false
+  heads:
+    - layer: 50
+      weight: [[11000, 0.0], [11700, 0.01], [15200, 0.05]]
+    - layer: 55
+      weight: [[11000, 0.0], [11700, 0.02], [15200, 0.10]]
+    - layer: 60
+      weight: [[11000, 0.0], [11700, 0.04], [15200, 0.20]]
+    - layer: 65
+      weight: [[11000, 0.0], [11700, 0.10], [15200, 0.50]]
+
 # weight_decay:
 #   - [all, 0.02]
 #   - [emb, 0.02]

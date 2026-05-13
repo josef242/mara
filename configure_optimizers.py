@@ -60,8 +60,13 @@ def summarize_optimizer_settings(settings, ddp_world_size, grad_accum, logger, m
     adam_param_count = 0
     if model is not None and optimizer_type in MUON_FAMILY:
         for n, p in model.named_parameters():
-            if '.weight' in n and any(lt in n for lt in ['wq.', 'wk.', 'wv.', 'wo.', 'w1.', 'w2.', 'w3.',
-                                                                'q_proj.', 'k_proj.', 'v_proj.', 'o_proj.', 'g_proj.']):
+            is_muon_eligible = '.weight' in n and any(
+                lt in n for lt in ['wq.', 'wk.', 'wv.', 'wo.', 'w1.', 'w2.', 'w3.',
+                                   'q_proj.', 'k_proj.', 'v_proj.', 'o_proj.', 'g_proj.']
+            )
+            # Aux-head Linear projections also go in the Muon group with full LR.
+            is_aux_head_linear = n.startswith('aux_heads.') and n.endswith('.linear.weight')
+            if is_muon_eligible or is_aux_head_linear:
                 muon_param_count += 1
             else:
                 adam_param_count += 1
@@ -318,6 +323,12 @@ def configure_optimizers(
             lt in name for lt in _muon_patterns
         )
 
+    def is_aux_head_linear(name):
+        """Auxiliary-head readout projection. 2D Linear -> Muon-eligible, but
+        we tag it separately so it can opt out of the main output head's
+        output_lr_batch_adjust scaling and take full Muon LR."""
+        return name.startswith('aux_heads.') and name.endswith('.linear.weight')
+
     def is_no_decay(name):
         """Biases and layer norm weights — no weight decay."""
         return name.endswith("bias") or ("norm" in name.lower() and name.endswith("weight"))
@@ -326,6 +337,8 @@ def configure_optimizers(
         """Classify parameter into weight decay group."""
         if is_no_decay(name):
             return 'norm_bias'
+        if is_aux_head_linear(name):
+            return 'aux_head_muon'
         if is_muon_param(name):
             return 'default'
         if 'tok_embeddings' in name:
@@ -353,7 +366,7 @@ def configure_optimizers(
         muon_params = []
         adam_params = []
         for n, p in model.named_parameters():
-            if is_muon_param(n):
+            if is_muon_param(n) or is_aux_head_linear(n):
                 muon_params.append(p)
             else:
                 adam_params.append(p)
@@ -413,6 +426,11 @@ def configure_optimizers(
                 embed_params.append(p)
             elif group == 'output_head':
                 output_params.append(p)
+            elif group == 'aux_head_muon':
+                # Aux heads share the Muon param group: full Muon LR, no
+                # output_lr_batch_adjust scaling (which is reserved for the
+                # main LM head). Rook #96.
+                muon_params.append(p)
             elif is_muon_param(n):
                 muon_params.append(p)
             else:
@@ -519,6 +537,10 @@ def configure_optimizers(
                 embed_params.append(p)
             elif group == 'output_head':
                 output_params.append(p)
+            elif group == 'aux_head_muon':
+                # Aux head Linear is preceded by RMSNorm — treat as normalized
+                # so AdamC's corrected WD applies.
+                normalized_params.append(p)
             elif is_normalized_param(n):
                 normalized_params.append(p)
             else:

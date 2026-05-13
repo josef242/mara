@@ -234,6 +234,56 @@ def interpolate_lr_mod(schedule, step):
     return schedule[-1][1]
 
 
+def parse_aux_heads_config(aux_cfg):
+    """Parse the auxiliary_heads YAML block.
+
+    Accepts:
+      auxiliary_heads:
+        enabled: true
+        heads:
+          - layer: 23
+            weight: 0.05                       # scalar = constant
+          - layer: 46
+            weight: [[0, 0.001], [3000, 0.10]] # [[step, val], ...] = linear interp
+
+    Returns:
+        (sorted_layer_list, {layer_idx: schedule}) where schedule is a list of
+        (step, weight) tuples suitable for interpolate_lr_mod. Scalar weights
+        are normalized to [(0, value)] for uniform handling. Returns
+        ([], {}) if disabled or absent.
+    """
+    if not aux_cfg or not aux_cfg.get('enabled', False):
+        return [], {}
+    heads = aux_cfg.get('heads') or []
+    if not isinstance(heads, list) or len(heads) == 0:
+        fatal_error("auxiliary_heads.heads must be a non-empty list when enabled.")
+    layers = []
+    schedules = {}
+    for entry in heads:
+        if not isinstance(entry, dict) or 'layer' not in entry or 'weight' not in entry:
+            fatal_error(f"auxiliary_heads.heads entry must have 'layer' and 'weight' keys: {entry}")
+        li = entry['layer']
+        if not isinstance(li, int):
+            fatal_error(f"auxiliary_heads.heads[*].layer must be an int, got {type(li).__name__}: {li}")
+        w = entry['weight']
+        if isinstance(w, (int, float)):
+            sched = [(0, float(w))]
+        elif isinstance(w, list) and len(w) > 0 and all(
+            isinstance(wp, (list, tuple)) and len(wp) == 2 and isinstance(wp[0], int)
+            and isinstance(wp[1], (int, float)) for wp in w
+        ):
+            sched = sorted([(int(p[0]), float(p[1])) for p in w], key=lambda x: x[0])
+        else:
+            fatal_error(
+                f"auxiliary_heads.heads[*].weight must be a number or [[step, val], ...]: {w}"
+            )
+        if li in schedules:
+            fatal_error(f"auxiliary_heads.heads has duplicate entry for layer {li}")
+        schedules[li] = sched
+        layers.append(li)
+    return sorted(layers), schedules
+
+
 def parse_lr_mods(lr_mods_config, model):
     """Parse lr_mods config and build param-to-schedule mapping.
 
@@ -473,6 +523,112 @@ def log_lr_schedule(settings, logger):
         logger.print_and_log(f"  ]   5. Second plateau [{settings.second_plat_len_pct*100:5.2f}%]:   steps {decay_to_second_end:,}-{second_plat_end:,} @ {settings.second_plat_lr:.2e}")
         logger.print_and_log(f"  ]   6. Final decay [{final_decay_pct*100:5.2f}%]:      steps {second_plat_end:,}-{settings.max_steps:,} → {settings.min_lr:.2e}")
 
+class ActivationProbe:
+    """RMS capture of forward activations at probe points per TransformerBlock.
+
+    Per-layer captures: h_in_rms (block input), attn_out_rms (attention output),
+    h_mid_rms (post_attn_norm output, KEEL with layer_id > 0 only),
+    ffn_out_rms (FFN/MoE output), h_out_rms (block output).
+    Top-level captures: final_norm_in_rms, final_norm_out_rms.
+
+    Designed for sample-mode use:
+        probe = ActivationProbe(model); probe.attach()
+        with torch.no_grad():
+            model(x, y)
+        data = probe.detach_and_get()
+
+    Hooks are removed by detach_and_get(). RMS values are computed eagerly on
+    device during the forward and bulk-synced to host on detach.
+    """
+
+    def __init__(self, model):
+        # Unwrap torch.compile root if present (per-submodule compile leaves the
+        # root unwrapped, but be defensive).
+        self.model = model._orig_mod if hasattr(model, '_orig_mod') else model
+        self.handles = []
+        self._per_layer = {}   # {idx: {key: 0-d Tensor}}
+        self._final = {}        # {key: 0-d Tensor}
+
+    @staticmethod
+    def _rms_tensor(t):
+        if isinstance(t, tuple):
+            t = t[0]
+        return t.detach().float().pow(2).mean().sqrt()
+
+    def _stash(self, idx, key, t):
+        self._per_layer.setdefault(idx, {})[key] = self._rms_tensor(t)
+
+    def attach(self):
+        for idx, blk in enumerate(self.model.layers):
+            i = idx  # capture by value
+            self.handles.append(
+                blk.register_forward_pre_hook(lambda m, a, _i=i: self._stash(_i, 'h_in_rms', a[0]))
+            )
+            self.handles.append(
+                blk.register_forward_hook(lambda m, a, out, _i=i: self._stash(_i, 'h_out_rms', out))
+            )
+
+            if getattr(blk, 'use_gdn', False) and hasattr(blk, 'gdn_attn'):
+                attn_mod = blk.gdn_attn
+            elif hasattr(blk, 'attention'):
+                attn_mod = blk.attention
+            else:
+                attn_mod = None
+            if attn_mod is not None:
+                self.handles.append(
+                    attn_mod.register_forward_hook(
+                        lambda m, a, out, _i=i: self._stash(_i, 'attn_out_rms', out)
+                    )
+                )
+
+            if hasattr(blk, 'post_attn_norm'):
+                self.handles.append(
+                    blk.post_attn_norm.register_forward_hook(
+                        lambda m, a, out, _i=i: self._stash(_i, 'h_mid_rms', out)
+                    )
+                )
+
+            if getattr(blk, 'moe_enabled', False) and hasattr(blk, 'moe'):
+                ffn_mod = blk.moe
+            elif hasattr(blk, 'feed_forward'):
+                ffn_mod = blk.feed_forward
+            else:
+                ffn_mod = None
+            if ffn_mod is not None:
+                self.handles.append(
+                    ffn_mod.register_forward_hook(
+                        lambda m, a, out, _i=i: self._stash(_i, 'ffn_out_rms', out)
+                    )
+                )
+
+        # Top-level final norm: pre captures the activation entering the head,
+        # post captures the output that feeds the LM head.
+        norm = getattr(self.model, 'norm', None)
+        if norm is not None:
+            self.handles.append(
+                norm.register_forward_pre_hook(
+                    lambda m, a: self._final.__setitem__('final_norm_in_rms', self._rms_tensor(a[0]))
+                )
+            )
+            self.handles.append(
+                norm.register_forward_hook(
+                    lambda m, a, out: self._final.__setitem__('final_norm_out_rms', self._rms_tensor(out))
+                )
+            )
+
+    def detach_and_get(self):
+        for h in self.handles:
+            h.remove()
+        self.handles = []
+        layers = {}
+        for idx, d in self._per_layer.items():
+            layers[idx] = {k: float(v.item()) for k, v in d.items()}
+        final = {k: float(v.item()) for k, v in self._final.items()}
+        self._per_layer = {}
+        self._final = {}
+        return {'layers_by_idx': layers, **final}
+
+
 def _clip_grad_norm_mixed_mesh(model, max_norm, norm_type=2.0):
     """clip_grad_norm_ that works with params on different DTensor meshes.
 
@@ -528,6 +684,14 @@ def train_loop(
         current_pcts = {g.name: g.percentage for g in train_loader.groups}
         val_loader.set_percentages_silent(current_pcts)
 
+    # Parse auxiliary-head schedules once. Empty when the feature is disabled,
+    # which keeps the per-step hot path free of dict lookups in that case.
+    _, aux_head_schedules = parse_aux_heads_config(getattr(settings, 'auxiliary_heads', None))
+    aux_heads_enabled = bool(aux_head_schedules)
+    if aux_heads_enabled and ddp_rank == 0:
+        _layer_str = ", ".join(f"L{li}" for li in sorted(aux_head_schedules))
+        logger.print_and_log(f"Auxiliary heads enabled at layers: {_layer_str}")
+
     # Do a baseline validation before training
     if start_step == 1:
         sync_val_loader()
@@ -550,6 +714,17 @@ def train_loop(
         model.train()
         optimizer.zero_grad(set_to_none=True)
         loss_accum = 0.0
+        # Per-step aux loss bookkeeping. Schedule weights are evaluated once
+        # per step (constant within a step, lerp across waypoints). Per-head
+        # unweighted CE values accumulate across micro-batches for logging.
+        aux_weights_now = (
+            {li: interpolate_lr_mod(sched, step) for li, sched in aux_head_schedules.items()}
+            if aux_heads_enabled else {}
+        )
+        aux_loss_accum = (
+            {li: torch.zeros((), device=device) for li in aux_head_schedules}
+            if aux_heads_enabled else {}
+        )
         grad_accum_steps = grad_accum_schedule[step]
         for micro_step in range(grad_accum_steps):
             x, y = train_loader.next_batch(step=step)
@@ -573,6 +748,20 @@ def train_loop(
                     fwd_model = model._orig_mod
                 with torch.autocast(device_type=device_type, dtype=torch.bfloat16 if settings.data_type=="bf16" else torch.float16 if settings.data_type=="fp16" else torch.float32):
                     logits, loss = fwd_model(x, y, active_layers=active_layers)
+
+                # Auxiliary prediction heads: fold weighted aux losses into the
+                # main loss so backward() drives gradients through both. Per-head
+                # unweighted values accumulate for logging.
+                if aux_heads_enabled:
+                    raw_for_aux = fwd_model._orig_mod if hasattr(fwd_model, '_orig_mod') else fwd_model
+                    aux_tensors = getattr(raw_for_aux, '_last_aux_loss_tensors', None) or {}
+                    if aux_tensors:
+                        for li, t in aux_tensors.items():
+                            w = aux_weights_now.get(li, 0.0)
+                            if w != 0.0:
+                                loss = loss + w * t
+                            aux_loss_accum[li] = aux_loss_accum[li] + (t.detach().float() / grad_accum_steps)
+
                 loss = loss * trunc_loss_w / grad_accum_steps
                 loss_accum += loss.detach().float()
                 loss.backward()
@@ -586,7 +775,9 @@ def train_loop(
 
         if ddp:
             dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
-    
+            for _li in aux_loss_accum:
+                dist.all_reduce(aux_loss_accum[_li], op=dist.ReduceOp.AVG)
+
         # Moonlight-style: unified LR for all param groups
         # With rms_scale=True, the 0.2*sqrt(max(A,B)) scaling in Muon
         # provides the appropriate per-layer ratio automatically
@@ -716,12 +907,18 @@ def train_loop(
             trunc_tag = f" | trunc: {active_layers if is_truncated else model_cfg.n_layers}/{model_cfg.n_layers}" if (truncator and truncator.enabled) else ""
             bal_tag = f" | bal: {moe_stats[0]['avg_cv']:.3f}" if moe_stats[0] else ""
             drp_tag = f" | drp: {moe_stats[0]['drop_pct']:.2f}%" if moe_stats[0] and moe_stats[0]['drop_pct'] > 0 else ""
+            aux_tag = ""
+            aux_silent = ""
+            if aux_loss_accum:
+                aux_pairs = sorted((li, v.item()) for li, v in aux_loss_accum.items())
+                aux_tag = " | " + " ".join(f"aux_l{li}: {v:.4f}" for li, v in aux_pairs)
+                aux_silent = "|" + "|".join(f"aux_l{li}={v:.6f}" for li, v in aux_pairs)
             logger.print_and_log(
-                f"st: {step:5d} | ls: {loss_accum.item():.6f} | ppl: {ppl:.2f} | lr: {lr:.4e} | nrm: {norm:.4f} [{clip_value:.1f}] | dt: {dt:.2f}s | t_tk: {total_tokens_processed:11,d} | tok/s: {tokens_per_sec:.0f} | MFU: {mfu:.0f}%{bal_tag}{drp_tag}{trunc_tag}",
+                f"st: {step:5d} | ls: {loss_accum.item():.6f} | ppl: {ppl:.2f} | lr: {lr:.4e} | nrm: {norm:.4f} [{clip_value:.1f}] | dt: {dt:.2f}s | t_tk: {total_tokens_processed:11,d} | tok/s: {tokens_per_sec:.0f} | MFU: {mfu:.0f}%{bal_tag}{drp_tag}{trunc_tag}{aux_tag}",
             )
 
             logger.print_and_log(
-                f"{step:5d}|{loss_accum.item():.6f}|{ppl:.2f}|{lr:.4e}|{norm:.4f}|{dt:.2f}|{total_tokens_processed:11d}|{tokens_per_sec:.0f}",
+                f"{step:5d}|{loss_accum.item():.6f}|{ppl:.2f}|{lr:.4e}|{norm:.4f}|{dt:.2f}|{total_tokens_processed:11d}|{tokens_per_sec:.0f}{aux_silent}",
                 True, settings.train_log_file, silent=True
             )
 
@@ -774,11 +971,52 @@ def train_loop(
                     if ddp_rank == 0:
                         logger.print_and_log(f"  feedback_gain compute failed: {type(e).__name__}: {e}")
 
+            # Persistent activation diagnostics: forward-activation RMS profile
+            # captured via hooks on a tiny val batch. Eval mode disables
+            # activation checkpointing inside TransformerBlock.forward, so each
+            # block's intermediates are materialized once and visible to hooks.
+            activation_data = None
+            if diagnostics is not None:
+                try:
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    ap_x, ap_y = val_loader.next_batch(step=step)
+                    ap_x = ap_x[:1, :256].to(device)
+                    ap_y = ap_y[:1, :256].to(device)
+                    probe = ActivationProbe(model)
+                    probe.attach()
+                    try:
+                        model.eval()
+                        with torch.no_grad(), torch.autocast(
+                            device_type=device_type,
+                            dtype=torch.bfloat16 if settings.data_type == "bf16"
+                                  else torch.float16 if settings.data_type == "fp16"
+                                  else torch.float32,
+                        ):
+                            model(ap_x, ap_y)
+                        activation_data = probe.detach_and_get()
+                    finally:
+                        # Ensure hooks always come off even if forward raised.
+                        if probe.handles:
+                            for _h in probe.handles:
+                                _h.remove()
+                            probe.handles = []
+                        model.train()
+                    del ap_x, ap_y
+                except Exception as e:
+                    activation_data = None
+                    if ddp_rank == 0:
+                        logger.print_and_log(f"  activation_probe failed: {type(e).__name__}: {e}")
+
             # Log layer diagnostics after validation
             if diagnostics is not None:
                 awd_diag = awd.get_diagnostics_data() if awd is not None else None
                 moe_diag = moe_stats[0] if moe_stats[0] else None
-                snapshot = diagnostics.log_diagnostics(step, settings.nas_path, total_tokens_processed, awd_data=awd_diag, moe_data=moe_diag)
+                snapshot = diagnostics.log_diagnostics(
+                    step, settings.nas_path, total_tokens_processed,
+                    awd_data=awd_diag, moe_data=moe_diag,
+                    activation_data=activation_data,
+                )
                 diagnostics.print_summary(snapshot, logger, awd_data=awd_diag, moe_data=moe_diag)
 
             # Log MoE expert utilization (only on rank 0, only when MoE is active)
@@ -1096,7 +1334,22 @@ def resume_training(model, optimizer, train_loader, ddp_rank, settings, grad_acc
 
     # FSDP2: Use set_model_state_dict to load and distribute weights
     logger.print_and_log("  ] Distributing model weights across ranks...")
-    options = StateDictOptions(full_state_dict=True, cpu_offload=True)
+    # Detect new modules added since the checkpoint (e.g. auxiliary heads when
+    # the intervention is being turned on at resume). Missing keys are tolerated
+    # so freshly-initialized weights survive the load; unexpected keys would
+    # still indicate a real config mismatch and we want to know about those.
+    model_keys = set(raw_model.state_dict().keys())
+    ckpt_keys = set(state_dict.keys())
+    missing_in_ckpt = sorted(model_keys - ckpt_keys)
+    has_new_aux = any(k.startswith('aux_heads.') for k in missing_in_ckpt)
+    use_strict = not has_new_aux
+    if has_new_aux:
+        n_aux = sum(1 for k in missing_in_ckpt if k.startswith('aux_heads.'))
+        logger.print_and_log(
+            f"  ] Detected {n_aux} new aux-head param(s) absent from checkpoint — "
+            f"loading non-strict so they keep their fresh init."
+        )
+    options = StateDictOptions(full_state_dict=True, cpu_offload=True, strict=use_strict)
     set_model_state_dict(raw_model, state_dict, options=options)
 
     # Important: Free up memory after model is distributed to GPUs
@@ -1829,6 +2082,12 @@ def create_and_shard_model(model_cfg, dp_mesh, ep_mesh, edp_mesh, device, settin
             fully_shard(layer.moe.experts, mesh=edp_mesh, mp_policy=mp_policy, reshard_after_forward=reshard_after_forward, offload_policy=offload_policy)
         # Outer: entire layer on dp_mesh (attention, norms, shared_experts, router gate)
         fully_shard(layer, mesh=dp_mesh, mp_policy=mp_policy, reshard_after_forward=reshard_after_forward, offload_policy=offload_policy)
+    # Auxiliary prediction heads each get their own FSDP wrap. They fire only
+    # at their tap-layer depth, so an independent unshard/reshard cycle keeps
+    # them off the all-gather schedule for the rest of the body forward pass.
+    if getattr(model, 'aux_heads', None) is not None and len(model.aux_heads) > 0:
+        for aux_head in model.aux_heads.values():
+            fully_shard(aux_head, mesh=dp_mesh, mp_policy=mp_policy, reshard_after_forward=reshard_after_forward, offload_policy=offload_policy)
     fully_shard(model, mesh=dp_mesh, mp_policy=mp_policy, reshard_after_forward=False, offload_policy=offload_policy)
 
     # Materialize: CPU offload requires params on CPU; FSDP handles H2D transfers
@@ -2365,6 +2624,15 @@ class Settings:
             if not self.adaptive_wd.get('enabled', False):
                 self.adaptive_wd = None
 
+        # --- auxiliary_heads: intermediate-depth prediction heads ---
+        # Validated lightly here; full parse happens in parse_aux_heads_config
+        # at trainer setup time (needs n_layers from model_cfg to range-check).
+        if not hasattr(self, 'auxiliary_heads'):
+            self.auxiliary_heads = None
+        elif isinstance(self.auxiliary_heads, dict):
+            if not self.auxiliary_heads.get('enabled', False):
+                self.auxiliary_heads = None
+
         # --- GDN hybrid attention ---
         if not hasattr(self, 'gdn_enabled'):
             self.gdn_enabled = False
@@ -2650,6 +2918,16 @@ if __name__ == "__main__":
     if special_tokens_path:
         logger.print_and_log(f"  ] Special tokens = {special_tokens_path}")
 
+    # ----------------------- Auxiliary prediction heads -----------------------
+    # Parse auxiliary_heads YAML block. We only need the layer list here to
+    # build the model; per-head weight schedules are re-parsed inside train_loop.
+    _aux_head_layers, _ = parse_aux_heads_config(getattr(settings, 'auxiliary_heads', None))
+    for _li in _aux_head_layers:
+        if _li < 0 or _li >= settings.cfg_layers:
+            fatal_error(
+                f"auxiliary_heads.heads layer {_li} out of range for cfg_layers={settings.cfg_layers}"
+            )
+
     # ----------------------- Create the model -----------------------
     model_cfg = ModelArgs(
         dim=settings.cfg_embd,
@@ -2695,6 +2973,8 @@ if __name__ == "__main__":
         # AttnRes (Block Attention Residuals)
         attn_res_enabled=getattr(settings, 'attn_res_enabled', False),
         attn_res_block_size=getattr(settings, 'attn_res_block_size', 8),
+        # Auxiliary prediction heads
+        aux_head_layers=_aux_head_layers,
     )
 
     # ----------------------- Save Settings Config File -----------------------
