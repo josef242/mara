@@ -1425,6 +1425,36 @@ def resume_training(model, optimizer, train_loader, ddp_rank, settings, grad_acc
         # required keys (lr, weight_decay, etc.) that TorchAO needs at step() time
         pg_defaults = [{k: v for k, v in pg.items() if k != 'params'} for pg in load_optim.param_groups]
 
+        def _inject_empty_state_for_new_params(saved_sd: dict, log_prefix: str = ""):
+            """Inject empty optimizer state for params present in the current
+            optimizer but absent from the saved state dict (e.g., aux-head
+            params added at resume). Optimizers initialize per-param state
+            lazily on the first step(), so an empty dict is the correct
+            starting point."""
+            model_fqns = set(name for name, _ in raw_model.named_parameters())
+            state_dict = saved_sd.get('state', {})
+            saved_fqns = set(state_dict.keys())
+            missing = model_fqns - saved_fqns
+            if not missing:
+                return
+            aux_missing = sorted(fqn for fqn in missing if fqn.startswith('aux_heads.'))
+            other_missing = sorted(missing - set(aux_missing))
+            if other_missing:
+                preview = ", ".join(other_missing[:5])
+                ellipsis = ", ..." if len(other_missing) > 5 else ""
+                logger.print_and_log(
+                    f"  ] {log_prefix}WARNING: optimizer state missing "
+                    f"{len(other_missing)} non-aux-head param(s): {preview}{ellipsis}"
+                )
+            if aux_missing:
+                logger.print_and_log(
+                    f"  ] {log_prefix}Injecting empty optimizer state for "
+                    f"{len(aux_missing)} new aux-head param(s) (lazy init on first step)"
+                )
+            for fqn in missing:
+                state_dict[fqn] = {}
+            saved_sd['state'] = state_dict
+
         if use_full_optim:
             # Full state dict — all ranks load the same file, FSDP distributes automatically.
             # Strip param_group metadata: the current optimizer already has the correct
@@ -1448,6 +1478,7 @@ def resume_training(model, optimizer, train_loader, ddp_rank, settings, grad_acc
                 for k, v in current_pg.items():
                     if k != 'params':
                         saved_pg[k] = v
+            _inject_empty_state_for_new_params(optim_sd)
             optim_options = StateDictOptions(full_state_dict=True, cpu_offload=True)
             set_optimizer_state_dict(raw_model, load_optim, optim_sd, options=optim_options)
             del optim_sd
@@ -1455,6 +1486,7 @@ def resume_training(model, optimizer, train_loader, ddp_rank, settings, grad_acc
         else:
             # Sharded state dict — each rank loads its own shard (requires same world_size)
             optim_shard = torch.load(optim_shard_path, map_location="cpu")
+            _inject_empty_state_for_new_params(optim_shard, log_prefix=f"[R{ddp_rank}] ")
             optim_options = StateDictOptions(full_state_dict=False)
             set_optimizer_state_dict(raw_model, load_optim, optim_shard, options=optim_options)
             del optim_shard
