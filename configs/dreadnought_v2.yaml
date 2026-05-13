@@ -26,7 +26,7 @@ reshard_after_forward: true
 
 # Resume training settings
 resume_training: true
-resume_step: 10_500
+resume_step: 11_000
 resume_data_reset: continue
 
 # Gradient clipping
@@ -104,8 +104,6 @@ auxiliary_heads:
       weight: [[11000, 0.0], [11700, 0.02], [15200, 0.10]]
     - layer: 60
       weight: [[11000, 0.0], [11700, 0.04], [15200, 0.20]]
-    - layer: 65
-      weight: [[11000, 0.0], [11700, 0.10], [15200, 0.50]]
 
 # weight_decay:
 #   - [all, 0.02]

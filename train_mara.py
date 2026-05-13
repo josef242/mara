@@ -686,11 +686,9 @@ def train_loop(
 
     # Parse auxiliary-head schedules once. Empty when the feature is disabled,
     # which keeps the per-step hot path free of dict lookups in that case.
+    # Startup config printout happens at the top of train() — not here.
     _, aux_head_schedules = parse_aux_heads_config(getattr(settings, 'auxiliary_heads', None))
     aux_heads_enabled = bool(aux_head_schedules)
-    if aux_heads_enabled and ddp_rank == 0:
-        _layer_str = ", ".join(f"L{li}" for li in sorted(aux_head_schedules))
-        logger.print_and_log(f"Auxiliary heads enabled at layers: {_layer_str}")
 
     # Do a baseline validation before training
     if start_step == 1:
@@ -3033,6 +3031,35 @@ if __name__ == "__main__":
         logger.print_and_log(f"  ] Conv kernel   = {model_cfg.gdn_short_conv_kernel}")
         logger.print_and_log(f"  ] Mode          = {model_cfg.gdn_mode}")
         logger.print_and_log(f"  ] Full-attn gate = sigmoid (gated softmax attention)")
+
+    # ----------------------- Log Auxiliary Heads configuration -----------------------
+    if _aux_head_layers and ddp_rank == 0:
+        _, _aux_print_schedules = parse_aux_heads_config(getattr(settings, 'auxiliary_heads', None))
+        # ~ params per head: RMSNorm(d) + Linear(d, V) = d + d*V
+        _params_per_head = model_cfg.dim + model_cfg.dim * settings.cfg_voc_sz
+        _total_aux_params = _params_per_head * len(_aux_head_layers)
+        logger.print_and_log(f"Auxiliary Heads Config:")
+        logger.print_and_log(
+            f"  ] Taps          = {len(_aux_head_layers)} heads at layers "
+            f"{', '.join(f'L{li}' for li in _aux_head_layers)}"
+        )
+        logger.print_and_log(
+            f"  ] Architecture  = RMSNorm + Linear(d={model_cfg.dim}, V={settings.cfg_voc_sz:,})"
+        )
+        logger.print_and_log(
+            f"  ] Param overhead= ~{_total_aux_params/1e6:.1f}M total "
+            f"({_params_per_head/1e6:.1f}M per head x {len(_aux_head_layers)})"
+        )
+        logger.print_and_log(f"  ] Optimizer     = Muon group, full LR (no output_lr_batch_adjust scaling)")
+        logger.print_and_log(f"  ] FSDP          = each head gets its own fully_shard wrap")
+        logger.print_and_log(f"  ] Schedules     (linear interpolation between waypoints):")
+        for _li in _aux_head_layers:
+            _sched = _aux_print_schedules[_li]
+            if len(_sched) == 1:
+                logger.print_and_log(f"  ]   L{_li:>3d}: constant {_sched[0][1]}")
+            else:
+                _wp = " -> ".join(f"{v} @ step {s:,}" for s, v in _sched)
+                logger.print_and_log(f"  ]   L{_li:>3d}: {_wp}")
 
     # ----------------------- Log training configuration -----------------------
     if ddp_rank == 0:
