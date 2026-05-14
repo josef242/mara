@@ -1181,6 +1181,10 @@ def save_model(model, optimizer, model_config, step, ddp_rank, ddp_local_rank, t
             'gdn_v_expand': getattr(model_config, 'gdn_v_expand', 2.0),
             'gdn_short_conv_kernel': getattr(model_config, 'gdn_short_conv_kernel', 4),
             'gdn_mode': getattr(model_config, 'gdn_mode', 'chunk'),
+            # Auxiliary prediction heads — so neo_common's filter-based ModelArgs
+            # rebuild at inference time picks them up and the state-dict load
+            # is clean (no "unexpected keys" warning for aux_heads.*.{norm,linear}.weight).
+            'aux_head_layers': list(getattr(model_config, 'aux_head_layers', []) or []),
         }
         checkpoint_data = {
             "model": full_sd,
