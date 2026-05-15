@@ -96,7 +96,8 @@ def fatal_error(message: str, exit_code: int = 1):
     os._exit(exit_code)
 
 # -------------------------- Validation --------------------------
-def calc_group_loss(model, loader, *, eval_iters, device, ddp, dtype, device_type):
+def calc_group_loss(model, loader, *, eval_iters, device, ddp, dtype, device_type,
+                    tst_bag_size=1, tst_power_law=False):
     """
     Return the mean loss for the group that `loader` is currently locked to.
     All ranks run the same number of iterations; the result is averaged across
@@ -104,14 +105,25 @@ def calc_group_loss(model, loader, *, eval_iters, device, ddp, dtype, device_typ
 
     Note: With FSDP2, we must call through the sharded model (not _orig_mod)
     because inputs need to interact with DTensor parameters properly.
+
+    Under TST phase 1, the loader yields (B, T*s) sequences; we reshape inputs
+    to (B, T, s) and pass tst_* through so val mirrors training.
     """
     tot = torch.tensor(0.0, device=device)
+    tst_enabled = tst_bag_size > 1
     with torch.no_grad():
         for _ in range(eval_iters):
             x, y = loader.next_batch()
             x, y = x.to(device), y.to(device)
+            if tst_enabled:
+                bs_x, total_x = x.shape
+                seq_x = total_x // tst_bag_size
+                x = x.view(bs_x, seq_x, tst_bag_size)
             with torch.autocast(device_type=device_type, dtype=dtype):
-                _, loss = model(x, y)
+                _, loss = model(
+                    x, y,
+                    tst_bag_size=tst_bag_size, tst_power_law=tst_power_law,
+                )
             tot += loss.detach()
 
     tot /= eval_iters                       # average over micro-batches
@@ -122,7 +134,8 @@ def calc_group_loss(model, loader, *, eval_iters, device, ddp, dtype, device_typ
 def do_validation(model, val_loader, device, eval_iters,
                   step, ddp_rank, val_log_file,
                   total_tokens_processed,
-                  ddp, ddp_world_size, data_type, device_type):
+                  ddp, ddp_world_size, data_type, device_type,
+                  tst_bag_size=1, tst_power_law=False):
 
     logger.print_and_log(f"[R{ddp_rank}] running validation at step {step}")
 
@@ -135,7 +148,8 @@ def do_validation(model, val_loader, device, eval_iters,
 
     for g in group_names:
         val_loader.set_val_group(g, eval_iters = eval_iters)
-        loss = calc_group_loss(model, val_loader, eval_iters=eval_iters, device=device, ddp=ddp, dtype=dtype, device_type=device_type)
+        loss = calc_group_loss(model, val_loader, eval_iters=eval_iters, device=device, ddp=ddp, dtype=dtype, device_type=device_type,
+                               tst_bag_size=tst_bag_size, tst_power_law=tst_power_law)
         group_losses[g] = loss
 
         if ddp:
@@ -690,10 +704,18 @@ def train_loop(
     _, aux_head_schedules = parse_aux_heads_config(getattr(settings, 'auxiliary_heads', None))
     aux_heads_enabled = bool(aux_head_schedules)
 
+    # Token Superposition Training (TST) phase 1 settings — fixed for the run.
+    # bag_size=1 means the helper short-circuits to standard NTP (zero overhead).
+    tst_cfg = getattr(settings, 'tst', None)
+    tst_bag_size = int(tst_cfg['bag_size']) if tst_cfg else 1
+    tst_power_law = bool(tst_cfg.get('power_law', False)) if tst_cfg else False
+    tst_enabled = tst_bag_size > 1
+
     # Do a baseline validation before training
     if start_step == 1:
         sync_val_loader()
-        do_validation(model, val_loader, device, settings.eval_iters, 0, ddp_rank, settings.val_log_file, total_tokens_processed, ddp, ddp_world_size, settings.data_type, device_type)
+        do_validation(model, val_loader, device, settings.eval_iters, 0, ddp_rank, settings.val_log_file, total_tokens_processed, ddp, ddp_world_size, settings.data_type, device_type,
+                      tst_bag_size=tst_bag_size, tst_power_law=tst_power_law)
 
     for step in range(start_step, settings.max_steps):
         t0 = time.time()
@@ -744,8 +766,21 @@ def train_loop(
                 fwd_model = model
                 if is_truncated and truncator.bypass_compile and hasattr(model, '_orig_mod'):
                     fwd_model = model._orig_mod
+                # Under TST phase 1: loader hands us (B, T*s) sequences. Reshape
+                # the inputs to (B, T, s) so the model averages each bag into one
+                # embedding before the trunk; targets stay (B, T*s) — the loss
+                # helper bags them internally with the causal s-1 shift.
+                if tst_enabled:
+                    bs_x, total_x = x.shape
+                    seq_x = total_x // tst_bag_size
+                    x_in = x.view(bs_x, seq_x, tst_bag_size)
+                else:
+                    x_in = x
                 with torch.autocast(device_type=device_type, dtype=torch.bfloat16 if settings.data_type=="bf16" else torch.float16 if settings.data_type=="fp16" else torch.float32):
-                    logits, loss = fwd_model(x, y, active_layers=active_layers)
+                    logits, loss = fwd_model(
+                        x_in, y, active_layers=active_layers,
+                        tst_bag_size=tst_bag_size, tst_power_law=tst_power_law,
+                    )
 
                 # Auxiliary prediction heads: fold weighted aux losses into the
                 # main loss so backward() drives gradients through both. Per-head
@@ -925,7 +960,8 @@ def train_loop(
 
         if step % settings.val_step == 0 or last_step:
             sync_val_loader()
-            do_validation(model, val_loader, device, settings.eval_iters, step, ddp_rank, settings.val_log_file, total_tokens_processed, ddp, ddp_world_size, settings.data_type, device_type)
+            do_validation(model, val_loader, device, settings.eval_iters, step, ddp_rank, settings.val_log_file, total_tokens_processed, ddp, ddp_world_size, settings.data_type, device_type,
+                          tst_bag_size=tst_bag_size, tst_power_law=tst_power_law)
 
             # Log current data mix if using data annealing
             train_loader.log_schedule_status(step, ddp_rank, logger.print_and_log)
@@ -979,8 +1015,25 @@ def train_loop(
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
                     ap_x, ap_y = val_loader.next_batch(step=step)
-                    ap_x = ap_x[:1, :256].to(device)
-                    ap_y = ap_y[:1, :256].to(device)
+                    # Probe runs on a tiny slice; under TST the loader yields
+                    # (B, T*s) so we slice an integer multiple of bag_size and
+                    # reshape inputs to (1, T_probe, s) so the model receives the
+                    # same shape it does during training. Targets stay flat
+                    # because the loss helper bags them internally.
+                    raw_len = 256
+                    if tst_enabled:
+                        raw_len = (raw_len // tst_bag_size) * tst_bag_size
+                        if raw_len == 0:
+                            raise RuntimeError(
+                                f"activation probe slice (256) smaller than tst_bag_size ({tst_bag_size})"
+                            )
+                    ap_x = ap_x[:1, :raw_len].to(device)
+                    ap_y = ap_y[:1, :raw_len].to(device)
+                    if tst_enabled:
+                        seq_probe = raw_len // tst_bag_size
+                        ap_x_in = ap_x.view(1, seq_probe, tst_bag_size)
+                    else:
+                        ap_x_in = ap_x
                     probe = ActivationProbe(model)
                     probe.attach()
                     try:
@@ -991,7 +1044,10 @@ def train_loop(
                                   else torch.float16 if settings.data_type == "fp16"
                                   else torch.float32,
                         ):
-                            model(ap_x, ap_y)
+                            model(
+                                ap_x_in, ap_y,
+                                tst_bag_size=tst_bag_size, tst_power_law=tst_power_law,
+                            )
                         activation_data = probe.detach_and_get()
                     finally:
                         # Ensure hooks always come off even if forward raised.
@@ -1186,6 +1242,13 @@ def save_model(model, optimizer, model_config, step, ddp_rank, ddp_local_rank, t
             # is clean (no "unexpected keys" warning for aux_heads.*.{norm,linear}.weight).
             'aux_head_layers': list(getattr(model_config, 'aux_head_layers', []) or []),
         }
+        # TST phase metadata (record-only — resume reads settings.tst from
+        # the YAML, this just lets dashboards / forensic tools know which
+        # phase produced the checkpoint).
+        _tst_cfg_for_save = getattr(settings, 'tst', None)
+        _tst_bag_for_save = int(_tst_cfg_for_save['bag_size']) if _tst_cfg_for_save else 1
+        _tst_pl_for_save = bool(_tst_cfg_for_save.get('power_law', False)) if _tst_cfg_for_save else False
+
         checkpoint_data = {
             "model": full_sd,
             "config": model_config_dict,
@@ -1197,6 +1260,8 @@ def save_model(model, optimizer, model_config, step, ddp_rank, ddp_local_rank, t
             "optimizer_type": settings.optimizer_type,
             "max_lr": settings.max_lr,
             "cpu_offload": getattr(settings, 'cpu_offload', False),
+            "tst_bag_size": _tst_bag_for_save,
+            "tst_power_law": _tst_pl_for_save,
             "checkpoint_version": "3.0",            # FSDP2 checkpoint format
         }
         checkpoint_path = os.path.join(settings.local_checkpoint_dir, f"model_step_{step:06d}.pt")
@@ -2667,6 +2732,25 @@ class Settings:
             if not self.auxiliary_heads.get('enabled', False):
                 self.auxiliary_heads = None
 
+        # --- tst: Token Superposition Training (Phase 1 only — phase 2 is the
+        # same config with enabled: false, manual restart per the paper) ---
+        if not hasattr(self, 'tst'):
+            self.tst = None
+        elif isinstance(self.tst, dict):
+            if not self.tst.get('enabled', False):
+                self.tst = None
+            else:
+                bag = self.tst.get('bag_size')
+                if not isinstance(bag, int) or bag < 2:
+                    fatal_error(
+                        f"tst.bag_size must be an integer >= 2 when enabled, got {bag!r}"
+                    )
+                pl = self.tst.get('power_law', False)
+                if not isinstance(pl, bool):
+                    fatal_error(
+                        f"tst.power_law must be a bool, got {type(pl).__name__}"
+                    )
+
         # --- GDN hybrid attention ---
         if not hasattr(self, 'gdn_enabled'):
             self.gdn_enabled = False
@@ -2880,13 +2964,21 @@ if __name__ == "__main__":
     else:
         initial_groups = settings.groups
 
+    # Token Superposition Training (TST) phase 1: the loader fetches `T * s`
+    # raw tokens per micro-batch. The trainer reshapes (B, T*s) -> (B, T, s)
+    # before the model forward; the trunk still sees T positions per step.
+    # Phase 2 (settings.tst is None): the loader uses settings.T as usual.
+    _tst_bag_size = settings.tst.get('bag_size', 1) if settings.tst else 1
+    _tst_power_law = settings.tst.get('power_law', False) if settings.tst else False
+    _loader_T = settings.T * _tst_bag_size
+
     # Skip shard init for train_loader when resuming - shards will be loaded via set_state()
-    train_loader = PercentageDataLoader(B=settings.B, T=settings.T, rank=ddp_rank, world_size=ddp_world_size, split="train",
+    train_loader = PercentageDataLoader(B=settings.B, T=_loader_T, rank=ddp_rank, world_size=ddp_world_size, split="train",
                                         data_root=settings.data_root_path, validation=False, groups=initial_groups,
                                         skip_shard_init=settings.resume_training, data_schedule=data_schedule,
                                         resume_step=resume_step)
 
-    val_loader = PercentageDataLoader(B=settings.B, T=settings.T, rank=ddp_rank, world_size=ddp_world_size, split="val",
+    val_loader = PercentageDataLoader(B=settings.B, T=_loader_T, rank=ddp_rank, world_size=ddp_world_size, split="val",
                                       data_root=settings.data_root_path, validation=True, groups=initial_groups,
                                       data_schedule=data_schedule, resume_step=resume_step)
 
@@ -3096,6 +3188,23 @@ if __name__ == "__main__":
             else:
                 _wp = " -> ".join(f"{v} @ step {s:,}" for s, v in _sched)
                 logger.print_and_log(f"  ]   L{_li:>3d}: {_wp}")
+
+    # ----------------------- Log Token Superposition Training (TST) configuration ----
+    if getattr(settings, 'tst', None) and ddp_rank == 0:
+        _tst = settings.tst
+        _bag = int(_tst['bag_size'])
+        _pl = bool(_tst.get('power_law', False))
+        _model_T = settings.T
+        _loader_T_p1 = _model_T * _bag
+        logger.print_and_log(f"Token Superposition Training (TST) Config:  [PHASE 1]")
+        logger.print_and_log(f"  ] bag_size      = {_bag}")
+        logger.print_and_log(f"  ] power_law     = {_pl}  (paper recommends True for s >= 8)")
+        logger.print_and_log(f"  ] T_model       = {_model_T}  (positions the trunk sees per step)")
+        logger.print_and_log(f"  ] T_loader      = {_loader_T_p1}  (raw tokens fetched per micro-batch = T_model * s)")
+        logger.print_and_log(f"  ] Per-step data = {_bag}x baseline at constant per-step trunk FLOPs")
+        logger.print_and_log(f"  ] Phase 2 plan  = set 'tst.enabled: false' in YAML and restart from boundary checkpoint")
+        if _bag >= 8 and not _pl:
+            logger.print_and_log(f"  ] NOTE: bag_size={_bag} >= 8 and power_law=false; paper recommends power_law=true at this size")
 
     # ----------------------- Log training configuration -----------------------
     if ddp_rank == 0:

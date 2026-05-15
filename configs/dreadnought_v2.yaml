@@ -87,6 +87,20 @@ output_lr_batch_adjust:
   exponent: 0.3
 
 
+# Token Superposition Training (TST) — Peng/Gigant/Quesnelle (Nous, 2026).
+# Phase 1: average `bag_size` consecutive token embeddings into a single input
+# position and predict the next bag of `bag_size` tokens. Loader fetches T*s
+# raw tokens per micro-batch; the trunk still sees T positions per step (FLOPs
+# constant). Memory grows roughly s^2 in attention because phase 1 context is
+# T_model * s. Sweet spot s in [4, 8]; larger models tolerate larger s.
+# Phase 2 transition is a manual restart with `enabled: false` (paper finding:
+# embedding + LM head must be preserved across the boundary, so do NOT
+# re-initialise either at the switch).
+# tst:
+#   enabled: true
+#   bag_size: 6        # try s=6 first; bump to 8 if VRAM headroom allows
+#   power_law: false   # set true when bag_size >= 8 (paper recommendation)
+
 # Auxiliary prediction heads — distribute readout-shaping pressure across the
 # body so no single late block has to do all the abstract -> token-space
 # translation. RMSNorm + Linear at each tap layer; full Muon LR, no
