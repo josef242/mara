@@ -733,7 +733,16 @@ def train_loop(
 
         model.train()
         optimizer.zero_grad(set_to_none=True)
-        loss_accum = 0.0
+        # Two loss accumulators per step:
+        #   main_loss_accum  -- the model's actual NTP loss against targets;
+        #                       what `ls:` in the log reflects, and what
+        #                       perplexity is computed against. Comparable to
+        #                       val_loss and to baseline runs.
+        #   total_loss_accum -- the value the optimizer minimises: main loss
+        #                       plus Σ_i w_i * aux_loss_i. Equal to main when
+        #                       aux is disabled or all schedule weights are 0.
+        main_loss_accum = 0.0
+        total_loss_accum = 0.0
         # Per-step aux loss bookkeeping. Schedule weights are evaluated once
         # per step (constant within a step, lerp across waypoints). Per-head
         # unweighted CE values accumulate across micro-batches for logging.
@@ -777,14 +786,15 @@ def train_loop(
                 else:
                     x_in = x
                 with torch.autocast(device_type=device_type, dtype=torch.bfloat16 if settings.data_type=="bf16" else torch.float16 if settings.data_type=="fp16" else torch.float32):
-                    logits, loss = fwd_model(
+                    logits, main_loss = fwd_model(
                         x_in, y, active_layers=active_layers,
                         tst_bag_size=tst_bag_size, tst_power_law=tst_power_law,
                     )
 
-                # Auxiliary prediction heads: fold weighted aux losses into the
-                # main loss so backward() drives gradients through both. Per-head
-                # unweighted values accumulate for logging.
+                # Build total_loss = main + Σ w_i * aux_i (when any aux head
+                # has a nonzero weight at this step). Per-head unweighted CE
+                # accumulates for logging regardless of weight.
+                total_loss = main_loss
                 if aux_heads_enabled:
                     raw_for_aux = fwd_model._orig_mod if hasattr(fwd_model, '_orig_mod') else fwd_model
                     aux_tensors = getattr(raw_for_aux, '_last_aux_loss_tensors', None) or {}
@@ -792,12 +802,17 @@ def train_loop(
                         for li, t in aux_tensors.items():
                             w = aux_weights_now.get(li, 0.0)
                             if w != 0.0:
-                                loss = loss + w * t
+                                total_loss = total_loss + w * t
                             aux_loss_accum[li] = aux_loss_accum[li] + (t.detach().float() / grad_accum_steps)
 
-                loss = loss * trunc_loss_w / grad_accum_steps
-                loss_accum += loss.detach().float()
-                loss.backward()
+                # Apply the same truncation weighting + grad-accum normalisation
+                # to both. backward() runs on total_loss so the optimiser sees
+                # the combined objective; main_loss is recorded for logging.
+                main_loss = main_loss * trunc_loss_w / grad_accum_steps
+                total_loss = total_loss * trunc_loss_w / grad_accum_steps
+                main_loss_accum += main_loss.detach().float()
+                total_loss_accum += total_loss.detach().float()
+                total_loss.backward()
 
         # Capture gradient norms before optimizer.step() clears them
         # Only capture on steps right before validation to avoid overhead.
@@ -807,7 +822,8 @@ def train_loop(
             diagnostics.capture_gradients()
 
         if ddp:
-            dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
+            dist.all_reduce(main_loss_accum, op=dist.ReduceOp.AVG)
+            dist.all_reduce(total_loss_accum, op=dist.ReduceOp.AVG)
             for _li in aux_loss_accum:
                 dist.all_reduce(aux_loss_accum[_li], op=dist.ReduceOp.AVG)
 
@@ -936,10 +952,21 @@ def train_loop(
 
             mfu = compute_mfu(tokens_per_sec, flops_per_token, ddp_world_size, settings.data_type) * 100
         
-            ppl = math.exp(loss_accum.item())
+            main_loss_val = main_loss_accum.item()
+            total_loss_val = total_loss_accum.item()
+            # Perplexity is the language-model quality metric — compute against
+            # the main NTP loss so it stays comparable to baseline / val_loss.
+            ppl = math.exp(main_loss_val)
             trunc_tag = f" | trunc: {active_layers if is_truncated else model_cfg.n_layers}/{model_cfg.n_layers}" if (truncator and truncator.enabled) else ""
             bal_tag = f" | bal: {moe_stats[0]['avg_cv']:.3f}" if moe_stats[0] else ""
             drp_tag = f" | drp: {moe_stats[0]['drop_pct']:.2f}%" if moe_stats[0] and moe_stats[0]['drop_pct'] > 0 else ""
+            # Total (optimiser) loss only shown when it differs from main —
+            # i.e., when at least one aux head has a nonzero current weight.
+            tot_tag = ""
+            tot_silent = ""
+            if aux_heads_enabled and total_loss_val != main_loss_val:
+                tot_tag = f" | tot: {total_loss_val:.6f}"
+                tot_silent = f"|tot={total_loss_val:.6f}"
             aux_tag = ""
             aux_silent = ""
             if aux_loss_accum:
@@ -947,11 +974,11 @@ def train_loop(
                 aux_tag = " | " + " ".join(f"aux_l{li}: {v:.4f}" for li, v in aux_pairs)
                 aux_silent = "|" + "|".join(f"aux_l{li}={v:.6f}" for li, v in aux_pairs)
             logger.print_and_log(
-                f"st: {step:5d} | ls: {loss_accum.item():.6f} | ppl: {ppl:.2f} | lr: {lr:.4e} | nrm: {norm:.4f} [{clip_value:.1f}] | dt: {dt:.2f}s | t_tk: {total_tokens_processed:11,d} | tok/s: {tokens_per_sec:.0f} | MFU: {mfu:.0f}%{bal_tag}{drp_tag}{trunc_tag}{aux_tag}",
+                f"st: {step:5d} | ls: {main_loss_val:.6f} | ppl: {ppl:.2f} | lr: {lr:.4e} | nrm: {norm:.4f} [{clip_value:.1f}] | dt: {dt:.2f}s | t_tk: {total_tokens_processed:11,d} | tok/s: {tokens_per_sec:.0f} | MFU: {mfu:.0f}%{bal_tag}{drp_tag}{trunc_tag}{tot_tag}{aux_tag}",
             )
 
             logger.print_and_log(
-                f"{step:5d}|{loss_accum.item():.6f}|{ppl:.2f}|{lr:.4e}|{norm:.4f}|{dt:.2f}|{total_tokens_processed:11d}|{tokens_per_sec:.0f}{aux_silent}",
+                f"{step:5d}|{main_loss_val:.6f}|{ppl:.2f}|{lr:.4e}|{norm:.4f}|{dt:.2f}|{total_tokens_processed:11d}|{tokens_per_sec:.0f}{tot_silent}{aux_silent}",
                 True, settings.train_log_file, silent=True
             )
 
