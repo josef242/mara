@@ -965,8 +965,8 @@ def train_loop(
             tot_tag = ""
             tot_silent = ""
             if aux_heads_enabled and total_loss_val != main_loss_val:
-                tot_tag = f" | tot: {total_loss_val:.6f}"
-                tot_silent = f"|tot={total_loss_val:.6f}"
+                tot_tag = f" | tot_ls: {total_loss_val:.6f}"
+                tot_silent = f"|tot_ls={total_loss_val:.6f}"
             aux_tag = ""
             aux_silent = ""
             if aux_loss_accum:
