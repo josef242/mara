@@ -1428,6 +1428,18 @@ def train_loop(
                     f"aux {' '.join(_aux_dbg_parts)}"
                 )
 
+            # Per-step aux head schedule weights (λ_i). Useful for sanity-
+            # checking tot_ls = Σ λ_i × aux_l_i. Inactive taps (λ == 0)
+            # are omitted to keep the line short.
+            if aux_heads_enabled:
+                _lam_parts = [
+                    f"L{_li}={_w:.4f}"
+                    for _li, _w in sorted(aux_weights_now.items())
+                    if _w != 0.0
+                ]
+                if _lam_parts:
+                    logger.print_and_log(f"  ] lambdas: {' '.join(_lam_parts)}")
+
         if step in settings.restart_steps:
             logger.print_and_log(f"Warm restart: LR {lr:.4e} → clip {clip_value:.2f}")  # TODO: Why am I showing the clip value here?
 
