@@ -9,7 +9,7 @@ ga_schedule:
   - [17_000, 1_000_000]
   - [20_000, 2_000_000]
   - [24_000, 3_000_000]
-B: 4                          # Batch size per GPU
+B: 8                          # Batch size per GPU
 T: 2048                       # Context size (sequence length)
 max_steps: 200_000            # Maximum number of training steps
 eval_iters: 2                 # Number of iterations for evaluation x ranks

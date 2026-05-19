@@ -112,7 +112,6 @@ def calc_group_loss(model, loader, *, eval_iters, device, ddp, dtype, device_typ
     directly comparable across the scaffold-to-full transition.
     """
     tot = torch.tensor(0.0, device=device)
-    n_collected = 0
     with torch.no_grad():
         for _ in range(eval_iters):
             x, y = loader.next_batch()
@@ -124,19 +123,21 @@ def calc_group_loss(model, loader, *, eval_iters, device, ddp, dtype, device_typ
             if scaffold_mode:
                 raw_for_aux = model._orig_mod if hasattr(model, '_orig_mod') else model
                 aux_tensors = getattr(raw_for_aux, '_last_aux_loss_tensors', {}) or {}
+                # Hard fatal rather than continue/early-return: scaffold mode
+                # dispatch is deterministic across ranks (same scs_deepest_tap
+                # everywhere), so a missing aux loss on some rank but not
+                # others would desync the collective below into a hang. If we
+                # hit this it's a real bug and we want it loud.
                 if scs_deepest_tap is None or scs_deepest_tap not in aux_tensors:
-                    # No aux loss available — scaffold mode requires it.
-                    continue
+                    raise RuntimeError(
+                        f"calc_group_loss: scaffold_mode=True but scs_deepest_tap="
+                        f"{scs_deepest_tap} not in aux_tensors {sorted(aux_tensors.keys())}. "
+                        f"Aux head capture path may be misconfigured."
+                    )
                 loss = aux_tensors[scs_deepest_tap]
             tot += loss.detach()
-            n_collected += 1
 
-    if n_collected == 0:
-        # Couldn't compute any iters (only possible in scaffold mode with
-        # missing aux). Return NaN so downstream surfacing makes the issue
-        # visible rather than silently returning 0.
-        return float('nan')
-    tot /= n_collected                      # average over micro-batches actually collected
+    tot /= eval_iters                       # average over micro-batches
     if ddp:
         dist.all_reduce(tot, op=dist.ReduceOp.AVG)   # average across ranks
     return tot.item()                       # every rank now holds the same value
@@ -382,6 +383,10 @@ def compute_scs_activation_events(aux_head_schedules, n_layers, threshold=1.0):
 def scs_compartment_lr_scale(activation_step, warmup_steps, init_mult, step):
     """Per-step LR multiplier for a layer in a freshly-activated compartment.
 
+    Special case: activation_step == 0 (the initial always-active compartment
+        — layers 0..first_tap that train from the very start of the run) is
+        not a "freshly activated" compartment; it returns 1.0 unconditionally
+        so the body trains at full LR from step 0.
     Before activation_step: 0.0 (frozen — when paired with scaffold mode this
         means the layer's params don't get touched by WD either, since the
         optimizer multiplies WD by effective_lr = lr * lr_scale).
@@ -389,6 +394,9 @@ def scs_compartment_lr_scale(activation_step, warmup_steps, init_mult, step):
         init_mult to 1.0.
     After activation_step + warmup_steps: 1.0 (full LR).
     """
+    if activation_step == 0:
+        # Initial compartment — trained from step 0, no soft start.
+        return 1.0
     if step < activation_step:
         return 0.0
     if warmup_steps <= 0 or step >= activation_step + warmup_steps:
@@ -818,20 +826,71 @@ def train_loop(
         compute_scs_activation_events(aux_head_schedules, model_cfg.n_layers)
         if scs_enabled else {}
     )
+    # ── SCS compatibility guards ────────────────────────────────────────────
+    # The SCS freeze relies on the optimiser scaling WD by lr_scale (lr_mods
+    # side-dict). NorMuon (FSDP2_MUON_FAMILY) is wired for this; the
+    # standalone Adam fallback at the lr_mods application site broadcasts a
+    # single param's scale to the whole group and silently freezes
+    # everything (or scales by the wrong amount). Fail fast.
+    if scs_enabled and settings.optimizer_type not in FSDP2_MUON_FAMILY:
+        fatal_error(
+            f"SCS (compute_inactive_layers=false) requires an optimizer in "
+            f"FSDP2_MUON_FAMILY (per-param lr_scale via side-dict). Got "
+            f"optimizer_type='{settings.optimizer_type}'. Either pick a "
+            f"normuon_fsdp2-family optimizer or set "
+            f"auxiliary_heads.compute_inactive_layers: true."
+        )
+    # When weight-tying is on, output.weight IS tok_embeddings.weight (the
+    # same Parameter object). Freezing output.weight during scaffold would
+    # also freeze tok_embeddings, breaking the "tok_embeddings is always
+    # active" invariant. Refuse the combination explicitly.
+    if scs_enabled and getattr(settings, 'tie_word_embeddings', True):
+        fatal_error(
+            "SCS (compute_inactive_layers=false) is incompatible with "
+            "tie_word_embeddings=true: the shared Parameter would be frozen "
+            "(and decayed!) during scaffold along with the LM head. Set "
+            "tie_word_embeddings: false to use SCS."
+        )
+    # SCS + resume_training is plausible (resume a baseline checkpoint with
+    # SCS enabled to scaffold from a pre-trained starting point) but the
+    # tail layers and main head carry their existing trained weights /
+    # optimizer state — scaffold won't touch them, but it also won't reset
+    # them. Make the operator aware so a "scaffold from a fresh start"
+    # expectation isn't silently violated.
+    if scs_enabled and getattr(settings, 'resume_training', False) and ddp_rank == 0:
+        logger.print_and_log(
+            "[SCS] NOTE: resume_training=true with SCS enabled. Inactive tail "
+            "layers + main head are preserved at their checkpointed values "
+            "during scaffold (no fresh init). If you intended scaffold to "
+            "start from a fresh tail, reset those weights manually."
+        )
     # Map layer_idx -> list of Parameter objects in that layer (for fast
     # per-step lr_scale_overrides updates). Also collect output-head params
     # separately so we can freeze them via the same hook during scaffold mode.
     scs_layer_params = {i: [] for i in range(model_cfg.n_layers)}
     scs_output_params = []
+    # Aux-head params per tap layer. Aux heads above the active range during
+    # scaffold get no forward (no grad), but their WD still applies unless
+    # we freeze them via lr_scale=0. Without this they silently decay across
+    # the long scaffolding phases.
+    scs_aux_head_params = {li: [] for li in aux_head_schedules} if scs_enabled else {}
     if scs_enabled:
         import re as _re
         _raw_for_scan = model._orig_mod if hasattr(model, '_orig_mod') else model
         _layer_re = _re.compile(r'layers\.(\d+)\.')
+        _aux_re = _re.compile(r'aux_heads\.(\d+)\.')
         for _name, _p in _raw_for_scan.named_parameters():
             _m = _layer_re.match(_name)
             if _m:
                 scs_layer_params[int(_m.group(1))].append(_p)
-            elif _name.startswith('output.') or _name == 'norm.weight':
+                continue
+            _ma = _aux_re.match(_name)
+            if _ma:
+                _aux_li = int(_ma.group(1))
+                if _aux_li in scs_aux_head_params:
+                    scs_aux_head_params[_aux_li].append(_p)
+                continue
+            if _name.startswith('output.') or _name == 'norm.weight':
                 # Main LM head Linear weight AND final RMSNorm — both should
                 # freeze during scaffold (the scaffold path bypasses them).
                 scs_output_params.append(_p)
@@ -870,11 +929,13 @@ def train_loop(
         is_truncated = active_layers is not None
         trunc_loss_w = truncator.get_loss_weight(active_layers or model_cfg.n_layers) if truncator else 1.0
 
-        # ── SCS dispatch ────────────────────────────────────────────────────
+        # ── SCS dispatch (forward-shape decisions) ──────────────────────────
         # If any aux head is at λ >= 1.0, truncate forward + backward at that
         # depth and skip the main LM head. The deepest active aux head's CE
-        # becomes the effective LM loss.  When the cascade releases (no head at
+        # becomes the effective LM loss. When the cascade releases (no head at
         # λ >= 1.0), scaffold_mode flips off and the network trains end-to-end.
+        # The lr_scale_overrides writes for SCS happen further down, AFTER the
+        # lr_mod_entries loop, so SCS's freeze can't be silently overwritten.
         scs_deepest_tap = None
         scaffold_mode = False
         scs_active_layers = None
@@ -888,21 +949,6 @@ def train_loop(
                 active_layers = scs_active_layers
                 is_truncated = True
                 trunc_loss_w = 1.0
-            # Per-step per-layer LR scale: warmup ramp for active layers,
-            # frozen (0) for layers above the active range during scaffold.
-            for _li in range(model_cfg.n_layers):
-                _scale = scs_compartment_lr_scale(
-                    scs_activation_steps[_li], scs_warmup_steps, scs_init_mult, step,
-                )
-                if scaffold_mode and _li >= scs_active_layers:
-                    _scale = 0.0  # inactive tail — freeze (no fwd, no WD decay)
-                for _p in scs_layer_params[_li]:
-                    lr_scale_overrides[id(_p)] = _scale
-            # Main output head + final norm: frozen during scaffold (path
-            # bypasses them entirely so they should not drift via WD).
-            _out_scale = 0.0 if scaffold_mode else 1.0
-            for _p in scs_output_params:
-                lr_scale_overrides[id(_p)] = _out_scale
 
         model.train()
         optimizer.zero_grad(set_to_none=True)
@@ -914,8 +960,11 @@ def train_loop(
         #   total_loss_accum -- the value the optimizer minimises: main loss
         #                       plus Σ_i w_i * aux_loss_i. Equal to main when
         #                       aux is disabled or all schedule weights are 0.
-        main_loss_accum = 0.0
-        total_loss_accum = 0.0
+        # Initialised as 0-D tensors (not Python floats) so dist.all_reduce
+        # works even when no micro-step contributes a value (rare but
+        # possible under degenerate scaffold configs).
+        main_loss_accum = torch.zeros((), device=device)
+        total_loss_accum = torch.zeros((), device=device)
         # Per-step aux loss bookkeeping. Schedule weights are evaluated once
         # per step (constant within a step, lerp across waypoints). Per-head
         # unweighted CE values accumulate across micro-batches for logging.
@@ -923,10 +972,11 @@ def train_loop(
             {li: interpolate_lr_mod(sched, step) for li, sched in aux_head_schedules.items()}
             if aux_heads_enabled else {}
         )
-        aux_loss_accum = (
-            {li: torch.zeros((), device=device) for li in aux_head_schedules}
-            if aux_heads_enabled else {}
-        )
+        # Lazy-init: only populate entries for aux heads that actually fire
+        # this step. Under SCS scaffold, taps above the active range don't
+        # capture; pre-initialising would log misleading `aux_lN: 0.0000` for
+        # heads that aren't training. Keys are added on first contribution.
+        aux_loss_accum: dict = {}
         grad_accum_steps = grad_accum_schedule[step]
         for micro_step in range(grad_accum_steps):
             x, y = train_loader.next_batch(step=step)
@@ -973,7 +1023,8 @@ def train_loop(
                             w = aux_weights_now.get(li, 0.0)
                             if w != 0.0:
                                 total_loss = (w * t) if total_loss is None else total_loss + w * t
-                            aux_loss_accum[li] = aux_loss_accum[li] + (t.detach().float() / grad_accum_steps)
+                            _add = t.detach().float() / grad_accum_steps
+                            aux_loss_accum[li] = aux_loss_accum[li] + _add if li in aux_loss_accum else _add
                         if scaffold_mode and scs_deepest_tap is not None and scs_deepest_tap in aux_tensors:
                             # The effective LM loss in scaffold mode = deepest
                             # active aux head's CE (the model is literally
@@ -1053,6 +1104,37 @@ def train_loop(
                             else:
                                 param_group['lr'] = torch.tensor(new_lr)
                             break
+
+        # ── SCS lr_scale_overrides (must run AFTER lr_mod_entries so SCS's
+        #    freeze of output.weight / inactive layers can't be silently
+        #    clobbered by an `[out, schedule]` rule like the one
+        #    output_lr_batch_adjust auto-injects).
+        if scs_enabled:
+            # Per-layer compartment warmup + freeze.
+            for _li in range(model_cfg.n_layers):
+                _scale = scs_compartment_lr_scale(
+                    scs_activation_steps[_li], scs_warmup_steps, scs_init_mult, step,
+                )
+                if scaffold_mode and _li >= scs_active_layers:
+                    _scale = 0.0  # inactive tail — freeze (no fwd, no WD decay)
+                for _p in scs_layer_params[_li]:
+                    lr_scale_overrides[id(_p)] = _scale
+            # Main output head + final norm: frozen during scaffold (path
+            # bypasses them entirely so they should not drift via WD).
+            _out_scale = 0.0 if scaffold_mode else 1.0
+            for _p in scs_output_params:
+                lr_scale_overrides[id(_p)] = _out_scale
+            # Aux heads above the active range don't fire during scaffold,
+            # so their params have no gradient — but WD still applies via
+            # the optimizer (effective_lr * wd). Freeze them too so they
+            # don't silently decay across the long scaffolding phases.
+            # Aux heads at or below the active range fire and train at
+            # full LR (no per-aux-head scaling — they're the supervision
+            # signal, not subject to compartment warmup).
+            for _li, _params in scs_aux_head_params.items():
+                _aux_scale = 0.0 if (scaffold_mode and _li > scs_deepest_tap) else 1.0
+                for _p in _params:
+                    lr_scale_overrides[id(_p)] = _aux_scale
 
         # AWD: compute gradient norms and update multipliers (every check_interval steps)
         awd_updated = False
@@ -1144,7 +1226,10 @@ def train_loop(
             # Perplexity is the language-model quality metric — compute against
             # the main NTP loss so it stays comparable to baseline / val_loss.
             ppl = math.exp(main_loss_val)
-            trunc_tag = f" | trunc: {active_layers if is_truncated else model_cfg.n_layers}/{model_cfg.n_layers}" if (truncator and truncator.enabled) else ""
+            # Suppress trunc_tag during SCS scaffold — `scs_tag` already
+            # surfaces the active depth and a duplicated `trunc: 19/70`
+            # alongside `scs: L18/70` reads as two unrelated systems.
+            trunc_tag = f" | trunc: {active_layers if is_truncated else model_cfg.n_layers}/{model_cfg.n_layers}" if (truncator and truncator.enabled and not scaffold_mode) else ""
             bal_tag = f" | bal: {moe_stats[0]['avg_cv']:.3f}" if moe_stats[0] else ""
             drp_tag = f" | drp: {moe_stats[0]['drop_pct']:.2f}%" if moe_stats[0] and moe_stats[0]['drop_pct'] > 0 else ""
             # SCS scaffold tag — surfaces the active tap depth so it's obvious
