@@ -96,7 +96,8 @@ def fatal_error(message: str, exit_code: int = 1):
     os._exit(exit_code)
 
 # -------------------------- Validation --------------------------
-def calc_group_loss(model, loader, *, eval_iters, device, ddp, dtype, device_type):
+def calc_group_loss(model, loader, *, eval_iters, device, ddp, dtype, device_type,
+                    scaffold_mode=False, active_layers=None, scs_deepest_tap=None):
     """
     Return the mean loss for the group that `loader` is currently locked to.
     All ranks run the same number of iterations; the result is averaged across
@@ -104,17 +105,38 @@ def calc_group_loss(model, loader, *, eval_iters, device, ddp, dtype, device_typ
 
     Note: With FSDP2, we must call through the sharded model (not _orig_mod)
     because inputs need to interact with DTensor parameters properly.
+
+    Under SCS scaffold mode, the model's forward returns (None, None) and we
+    pull the deepest active aux head's CE from _last_aux_loss_tensors — same
+    semantic as the training loop's `ls:` field, so val and train stay
+    directly comparable across the scaffold-to-full transition.
     """
     tot = torch.tensor(0.0, device=device)
+    n_collected = 0
     with torch.no_grad():
         for _ in range(eval_iters):
             x, y = loader.next_batch()
             x, y = x.to(device), y.to(device)
             with torch.autocast(device_type=device_type, dtype=dtype):
-                _, loss = model(x, y)
+                _, loss = model(
+                    x, y, active_layers=active_layers, scaffold_mode=scaffold_mode,
+                )
+            if scaffold_mode:
+                raw_for_aux = model._orig_mod if hasattr(model, '_orig_mod') else model
+                aux_tensors = getattr(raw_for_aux, '_last_aux_loss_tensors', {}) or {}
+                if scs_deepest_tap is None or scs_deepest_tap not in aux_tensors:
+                    # No aux loss available — scaffold mode requires it.
+                    continue
+                loss = aux_tensors[scs_deepest_tap]
             tot += loss.detach()
+            n_collected += 1
 
-    tot /= eval_iters                       # average over micro-batches
+    if n_collected == 0:
+        # Couldn't compute any iters (only possible in scaffold mode with
+        # missing aux). Return NaN so downstream surfacing makes the issue
+        # visible rather than silently returning 0.
+        return float('nan')
+    tot /= n_collected                      # average over micro-batches actually collected
     if ddp:
         dist.all_reduce(tot, op=dist.ReduceOp.AVG)   # average across ranks
     return tot.item()                       # every rank now holds the same value
@@ -122,7 +144,8 @@ def calc_group_loss(model, loader, *, eval_iters, device, ddp, dtype, device_typ
 def do_validation(model, val_loader, device, eval_iters,
                   step, ddp_rank, val_log_file,
                   total_tokens_processed,
-                  ddp, ddp_world_size, data_type, device_type):
+                  ddp, ddp_world_size, data_type, device_type,
+                  scaffold_mode=False, active_layers=None, scs_deepest_tap=None):
 
     logger.print_and_log(f"[R{ddp_rank}] running validation at step {step}")
 
@@ -135,7 +158,12 @@ def do_validation(model, val_loader, device, eval_iters,
 
     for g in group_names:
         val_loader.set_val_group(g, eval_iters = eval_iters)
-        loss = calc_group_loss(model, val_loader, eval_iters=eval_iters, device=device, ddp=ddp, dtype=dtype, device_type=device_type)
+        loss = calc_group_loss(
+            model, val_loader, eval_iters=eval_iters, device=device, ddp=ddp,
+            dtype=dtype, device_type=device_type,
+            scaffold_mode=scaffold_mode, active_layers=active_layers,
+            scs_deepest_tap=scs_deepest_tap,
+        )
         group_losses[g] = loss
 
         if ddp:
@@ -282,6 +310,91 @@ def parse_aux_heads_config(aux_cfg):
         schedules[li] = sched
         layers.append(li)
     return sorted(layers), schedules
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Scaffolded Cascading Supervision (SCS) helpers
+# ─────────────────────────────────────────────────────────────────────────────
+def deepest_active_tap(aux_head_schedules, step, threshold=1.0):
+    """Return the deepest aux head layer whose schedule weight at `step` is
+    >= threshold, or None if no head is currently at or above threshold.
+
+    Used by the SCS dispatch (compute_inactive_layers=false) to decide whether
+    to enter scaffold mode and at which depth to truncate the forward."""
+    if not aux_head_schedules:
+        return None
+    deepest = None
+    for li, sched in aux_head_schedules.items():
+        if interpolate_lr_mod(sched, step) >= threshold:
+            if deepest is None or li > deepest:
+                deepest = li
+    return deepest
+
+
+def compute_scs_activation_events(aux_head_schedules, n_layers, threshold=1.0):
+    """Scan the aux head schedules to determine the step at which each layer
+    first becomes "active" under SCS, where:
+
+      * Layers from 0 through the shallowest aux tap are always active from
+        step 0 (the network's initial trainable region).
+      * A compartment between two taps (prev_tap+1 .. next_tap) activates at
+        the first step where the deepest tap at λ >= threshold reaches the
+        deeper tap of the pair.
+      * The "cascade-complete compartment" — layers from the deepest aux tap
+        + 1 through n_layers - 1 — activates at the first step where no aux
+        head is at λ >= threshold (this is also when the main LM head turns on).
+
+    Returns dict[layer_idx -> activation_step]. Layers that never activate
+    within the schedule window get marked as activating at max_step + 1.
+    """
+    sorted_layers = sorted(aux_head_schedules.keys())
+    if not sorted_layers:
+        return {i: 0 for i in range(n_layers)}
+
+    max_step = max(
+        max(s for s, _ in sched)
+        for sched in aux_head_schedules.values()
+    )
+
+    activation = {}
+    first_tap = sorted_layers[0]
+    for li in range(first_tap + 1):
+        activation[li] = 0
+
+    prev_deepest = first_tap
+    for step in range(0, max_step + 2):
+        cur = deepest_active_tap(aux_head_schedules, step, threshold=threshold)
+        if cur is None:
+            # Cascade complete — main head + remaining tail come online here.
+            for li in range(prev_deepest + 1, n_layers):
+                activation.setdefault(li, step)
+            break
+        if cur > prev_deepest:
+            for li in range(prev_deepest + 1, cur + 1):
+                activation.setdefault(li, step)
+            prev_deepest = cur
+
+    for li in range(n_layers):
+        activation.setdefault(li, max_step + 1)
+    return activation
+
+
+def scs_compartment_lr_scale(activation_step, warmup_steps, init_mult, step):
+    """Per-step LR multiplier for a layer in a freshly-activated compartment.
+
+    Before activation_step: 0.0 (frozen — when paired with scaffold mode this
+        means the layer's params don't get touched by WD either, since the
+        optimizer multiplies WD by effective_lr = lr * lr_scale).
+    At activation_step .. activation_step + warmup_steps: linear ramp from
+        init_mult to 1.0.
+    After activation_step + warmup_steps: 1.0 (full LR).
+    """
+    if step < activation_step:
+        return 0.0
+    if warmup_steps <= 0 or step >= activation_step + warmup_steps:
+        return 1.0
+    t = (step - activation_step) / warmup_steps
+    return init_mult + (1.0 - init_mult) * t
 
 
 def parse_lr_mods(lr_mods_config, model):
@@ -690,10 +803,58 @@ def train_loop(
     _, aux_head_schedules = parse_aux_heads_config(getattr(settings, 'auxiliary_heads', None))
     aux_heads_enabled = bool(aux_head_schedules)
 
+    # ── SCS (Scaffolded Cascading Supervision) per-loop state ───────────────
+    # Active when `auxiliary_heads.compute_inactive_layers: false`. The trainer
+    # then truncates forward + backward at the deepest tap currently at
+    # λ >= 1.0 (skipping the main LM head) and ramps each freshly-activated
+    # compartment's LR from new_layer_lr_multiplier up to 1.0 over
+    # new_layer_warmup_steps. Inactive layers (and output.weight during
+    # scaffold) get lr_scale=0 so WD doesn't quietly decay them either.
+    _ah_cfg = getattr(settings, 'auxiliary_heads', None) or {}
+    scs_enabled = aux_heads_enabled and not _ah_cfg.get('compute_inactive_layers', True)
+    scs_warmup_steps = int(_ah_cfg.get('new_layer_warmup_steps', 0)) if scs_enabled else 0
+    scs_init_mult = float(_ah_cfg.get('new_layer_lr_multiplier', 1.0)) if scs_enabled else 1.0
+    scs_activation_steps = (
+        compute_scs_activation_events(aux_head_schedules, model_cfg.n_layers)
+        if scs_enabled else {}
+    )
+    # Map layer_idx -> list of Parameter objects in that layer (for fast
+    # per-step lr_scale_overrides updates). Also collect output-head params
+    # separately so we can freeze them via the same hook during scaffold mode.
+    scs_layer_params = {i: [] for i in range(model_cfg.n_layers)}
+    scs_output_params = []
+    if scs_enabled:
+        import re as _re
+        _raw_for_scan = model._orig_mod if hasattr(model, '_orig_mod') else model
+        _layer_re = _re.compile(r'layers\.(\d+)\.')
+        for _name, _p in _raw_for_scan.named_parameters():
+            _m = _layer_re.match(_name)
+            if _m:
+                scs_layer_params[int(_m.group(1))].append(_p)
+            elif _name.startswith('output.') or _name == 'norm.weight':
+                # Main LM head Linear weight AND final RMSNorm — both should
+                # freeze during scaffold (the scaffold path bypasses them).
+                scs_output_params.append(_p)
+        if ddp_rank == 0:
+            _starts_at = sorted({s for s in scs_activation_steps.values()})
+            logger.print_and_log(
+                f"SCS enabled: activation events @ steps {_starts_at}, "
+                f"warmup {scs_warmup_steps} steps from init_mult={scs_init_mult}"
+            )
+
     # Do a baseline validation before training
     if start_step == 1:
         sync_val_loader()
-        do_validation(model, val_loader, device, settings.eval_iters, 0, ddp_rank, settings.val_log_file, total_tokens_processed, ddp, ddp_world_size, settings.data_type, device_type)
+        _scs_dt0 = deepest_active_tap(aux_head_schedules, 0) if scs_enabled else None
+        _scs_sm0 = _scs_dt0 is not None
+        do_validation(
+            model, val_loader, device, settings.eval_iters, 0, ddp_rank,
+            settings.val_log_file, total_tokens_processed,
+            ddp, ddp_world_size, settings.data_type, device_type,
+            scaffold_mode=_scs_sm0,
+            active_layers=(_scs_dt0 + 1) if _scs_sm0 else None,
+            scs_deepest_tap=_scs_dt0,
+        )
 
     for step in range(start_step, settings.max_steps):
         t0 = time.time()
@@ -708,6 +869,40 @@ def train_loop(
             active_layers = None
         is_truncated = active_layers is not None
         trunc_loss_w = truncator.get_loss_weight(active_layers or model_cfg.n_layers) if truncator else 1.0
+
+        # ── SCS dispatch ────────────────────────────────────────────────────
+        # If any aux head is at λ >= 1.0, truncate forward + backward at that
+        # depth and skip the main LM head. The deepest active aux head's CE
+        # becomes the effective LM loss.  When the cascade releases (no head at
+        # λ >= 1.0), scaffold_mode flips off and the network trains end-to-end.
+        scs_deepest_tap = None
+        scaffold_mode = False
+        scs_active_layers = None
+        if scs_enabled:
+            scs_deepest_tap = deepest_active_tap(aux_head_schedules, step, threshold=1.0)
+            if scs_deepest_tap is not None:
+                scaffold_mode = True
+                scs_active_layers = scs_deepest_tap + 1
+                # SCS takes precedence over the existing truncator (they're
+                # incompatible — truncator weights the loss, SCS drops main).
+                active_layers = scs_active_layers
+                is_truncated = True
+                trunc_loss_w = 1.0
+            # Per-step per-layer LR scale: warmup ramp for active layers,
+            # frozen (0) for layers above the active range during scaffold.
+            for _li in range(model_cfg.n_layers):
+                _scale = scs_compartment_lr_scale(
+                    scs_activation_steps[_li], scs_warmup_steps, scs_init_mult, step,
+                )
+                if scaffold_mode and _li >= scs_active_layers:
+                    _scale = 0.0  # inactive tail — freeze (no fwd, no WD decay)
+                for _p in scs_layer_params[_li]:
+                    lr_scale_overrides[id(_p)] = _scale
+            # Main output head + final norm: frozen during scaffold (path
+            # bypasses them entirely so they should not drift via WD).
+            _out_scale = 0.0 if scaffold_mode else 1.0
+            for _p in scs_output_params:
+                lr_scale_overrides[id(_p)] = _out_scale
 
         model.train()
         optimizer.zero_grad(set_to_none=True)
@@ -754,12 +949,22 @@ def train_loop(
                 if is_truncated and truncator.bypass_compile and hasattr(model, '_orig_mod'):
                     fwd_model = model._orig_mod
                 with torch.autocast(device_type=device_type, dtype=torch.bfloat16 if settings.data_type=="bf16" else torch.float16 if settings.data_type=="fp16" else torch.float32):
-                    logits, main_loss = fwd_model(x, y, active_layers=active_layers)
+                    logits, main_loss = fwd_model(
+                        x, y, active_layers=active_layers, scaffold_mode=scaffold_mode,
+                    )
 
                 # Build total_loss = main + Σ w_i * aux_i (when any aux head
                 # has a nonzero weight at this step). Per-head unweighted CE
                 # accumulates for logging regardless of weight.
+                #
+                # In scaffold_mode, main_loss is None (model skipped the main
+                # LM head); total_loss starts as the deepest active aux head's
+                # weighted contribution and aggregates from there. main_loss
+                # for logging gets set to the deepest active aux head's
+                # unweighted CE — the "effective LM loss" of the partial
+                # network — so `ls:` stays interpretable.
                 total_loss = main_loss
+                main_loss_for_log = None  # set below; either model's main or deepest aux CE
                 if aux_heads_enabled:
                     raw_for_aux = fwd_model._orig_mod if hasattr(fwd_model, '_orig_mod') else fwd_model
                     aux_tensors = getattr(raw_for_aux, '_last_aux_loss_tensors', None) or {}
@@ -767,15 +972,32 @@ def train_loop(
                         for li, t in aux_tensors.items():
                             w = aux_weights_now.get(li, 0.0)
                             if w != 0.0:
-                                total_loss = total_loss + w * t
+                                total_loss = (w * t) if total_loss is None else total_loss + w * t
                             aux_loss_accum[li] = aux_loss_accum[li] + (t.detach().float() / grad_accum_steps)
+                        if scaffold_mode and scs_deepest_tap is not None and scs_deepest_tap in aux_tensors:
+                            # The effective LM loss in scaffold mode = deepest
+                            # active aux head's CE (the model is literally
+                            # training to predict tokens through that head).
+                            main_loss_for_log = aux_tensors[scs_deepest_tap].detach().float()
+
+                if main_loss_for_log is None:
+                    main_loss_for_log = main_loss.detach().float() if main_loss is not None else None
+
+                if total_loss is None:
+                    # Should not happen — scaffold_mode requires at least one
+                    # aux head firing, and non-scaffold paths always return
+                    # main_loss from the model. Guard for clarity.
+                    raise RuntimeError(
+                        "total_loss is None at step {} — no main loss and no aux losses".format(step)
+                    )
 
                 # Apply the same truncation weighting + grad-accum normalisation
                 # to both. backward() runs on total_loss so the optimiser sees
-                # the combined objective; main_loss is recorded for logging.
-                main_loss = main_loss * trunc_loss_w / grad_accum_steps
+                # the combined objective; main_loss_for_log is recorded for
+                # the `ls:` field.
                 total_loss = total_loss * trunc_loss_w / grad_accum_steps
-                main_loss_accum += main_loss.detach().float()
+                if main_loss_for_log is not None:
+                    main_loss_accum += main_loss_for_log * trunc_loss_w / grad_accum_steps
                 total_loss_accum += total_loss.detach().float()
                 total_loss.backward()
 
@@ -925,6 +1147,10 @@ def train_loop(
             trunc_tag = f" | trunc: {active_layers if is_truncated else model_cfg.n_layers}/{model_cfg.n_layers}" if (truncator and truncator.enabled) else ""
             bal_tag = f" | bal: {moe_stats[0]['avg_cv']:.3f}" if moe_stats[0] else ""
             drp_tag = f" | drp: {moe_stats[0]['drop_pct']:.2f}%" if moe_stats[0] and moe_stats[0]['drop_pct'] > 0 else ""
+            # SCS scaffold tag — surfaces the active tap depth so it's obvious
+            # at a glance which phase the run is in. Empty when not in scaffold
+            # mode (cascade complete) or when SCS isn't enabled at all.
+            scs_tag = f" | scs: L{scs_deepest_tap}/{model_cfg.n_layers}" if scaffold_mode else ""
             # Total (optimiser) loss only shown when it differs from main —
             # i.e., when at least one aux head has a nonzero current weight.
             tot_tag = ""
@@ -939,7 +1165,7 @@ def train_loop(
                 aux_tag = " | " + " ".join(f"aux_l{li}: {v:.4f}" for li, v in aux_pairs)
                 aux_silent = "|" + "|".join(f"aux_l{li}={v:.6f}" for li, v in aux_pairs)
             logger.print_and_log(
-                f"st: {step:5d} | ls: {main_loss_val:.6f} | ppl: {ppl:.2f} | lr: {lr:.4e} | nrm: {norm:.4f} [{clip_value:.1f}] | dt: {dt:.2f}s | t_tk: {total_tokens_processed:11,d} | tok/s: {tokens_per_sec:.0f} | MFU: {mfu:.0f}%{bal_tag}{drp_tag}{trunc_tag}{tot_tag}{aux_tag}",
+                f"st: {step:5d} | ls: {main_loss_val:.6f} | ppl: {ppl:.2f} | lr: {lr:.4e} | nrm: {norm:.4f} [{clip_value:.1f}] | dt: {dt:.2f}s | t_tk: {total_tokens_processed:11,d} | tok/s: {tokens_per_sec:.0f} | MFU: {mfu:.0f}%{bal_tag}{drp_tag}{trunc_tag}{scs_tag}{tot_tag}{aux_tag}",
             )
 
             logger.print_and_log(
@@ -952,7 +1178,14 @@ def train_loop(
 
         if step % settings.val_step == 0 or last_step:
             sync_val_loader()
-            do_validation(model, val_loader, device, settings.eval_iters, step, ddp_rank, settings.val_log_file, total_tokens_processed, ddp, ddp_world_size, settings.data_type, device_type)
+            do_validation(
+                model, val_loader, device, settings.eval_iters, step, ddp_rank,
+                settings.val_log_file, total_tokens_processed,
+                ddp, ddp_world_size, settings.data_type, device_type,
+                scaffold_mode=scaffold_mode,
+                active_layers=scs_active_layers,
+                scs_deepest_tap=scs_deepest_tap,
+            )
 
             # Log current data mix if using data annealing
             train_loader.log_schedule_status(step, ddp_rank, logger.print_and_log)
@@ -2693,6 +2926,30 @@ class Settings:
         elif isinstance(self.auxiliary_heads, dict):
             if not self.auxiliary_heads.get('enabled', False):
                 self.auxiliary_heads = None
+            else:
+                ah = self.auxiliary_heads
+                # Scaffolded Cascading Supervision (SCS) optional fields.
+                # compute_inactive_layers: when False, the trainer truncates
+                # forward/backward at the deepest tap currently at λ >= 1.0 and
+                # skips the main LM head. Inactive layers (and output.weight)
+                # are frozen via lr_scale_overrides so WD doesn't decay them.
+                cil = ah.get('compute_inactive_layers', True)
+                if not isinstance(cil, bool):
+                    fatal_error(
+                        f"auxiliary_heads.compute_inactive_layers must be bool, got {type(cil).__name__}"
+                    )
+                if not cil:
+                    # Validate the warmup knobs that come with SCS.
+                    wms = ah.get('new_layer_warmup_steps', 0)
+                    if not isinstance(wms, int) or wms < 0:
+                        fatal_error(
+                            f"auxiliary_heads.new_layer_warmup_steps must be a non-negative int, got {wms!r}"
+                        )
+                    nlm = ah.get('new_layer_lr_multiplier', 1.0)
+                    if not isinstance(nlm, (int, float)) or not (0.0 <= float(nlm) <= 1.0):
+                        fatal_error(
+                            f"auxiliary_heads.new_layer_lr_multiplier must be a float in [0, 1], got {nlm!r}"
+                        )
 
         # --- GDN hybrid attention ---
         if not hasattr(self, 'gdn_enabled'):
@@ -3123,6 +3380,51 @@ if __name__ == "__main__":
             else:
                 _wp = " -> ".join(f"{v} @ step {s:,}" for s, v in _sched)
                 logger.print_and_log(f"  ]   L{_li:>3d}: {_wp}")
+
+    # ----------------------- Log SCS (Scaffolded Cascading Supervision) -----
+    _ah_print = getattr(settings, 'auxiliary_heads', None) or {}
+    if _aux_head_layers and not _ah_print.get('compute_inactive_layers', True) and ddp_rank == 0:
+        _, _scs_sched = parse_aux_heads_config(getattr(settings, 'auxiliary_heads', None))
+        _scs_activation = compute_scs_activation_events(_scs_sched, model_cfg.n_layers)
+        _scs_wms = int(_ah_print.get('new_layer_warmup_steps', 0))
+        _scs_nlm = float(_ah_print.get('new_layer_lr_multiplier', 1.0))
+        # Determine cascade-complete step: the activation step of the layer
+        # one past the deepest aux tap (i.e. the first non-aux-controlled layer).
+        _deepest_tap_layer = max(_aux_head_layers)
+        _cascade_complete = (
+            _scs_activation[_deepest_tap_layer + 1]
+            if _deepest_tap_layer + 1 < model_cfg.n_layers
+            else None
+        )
+        logger.print_and_log(f"Scaffolded Cascading Supervision (SCS):")
+        logger.print_and_log(f"  ] compute_inactive_layers = false  (scaffold mode while any tap is at λ >= 1.0)")
+        logger.print_and_log(
+            f"  ] warmup              = {_scs_wms} steps ramping from {_scs_nlm} -> 1.0 per compartment"
+        )
+        if _cascade_complete is not None:
+            logger.print_and_log(
+                f"  ] cascade complete    = step {_cascade_complete:,} (main LM head + tail layers come online)"
+            )
+        # Group consecutive layers with the same activation step into compartments
+        # for a compact display.
+        logger.print_and_log(f"  ] Compartments       (layer range -> activation step):")
+        _prev_step = None
+        _range_start = 0
+        for _li in range(model_cfg.n_layers):
+            _st = _scs_activation[_li]
+            if _st != _prev_step:
+                if _prev_step is not None:
+                    _end_label = _li - 1
+                    logger.print_and_log(
+                        f"  ]   L{_range_start:>3d}..L{_end_label:>3d}: activates @ step {_prev_step:,}"
+                    )
+                _range_start = _li
+                _prev_step = _st
+        # Trailing range
+        logger.print_and_log(
+            f"  ]   L{_range_start:>3d}..L{model_cfg.n_layers - 1:>3d}: activates @ step {_prev_step:,}"
+        )
+        logger.print_and_log(f"  ] During scaffold: main head + final norm frozen via lr_scale=0; inactive tail likewise.")
 
     # ----------------------- Log training configuration -----------------------
     if ddp_rank == 0:
