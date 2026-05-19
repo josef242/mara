@@ -840,6 +840,17 @@ def train_loop(
             f"normuon_fsdp2-family optimizer or set "
             f"auxiliary_heads.compute_inactive_layers: true."
         )
+    # MuonSphere does a spectral retraction (param.mul_(scale_factor)) BEFORE
+    # the lr_scale lookup, so SCS's "freeze via lr_scale=0" can't actually
+    # freeze MuonSphere-grouped params — they keep getting rescaled to stay
+    # on the spectral sphere every step. Refuse the combination.
+    if scs_enabled and settings.optimizer_type in {"muonsphere_fsdp2", "normuon_sphere_fsdp2"}:
+        fatal_error(
+            f"SCS (compute_inactive_layers=false) is incompatible with "
+            f"MuonSphere optimizers ('muonsphere_fsdp2', 'normuon_sphere_fsdp2'): "
+            f"spectral retraction bypasses the lr_scale freeze. Use a non-Sphere "
+            f"variant (normuon_fsdp2 / muon_fsdp2) for SCS runs."
+        )
     # When weight-tying is on, output.weight IS tok_embeddings.weight (the
     # same Parameter object). Freezing output.weight during scaffold would
     # also freeze tok_embeddings, breaking the "tok_embeddings is always
@@ -874,6 +885,14 @@ def train_loop(
     # we freeze them via lr_scale=0. Without this they silently decay across
     # the long scaffolding phases.
     scs_aux_head_params = {li: [] for li in aux_head_schedules} if scs_enabled else {}
+    # Set of param ids that lr_mods manages — SCS must NOT overwrite their
+    # lr_scale post-cascade (e.g. output_lr_batch_adjust auto-injects an
+    # [out, schedule] entry; SCS clobbering it to 1.0 every step would
+    # silently disable the output-head LR scaling).
+    _lr_mod_managed_param_ids = (
+        {id(p) for p, _ in (lr_mod_entries or [])}
+        if scs_enabled else set()
+    )
     if scs_enabled:
         import re as _re
         _raw_for_scan = model._orig_mod if hasattr(model, '_orig_mod') else model
@@ -1054,9 +1073,13 @@ def train_loop(
 
         # Capture gradient norms before optimizer.step() clears them
         # Only capture on steps right before validation to avoid overhead.
-        # Skip truncated steps — skipped layers have zero gradients which
-        # would corrupt the diagnostics snapshot.
-        if diagnostics is not None and not is_truncated and (step % settings.val_step == 0 or last_step):
+        # Skip diagnostics on truncator-truncated steps (skipped layers
+        # have zero gradients which would corrupt the snapshot). SCS
+        # scaffold IS the steady state for thousands of steps, so we DO
+        # capture there — active-layer entries are valid, frozen-tail
+        # entries are zero/empty and the dashboard already tolerates
+        # missing per-layer data.
+        if diagnostics is not None and (not is_truncated or scaffold_mode) and (step % settings.val_step == 0 or last_step):
             diagnostics.capture_gradients()
 
         if ddp:
@@ -1110,29 +1133,49 @@ def train_loop(
         #    clobbered by an `[out, schedule]` rule like the one
         #    output_lr_batch_adjust auto-injects).
         if scs_enabled:
-            # Per-layer compartment warmup + freeze.
+            # Per-layer compartment warmup + freeze. When SCS has nothing
+            # custom to assert (scale==1.0 AND not in scaffold), defer to
+            # any lr_mods entry that manages the param. During scaffold or
+            # warmup ramp (scale != 1.0), SCS always wins.
             for _li in range(model_cfg.n_layers):
                 _scale = scs_compartment_lr_scale(
                     scs_activation_steps[_li], scs_warmup_steps, scs_init_mult, step,
                 )
                 if scaffold_mode and _li >= scs_active_layers:
                     _scale = 0.0  # inactive tail — freeze (no fwd, no WD decay)
+                _defer = (_scale == 1.0 and not scaffold_mode)
                 for _p in scs_layer_params[_li]:
+                    if _defer and id(_p) in _lr_mod_managed_param_ids:
+                        continue
                     lr_scale_overrides[id(_p)] = _scale
-            # Main output head + final norm: frozen during scaffold (path
-            # bypasses them entirely so they should not drift via WD).
-            _out_scale = 0.0 if scaffold_mode else 1.0
-            for _p in scs_output_params:
-                lr_scale_overrides[id(_p)] = _out_scale
-            # Aux heads above the active range don't fire during scaffold,
-            # so their params have no gradient — but WD still applies via
-            # the optimizer (effective_lr * wd). Freeze them too so they
-            # don't silently decay across the long scaffolding phases.
-            # Aux heads at or below the active range fire and train at
-            # full LR (no per-aux-head scaling — they're the supervision
-            # signal, not subject to compartment warmup).
+            # Main output head + final norm: frozen during scaffold (the
+            # forward path bypasses them entirely so they should not drift
+            # via WD). Post-cascade we ONLY reset to 1.0 for params not
+            # managed by lr_mods — output_lr_batch_adjust auto-injects an
+            # [out, schedule] rule whose effect would be silently clobbered
+            # if SCS unconditionally wrote 1.0 every step.
+            if scaffold_mode:
+                for _p in scs_output_params:
+                    lr_scale_overrides[id(_p)] = 0.0
+            else:
+                for _p in scs_output_params:
+                    if id(_p) not in _lr_mod_managed_param_ids:
+                        lr_scale_overrides[id(_p)] = 1.0
+            # Aux heads:
+            #   * Above active range during scaffold: frozen (no fwd, no
+            #     grad, but WD would still apply without the freeze).
+            #   * Current schedule weight == 0: also frozen — no gradient
+            #     contributes back through them (the trainer's `if w != 0`
+            #     gate skips the multiply-add into total_loss), so the only
+            #     effect they'd see is silent WD decay.
+            #   * Otherwise: full LR.
             for _li, _params in scs_aux_head_params.items():
-                _aux_scale = 0.0 if (scaffold_mode and _li > scs_deepest_tap) else 1.0
+                _w_now = aux_weights_now.get(_li, 0.0)
+                _frozen = (
+                    (scaffold_mode and _li > scs_deepest_tap)
+                    or _w_now == 0.0
+                )
+                _aux_scale = 0.0 if _frozen else 1.0
                 for _p in _params:
                     lr_scale_overrides[id(_p)] = _aux_scale
 
@@ -1199,8 +1242,10 @@ def train_loop(
         if moe_balance_hook is not None:
             moe_balance_hook()
 
-        # Snapshot weights for update ratio diagnostic (before step modifies them)
-        is_diag_step = diagnostics is not None and not is_truncated and (step % settings.val_step == 0 or last_step)
+        # Snapshot weights for update ratio diagnostic (before step modifies them).
+        # Same gating as capture_gradients above — scaffold counts as a valid
+        # capture step even though is_truncated is True.
+        is_diag_step = diagnostics is not None and (not is_truncated or scaffold_mode) and (step % settings.val_step == 0 or last_step)
         if is_diag_step:
             diagnostics.snapshot_weights()
 
