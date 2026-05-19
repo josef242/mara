@@ -860,6 +860,24 @@ def train_loop(
         scs_activation_steps.get(model_cfg.n_layers - 1, 0)
         if scs_enabled else 0
     )
+    # Precomputed compartment ranges for the per-step scs_lr: debug line —
+    # list of (start_layer, end_layer, activation_step). Consecutive layers
+    # with the same activation step group into a single compartment.
+    scs_compartment_ranges = []
+    if scs_enabled:
+        _prev_act = None
+        _range_start = 0
+        for _li in range(model_cfg.n_layers):
+            _st = scs_activation_steps[_li]
+            if _st != _prev_act:
+                if _prev_act is not None:
+                    scs_compartment_ranges.append((_range_start, _li - 1, _prev_act))
+                _range_start = _li
+                _prev_act = _st
+        if _prev_act is not None:
+            scs_compartment_ranges.append(
+                (_range_start, model_cfg.n_layers - 1, _prev_act)
+            )
     # ── SCS compatibility guards ────────────────────────────────────────────
     # The SCS freeze relies on the optimiser scaling WD by lr_scale (lr_mods
     # side-dict). NorMuon (FSDP2_MUON_FAMILY) is wired for this; the
@@ -1382,6 +1400,33 @@ def train_loop(
                 f"{step:5d}|{main_loss_val:.6f}|{ppl:.2f}|{lr:.4e}|{norm:.4f}|{dt:.2f}|{total_tokens_processed:11d}|{tokens_per_sec:.0f}{tot_silent}{aux_silent}",
                 True, settings.train_log_file, silent=True
             )
+
+            # SCS effective-LR debug line — shows per-compartment, output-head,
+            # and per-aux-head lr_scale values at this step. Lets you eyeball
+            # whether warmup ramps are being applied as expected. Easy to grep
+            # away later once we're confident the schedule is firing right.
+            if scs_enabled:
+                _comp_parts = []
+                for _start, _end, _act in scs_compartment_ranges:
+                    _s = scs_compartment_lr_scale(_act, scs_warmup_steps, scs_init_mult, step)
+                    if scaffold_mode and _start >= scs_active_layers:
+                        _s = 0.0
+                    _comp_parts.append(f"L{_start}-{_end}={_s:.3f}")
+                _out_dbg = scs_compartment_lr_scale(
+                    _cascade_complete_step, scs_warmup_steps, scs_init_mult, step,
+                )
+                _aux_dbg_parts = []
+                for _li in sorted(aux_head_schedules):
+                    _wn = aux_weights_now.get(_li, 0.0)
+                    _frz = (
+                        (scaffold_mode and scs_deepest_tap is not None and _li > scs_deepest_tap)
+                        or _wn == 0.0
+                    )
+                    _aux_dbg_parts.append(f"L{_li}={0.0 if _frz else 1.0:.1f}")
+                logger.print_and_log(
+                    f"  ] scs_lr: {' '.join(_comp_parts)} | out={_out_dbg:.3f} | "
+                    f"aux {' '.join(_aux_dbg_parts)}"
+                )
 
         if step in settings.restart_steps:
             logger.print_and_log(f"Warm restart: LR {lr:.4e} → clip {clip_value:.2f}")  # TODO: Why am I showing the clip value here?
