@@ -275,6 +275,13 @@ def parse_aux_heads_config(aux_cfg):
           - layer: 46
             weight: [[0, 0.001], [3000, 0.10]] # [[step, val], ...] = linear interp
 
+    Each waypoint's step must be a non-negative int and steps within a single
+    schedule must be strictly increasing (duplicates would cause a divide-by-
+    zero in interpolate_lr_mod's lerp). Weights must lie in [0, 1] — values
+    outside that range are rejected because higher-level logic (SCS scaffold
+    detection at λ >= 1.0, aux-head weighting into total_loss) assumes the
+    normalised range.
+
     Returns:
         (sorted_layer_list, {layer_idx: schedule}) where schedule is a list of
         (step, weight) tuples suitable for interpolate_lr_mod. Scalar weights
@@ -306,6 +313,26 @@ def parse_aux_heads_config(aux_cfg):
             fatal_error(
                 f"auxiliary_heads.heads[*].weight must be a number or [[step, val], ...]: {w}"
             )
+        # Strict-monotonic step validation: duplicates would divide by zero
+        # in interpolate_lr_mod; negative steps are nonsensical.
+        for _i, (_s, _v) in enumerate(sched):
+            if _s < 0:
+                fatal_error(
+                    f"auxiliary_heads.heads[layer={li}].weight has negative step {_s}"
+                )
+            if _i > 0 and _s == sched[_i - 1][0]:
+                fatal_error(
+                    f"auxiliary_heads.heads[layer={li}].weight has duplicate step {_s} "
+                    f"(would divide by zero in interpolation)"
+                )
+        # Weight bounds: SCS scaffold detection and the trainer's `if w != 0`
+        # gate both assume weights in [0, 1].
+        for _s, _v in sched:
+            if not (0.0 <= _v <= 1.0):
+                fatal_error(
+                    f"auxiliary_heads.heads[layer={li}].weight value {_v} at step {_s} "
+                    f"outside [0, 1] — reject (use schedule weights in the normalised range)"
+                )
         if li in schedules:
             fatal_error(f"auxiliary_heads.heads has duplicate entry for layer {li}")
         schedules[li] = sched
@@ -875,6 +902,39 @@ def train_loop(
             "during scaffold (no fresh init). If you intended scaffold to "
             "start from a fresh tail, reset those weights manually."
         )
+    # SCS is meaningless if scaffold isn't on at step 0 — the schedule fires
+    # cascade-complete immediately, every layer gets activation_step=0
+    # (treated as always-active), and SCS is silently a no-op. Catch this
+    # misconfig at startup rather than letting the user run a 200k-step
+    # baseline thinking they got SCS.
+    if scs_enabled and deepest_active_tap(aux_head_schedules, 0) is None:
+        fatal_error(
+            "SCS (compute_inactive_layers=false) requires at least one aux "
+            "head at lambda >= 1.0 at step 0, but no head's schedule reaches "
+            "that threshold at step 0. Either set the shallowest head's "
+            "weight schedule to start at 1.0, or disable SCS."
+        )
+    # SCS owns body-layer lr_scale during scaffold and warmup phases. Any
+    # lr_mods entry targeting body params (layer-range rules) would be
+    # silently overridden whenever SCS asserts a scale != 1.0. Surface this
+    # at startup so the user knows their lr_mods rule is muted during those
+    # phases. (Aux-head and output-head conflicts are handled by the defer
+    # logic on lr_scale_overrides; this warning is about body layers.)
+    if scs_enabled and ddp_rank == 0:
+        _lr_mod_in_body = []
+        if lr_mod_entries:
+            _body_param_ids = {
+                id(p) for li in range(model_cfg.n_layers) for p in scs_layer_params[li]
+            }
+            _lr_mod_in_body = [p for p, _ in lr_mod_entries if id(p) in _body_param_ids]
+        if _lr_mod_in_body:
+            logger.print_and_log(
+                f"[SCS] WARNING: {len(_lr_mod_in_body)} body-layer lr_mod entries "
+                f"are present. SCS owns body-layer lr_scale during scaffold and "
+                f"warmup phases — those lr_mod entries will be silently overridden "
+                f"in those phases (active only post-cascade for params whose "
+                f"current SCS scale is 1.0)."
+            )
     # Map layer_idx -> list of Parameter objects in that layer (for fast
     # per-step lr_scale_overrides updates). Also collect output-head params
     # separately so we can freeze them via the same hook during scaffold mode.
@@ -1278,9 +1338,16 @@ def train_loop(
             bal_tag = f" | bal: {moe_stats[0]['avg_cv']:.3f}" if moe_stats[0] else ""
             drp_tag = f" | drp: {moe_stats[0]['drop_pct']:.2f}%" if moe_stats[0] and moe_stats[0]['drop_pct'] > 0 else ""
             # SCS scaffold tag — surfaces the active tap depth so it's obvious
-            # at a glance which phase the run is in. Empty when not in scaffold
-            # mode (cascade complete) or when SCS isn't enabled at all.
-            scs_tag = f" | scs: L{scs_deepest_tap}/{model_cfg.n_layers}" if scaffold_mode else ""
+            # at a glance which phase the run is in. Shows the tap depth
+            # during scaffold; shows "done" post-cascade so operators joining
+            # an SCS-enabled run mid-stream can still tell it's an SCS run.
+            # Empty for non-SCS configs.
+            if scaffold_mode:
+                scs_tag = f" | scs: L{scs_deepest_tap}/{model_cfg.n_layers}"
+            elif scs_enabled:
+                scs_tag = " | scs: done"
+            else:
+                scs_tag = ""
             # Total (optimiser) loss only shown when it differs from main —
             # i.e., when at least one aux head has a nonzero current weight.
             tot_tag = ""
@@ -1339,7 +1406,10 @@ def train_loop(
             # Runs the model's eval branch (non-CCE) so h and logits are
             # exposed in the autograd graph; uses torch.autograd.grad so
             # model.grad fields are not touched. One extra val batch consumed.
-            if diagnostics is not None:
+            # Skipped during SCS scaffold — the main output head is frozen and
+            # not in the active forward path, so the metric is undefined and
+            # a full-depth forward would unshard frozen tail params (waste).
+            if diagnostics is not None and not scaffold_mode:
                 try:
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
@@ -1363,8 +1433,11 @@ def train_loop(
             # captured via hooks on a tiny val batch. Eval mode disables
             # activation checkpointing inside TransformerBlock.forward, so each
             # block's intermediates are materialized once and visible to hooks.
+            # Skipped during SCS scaffold — the probe forward would unshard
+            # frozen tail layers + main head and capture meaningless RMS
+            # values through them. Resumes cleanly post-cascade.
             activation_data = None
-            if diagnostics is not None:
+            if diagnostics is not None and not scaffold_mode:
                 try:
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
@@ -1836,8 +1909,19 @@ def resume_training(model, optimizer, train_loader, ddp_rank, settings, grad_acc
             if other_missing:
                 preview = ", ".join(other_missing[:5])
                 ellipsis = ", ..." if len(other_missing) > 5 else ""
+                # Under SCS, scaffold-frozen params (the optimiser's
+                # early-return skips them entirely) never had state created
+                # on save — missing state on resume is expected for those.
+                # Downgrade WARNING → NOTE so an operator resuming a
+                # scaffold run doesn't think the checkpoint is corrupt.
+                _scs_on = (
+                    isinstance(getattr(settings, 'auxiliary_heads', None), dict)
+                    and settings.auxiliary_heads.get('enabled', False)
+                    and not settings.auxiliary_heads.get('compute_inactive_layers', True)
+                )
+                _kind = "NOTE (SCS scaffold)" if _scs_on else "WARNING"
                 logger.print_and_log(
-                    f"  ] {log_prefix}WARNING: optimizer state missing "
+                    f"  ] {log_prefix}{_kind}: optimizer state missing "
                     f"{len(other_missing)} non-aux-head param(s): {preview}{ellipsis}"
                 )
             if aux_missing:
