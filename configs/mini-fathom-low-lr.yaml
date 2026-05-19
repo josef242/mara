@@ -30,7 +30,7 @@ reshard_after_forward: false
 
 # Resume training settings
 resume_training: true
-resume_step: 26_500
+resume_step: 29_000
 resume_data_reset: continue         # Modes are: continue (no reset), soft (reset pct window - change in pct), hard (reset all)
 
 # Gradient clipping
@@ -124,7 +124,7 @@ server_port: 8888
 
 
 # Checkpoint Paths
-nas_root: ../ckpt/mara_fsdp2/                                   # Defaults to ./log/ if not specified
+nas_root: /home/josef/brainbox/checkpoints/current/             # Defaults to ./log/ if not specified
 local_checkpoint_root: ~/checkpoints/                           # Defaults to ~/checkpoints/ if not specified
 # nas_path: ./log/4B-T-AC/                                      # Automatically derived from nas_root/run_name - can be overridden
 # resume_checkpoint_path: ./log/4B-T-AC/model_step_008500.pt    # Automatically derived from nas_root/run_name/model_step_resume_step - can be overridden

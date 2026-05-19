@@ -26,7 +26,7 @@ reshard_after_forward: true
 
 # Resume training settings
 resume_training: true
-resume_step: 11_000
+resume_step: 12_000
 resume_data_reset: continue
 
 # Gradient clipping
@@ -135,5 +135,5 @@ val_log_file: val_log.txt
 server_port: 8888
 
 # Checkpoint Paths
-nas_root: ../ckpt/mara_fsdp2/
+nas_root: /home/josef/brainbox/checkpoints/current/
 local_checkpoint_root: ~/checkpoints/
