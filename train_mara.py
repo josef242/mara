@@ -914,27 +914,6 @@ def train_loop(
             "that threshold at step 0. Either set the shallowest head's "
             "weight schedule to start at 1.0, or disable SCS."
         )
-    # SCS owns body-layer lr_scale during scaffold and warmup phases. Any
-    # lr_mods entry targeting body params (layer-range rules) would be
-    # silently overridden whenever SCS asserts a scale != 1.0. Surface this
-    # at startup so the user knows their lr_mods rule is muted during those
-    # phases. (Aux-head and output-head conflicts are handled by the defer
-    # logic on lr_scale_overrides; this warning is about body layers.)
-    if scs_enabled and ddp_rank == 0:
-        _lr_mod_in_body = []
-        if lr_mod_entries:
-            _body_param_ids = {
-                id(p) for li in range(model_cfg.n_layers) for p in scs_layer_params[li]
-            }
-            _lr_mod_in_body = [p for p, _ in lr_mod_entries if id(p) in _body_param_ids]
-        if _lr_mod_in_body:
-            logger.print_and_log(
-                f"[SCS] WARNING: {len(_lr_mod_in_body)} body-layer lr_mod entries "
-                f"are present. SCS owns body-layer lr_scale during scaffold and "
-                f"warmup phases — those lr_mod entries will be silently overridden "
-                f"in those phases (active only post-cascade for params whose "
-                f"current SCS scale is 1.0)."
-            )
     # Map layer_idx -> list of Parameter objects in that layer (for fast
     # per-step lr_scale_overrides updates). Also collect output-head params
     # separately so we can freeze them via the same hook during scaffold mode.
@@ -978,6 +957,27 @@ def train_loop(
             logger.print_and_log(
                 f"SCS enabled: activation events @ steps {_starts_at}, "
                 f"warmup {scs_warmup_steps} steps from init_mult={scs_init_mult}"
+            )
+
+    # SCS owns body-layer lr_scale during scaffold and warmup phases. Any
+    # lr_mods entry targeting body params would be silently overridden
+    # whenever SCS asserts a scale != 1.0. Surface this at startup so the
+    # user knows their lr_mods rule is muted during those phases. Must run
+    # AFTER scs_layer_params is populated (the named-parameters scan above).
+    if scs_enabled and ddp_rank == 0:
+        _lr_mod_in_body = []
+        if lr_mod_entries:
+            _body_param_ids = {
+                id(p) for li in range(model_cfg.n_layers) for p in scs_layer_params[li]
+            }
+            _lr_mod_in_body = [p for p, _ in lr_mod_entries if id(p) in _body_param_ids]
+        if _lr_mod_in_body:
+            logger.print_and_log(
+                f"[SCS] WARNING: {len(_lr_mod_in_body)} body-layer lr_mod entries "
+                f"are present. SCS owns body-layer lr_scale during scaffold and "
+                f"warmup phases — those lr_mod entries will be silently overridden "
+                f"in those phases (active only post-cascade for params whose "
+                f"current SCS scale is 1.0)."
             )
 
     # Do a baseline validation before training
@@ -1649,6 +1649,18 @@ def save_model(model, optimizer, model_config, step, ddp_rank, ddp_local_rank, t
             # is clean (no "unexpected keys" warning for aux_heads.*.{norm,linear}.weight).
             'aux_head_layers': list(getattr(model_config, 'aux_head_layers', []) or []),
         }
+        # SCS knobs — recorded so a forensic tool / dashboard can tell
+        # whether a checkpoint was produced under scaffold and with which
+        # warmup schedule. Resume still reads these from YAML (settings),
+        # not from the checkpoint, but persisting them here makes a
+        # silent settings drift visible after the fact.
+        _scs_cfg_for_save = getattr(settings, 'auxiliary_heads', None) or {}
+        scs_settings_snapshot = {
+            'compute_inactive_layers': _scs_cfg_for_save.get('compute_inactive_layers', True),
+            'new_layer_warmup_steps': _scs_cfg_for_save.get('new_layer_warmup_steps', 0),
+            'new_layer_lr_multiplier': _scs_cfg_for_save.get('new_layer_lr_multiplier', 1.0),
+        } if isinstance(_scs_cfg_for_save, dict) else None
+
         checkpoint_data = {
             "model": full_sd,
             "config": model_config_dict,
@@ -1660,6 +1672,7 @@ def save_model(model, optimizer, model_config, step, ddp_rank, ddp_local_rank, t
             "optimizer_type": settings.optimizer_type,
             "max_lr": settings.max_lr,
             "cpu_offload": getattr(settings, 'cpu_offload', False),
+            "scs_settings": scs_settings_snapshot,
             "checkpoint_version": "3.0",            # FSDP2 checkpoint format
         }
         checkpoint_path = os.path.join(settings.local_checkpoint_dir, f"model_step_{step:06d}.pt")
