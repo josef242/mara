@@ -853,6 +853,13 @@ def train_loop(
         compute_scs_activation_events(aux_head_schedules, model_cfg.n_layers)
         if scs_enabled else {}
     )
+    # The cascade-complete step is the activation step of the deepest layer
+    # (the last compartment to come online). Used to drive the output-head
+    # warmup ramp post-cascade. 0 when SCS disabled.
+    _cascade_complete_step = (
+        scs_activation_steps.get(model_cfg.n_layers - 1, 0)
+        if scs_enabled else 0
+    )
     # ── SCS compatibility guards ────────────────────────────────────────────
     # The SCS freeze relies on the optimiser scaling WD by lr_scale (lr_mods
     # side-dict). NorMuon (FSDP2_MUON_FAMILY) is wired for this; the
@@ -1208,19 +1215,25 @@ def train_loop(
                     if _defer and id(_p) in _lr_mod_managed_param_ids:
                         continue
                     lr_scale_overrides[id(_p)] = _scale
-            # Main output head + final norm: frozen during scaffold (the
-            # forward path bypasses them entirely so they should not drift
-            # via WD). Post-cascade we ONLY reset to 1.0 for params not
-            # managed by lr_mods — output_lr_batch_adjust auto-injects an
-            # [out, schedule] rule whose effect would be silently clobbered
-            # if SCS unconditionally wrote 1.0 every step.
-            if scaffold_mode:
-                for _p in scs_output_params:
-                    lr_scale_overrides[id(_p)] = 0.0
-            else:
-                for _p in scs_output_params:
-                    if id(_p) not in _lr_mod_managed_param_ids:
-                        lr_scale_overrides[id(_p)] = 1.0
+            # Main output head + final norm: treated as the "cascade-complete
+            # compartment" — they activate at the same step that brings the
+            # tail layers online, and ramp from init_mult to 1.0 over
+            # new_layer_warmup_steps just like any other newly-activated
+            # compartment. Without this ramp the random-init output head
+            # would shock the trained body via backprop on the first
+            # non-scaffold step (large dL/dh through layers 0..deepest_tap).
+            # During scaffold proper, scs_compartment_lr_scale returns 0.0
+            # because step < cascade-complete step, so freeze still holds.
+            # Defers to lr_mods only post-warmup (scale==1.0) to avoid
+            # clobbering output_lr_batch_adjust style rules.
+            _out_scale = scs_compartment_lr_scale(
+                _cascade_complete_step, scs_warmup_steps, scs_init_mult, step,
+            )
+            _out_defer = (_out_scale == 1.0 and not scaffold_mode)
+            for _p in scs_output_params:
+                if _out_defer and id(_p) in _lr_mod_managed_param_ids:
+                    continue
+                lr_scale_overrides[id(_p)] = _out_scale
             # Aux heads:
             #   * Above active range during scaffold: frozen (no fwd, no
             #     grad, but WD would still apply without the freeze).
@@ -3631,6 +3644,10 @@ if __name__ == "__main__":
         if _cascade_complete is not None:
             logger.print_and_log(
                 f"  ] cascade complete    = step {_cascade_complete:,} (main LM head + tail layers come online)"
+            )
+            logger.print_and_log(
+                f"  ] output head warmup = step {_cascade_complete:,} -> {_cascade_complete + _scs_wms:,} "
+                f"(ramps {_scs_nlm} -> 1.0, mirrors tail-compartment warmup)"
             )
         # Group consecutive layers with the same activation step into compartments
         # for a compact display.
