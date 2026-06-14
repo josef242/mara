@@ -30,7 +30,7 @@ reshard_after_forward: false
 
 # Resume training settings
 resume_training: true
-resume_step: 29_000
+resume_step: 29_250
 resume_data_reset: continue         # Modes are: continue (no reset), soft (reset pct window - change in pct), hard (reset all)
 
 # Gradient clipping
