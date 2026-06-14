@@ -856,6 +856,50 @@ def _clip_grad_norm_mixed_mesh(model, max_norm, norm_type=2.0):
     return total_norm
 
 
+def _global_param_norms(params, ddp, norm_type=2.0):
+    """Global (FSDP-reduced) weight-norm and grad-norm over the given params.
+
+    Uses the SAME local-norm**2 -> all_reduce -> sqrt method as
+    _clip_grad_norm_mixed_mesh, so the returned head grad-norm is reduced
+    consistently with the total grad-norm it will be divided by (otherwise a
+    local-shard numerator over a global denominator is meaningless under FSDP).
+    Call AFTER backward and BEFORE clipping so grads are unscaled.
+
+    Returns (weight_norm, grad_norm) as python floats.
+    """
+    from torch.distributed.tensor import DTensor
+
+    w_local_sq = 0.0
+    g_local_sq = 0.0
+    dev = None
+    for p in params:
+        if p is None:
+            continue
+        pw = p._local_tensor if isinstance(p, DTensor) else p
+        dev = pw.device
+        w_local_sq += torch.linalg.vector_norm(pw, norm_type).item() ** norm_type
+        if p.grad is not None:
+            pg = p.grad._local_tensor if isinstance(p.grad, DTensor) else p.grad
+            g_local_sq += torch.linalg.vector_norm(pg, norm_type).item() ** norm_type
+
+    if dev is None:
+        return 0.0, 0.0
+    if ddp:
+        t = torch.tensor([w_local_sq, g_local_sq], device=dev)
+        dist.all_reduce(t)
+        w_local_sq, g_local_sq = t[0].item(), t[1].item()
+    return w_local_sq ** (1.0 / norm_type), g_local_sq ** (1.0 / norm_type)
+
+
+def _head_param(raw_model):
+    """The main LM readout head param = raw_model.output.weight, identified by
+    OBJECT (not name): under weight tying output.weight IS tok_embeddings.weight,
+    which named_parameters() reports only under the embedding name — so a
+    name-based match would miss it. Returns the param (or None)."""
+    out = getattr(raw_model, "output", None)
+    return getattr(out, "weight", None) if out is not None else None
+
+
 # -------------------------- Training Loop --------------------------
 def train_loop(
         model, optimizer, train_loader, val_loader, device, ddp, ddp_rank, ddp_local_rank, ddp_world_size, start_step,
@@ -1119,6 +1163,7 @@ def train_loop(
         # is disabled, so logging gates cleanly on zloss_enabled.
         zloss_accum = torch.zeros((), device=device)
         logZ_accum = torch.zeros((), device=device)
+        logZ_p95_last = 0.0          # last micro-step's logZ 95th pctile (snapshot)
         zloss_alpha_eff = get_zloss_alpha(step, settings)
         # Per-step aux loss bookkeeping. Schedule weights are evaluated once
         # per step (constant within a step, lerp across waypoints). Per-head
@@ -1219,6 +1264,13 @@ def train_loop(
                         zloss_accum += z_sel.detach().float() / grad_accum_steps
                         if logz_sel is not None:
                             logZ_accum += logz_sel.detach().float() / grad_accum_steps
+                        # logZ p95 (tail) — snapshot the last micro-step's value
+                        # (a percentile doesn't average meaningfully; main head
+                        # only — aux taps don't surface it). rms is derived from
+                        # zloss_accum at log time (rms = sqrt(mean logZ**2)).
+                        _p95 = getattr(raw_for_z, '_last_logz_p95', None)
+                        if _p95 is not None:
+                            logZ_p95_last = _p95.detach().float().item()
 
                 # Apply the same truncation weighting + grad-accum normalisation
                 # to both. backward() runs on total_loss so the optimiser sees
@@ -1265,6 +1317,19 @@ def train_loop(
         lr = scheduled_lr
         
         clip_value = settings.clip_warmup if step < settings.warmup_steps else settings.clip_standard
+
+        # Head metrics for the z-loss probe: weight_norm + GLOBAL (FSDP-reduced)
+        # grad_norm of the output head, measured BEFORE clipping so they're
+        # unscaled and consistent with total grad-norm (also pre-clip). The
+        # ratio head.grad_norm/total tells us whether z-loss is actually
+        # touching the readout. Computed only when z-loss is enabled.
+        head_w_norm = head_g_norm = None
+        if zloss_enabled:
+            _raw_hm = model._orig_mod if hasattr(model, '_orig_mod') else model
+            head_w_norm, head_g_norm = _global_param_norms(
+                [_head_param(_raw_hm)], ddp
+            )
+
         norm = _clip_grad_norm_mixed_mesh(model, clip_value)
 
         # Apply per-parameter LR scaling from lr_mods (via side-dict)
@@ -1470,17 +1535,32 @@ def train_loop(
                 aux_tag = " | " + " ".join(f"aux_l{li}: {v:.4f}" for li, v in aux_pairs)
                 aux_silent = "|" + "|".join(f"aux_l{li}={v:.6f}" for li, v in aux_pairs)
             # Z-loss columns: zloss (raw mean(logZ**2), pre-alpha), logZ
-            # (mean logZ), z_a (effective alpha applied this step). These are
-            # display-only diagnostics — the headline ls:/ppl above stay PURE
-            # CE for comparability across runs. Appended last so existing
-            # log parsers for non-zloss runs are unaffected.
+            # (mean logZ), logZ_rms (sqrt mean logZ**2), logZ_p95 (tail), z_a
+            # (effective alpha this step), and the HEAD-mechanism probe columns
+            # (hd_wn = head weight norm, hd_gn = head grad norm GLOBAL/pre-clip,
+            # hd_gr = head_grad/total_grad ratio — does z-loss touch the
+            # readout?). Display-only diagnostics — the headline ls:/ppl above
+            # stay PURE CE. Appended last so non-zloss log parsers are
+            # unaffected. rms = sqrt(zloss); ratio uses `norm` (total grad-norm,
+            # also pre-clip), so numerator and denominator are reduced
+            # consistently.
             z_tag = ""
             z_silent = ""
             if zloss_enabled:
                 zloss_val = zloss_accum.item()
                 logZ_val = logZ_accum.item()
-                z_tag = f" | zloss: {zloss_val:.4f} | logZ: {logZ_val:.4f} | z_a: {zloss_alpha_eff:.4e}"
-                z_silent = f"|zloss={zloss_val:.6f}|logZ={logZ_val:.6f}|z_a={zloss_alpha_eff:.6e}"
+                logZ_rms = zloss_val ** 0.5 if zloss_val > 0 else 0.0
+                hd_gr = (head_g_norm / norm) if (head_g_norm is not None and norm > 0) else 0.0
+                z_tag = (f" | zloss: {zloss_val:.4f} | logZ: {logZ_val:.4f}"
+                         f" | logZ_rms: {logZ_rms:.4f} | logZ_p95: {logZ_p95_last:.4f}"
+                         f" | z_a: {zloss_alpha_eff:.4e}"
+                         f" | hd_wn: {(head_w_norm or 0.0):.4f} | hd_gn: {(head_g_norm or 0.0):.4e}"
+                         f" | hd_gr: {hd_gr:.4f}")
+                z_silent = (f"|zloss={zloss_val:.6f}|logZ={logZ_val:.6f}"
+                            f"|logZ_rms={logZ_rms:.6f}|logZ_p95={logZ_p95_last:.6f}"
+                            f"|z_a={zloss_alpha_eff:.6e}"
+                            f"|hd_wn={(head_w_norm or 0.0):.6f}|hd_gn={(head_g_norm or 0.0):.6e}"
+                            f"|hd_gr={hd_gr:.6f}")
             logger.print_and_log(
                 f"st: {step:5d} | ls: {main_loss_val:.6f} | ppl: {ppl:.2f} | lr: {lr:.4e} | nrm: {norm:.4f} [{clip_value:.1f}] | dt: {dt:.2f}s | t_tk: {total_tokens_processed:11,d} | tok/s: {tokens_per_sec:.0f} | MFU: {mfu:.0f}%{bal_tag}{drp_tag}{trunc_tag}{scs_tag}{tot_tag}{aux_tag}{z_tag}",
             )
