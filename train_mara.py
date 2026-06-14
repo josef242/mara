@@ -248,6 +248,47 @@ def get_lr(it: int, settings):
         fatal_error(f"Unknown lr_schedule_type: '{schedule_type}'\nValid options: 'cosine', 'restarts', 'plateau'")
 
 
+def get_zloss_alpha(step: int, settings) -> float:
+    """Effective z-loss coefficient at absolute global `step`.
+
+    Pure function of (global step + static z_loss config) -> resume-safe with
+    NO new checkpoint state, exactly like get_lr: it keys off the same global
+    `step` loop variable that round-trips through checkpoint save/load (on
+    resume, start_step = checkpoint['step'] + 1), so alpha_eff at a given
+    global step is identical across kill/resume.
+
+    Returns 0.0 when z-loss is disabled. With warmup disabled the full target
+    alpha applies immediately (the non-annealed behavior). Otherwise, with
+    progress = clamp((step - start_step) / duration_steps, 0, 1):
+        cosine (default): alpha * (1 - cos(pi * progress)) / 2
+        linear:           alpha * progress
+    Before start_step -> 0.0; at/after start_step + duration_steps -> alpha.
+    """
+    z = getattr(settings, 'z_loss', None)
+    if z is None:
+        return 0.0
+    alpha = float(z.get('alpha', 0.0))
+    warmup = z.get('warmup') or {}
+    if not warmup.get('enabled', False):
+        return alpha
+    start_step = int(warmup.get('start_step', 0))
+    duration = int(warmup.get('duration_steps', 1))
+    shape = warmup.get('shape', 'cosine')
+    if step <= start_step:
+        return 0.0
+    if duration <= 0:
+        return alpha
+    progress = (step - start_step) / duration
+    if progress >= 1.0:
+        return alpha
+    if progress < 0.0:
+        progress = 0.0
+    if shape == 'linear':
+        return alpha * progress
+    # cosine (default): zero-slope at both ends — gentlest onset, no kink.
+    return alpha * (1.0 - math.cos(math.pi * progress)) / 2.0
+
+
 def interpolate_lr_mod(schedule, step):
     """Linear interpolation of lr_mod schedule. Returns scale factor (1.0 = normal)."""
     if step <= schedule[0][0]:
@@ -837,6 +878,9 @@ def train_loop(
     # Startup config printout happens at the top of train() — not here.
     _, aux_head_schedules = parse_aux_heads_config(getattr(settings, 'auxiliary_heads', None))
     aux_heads_enabled = bool(aux_head_schedules)
+    # z-loss gate (single source of truth for the micro-step fold + log emit).
+    # settings.z_loss is None exactly when disabled (normalized in Settings).
+    zloss_enabled = getattr(settings, 'z_loss', None) is not None
 
     # ── SCS (Scaffolded Cascading Supervision) per-loop state ───────────────
     # Active when `auxiliary_heads.compute_inactive_layers: false`. The trainer
@@ -1069,6 +1113,13 @@ def train_loop(
         # possible under degenerate scaffold configs).
         main_loss_accum = torch.zeros((), device=device)
         total_loss_accum = torch.zeros((), device=device)
+        # Z-loss bookkeeping (RAW, pre-alpha) for the live LM readout head.
+        # zloss_alpha_eff is a pure function of the absolute global step ->
+        # resume-safe, no checkpoint state. Accumulators stay zero when z-loss
+        # is disabled, so logging gates cleanly on zloss_enabled.
+        zloss_accum = torch.zeros((), device=device)
+        logZ_accum = torch.zeros((), device=device)
+        zloss_alpha_eff = get_zloss_alpha(step, settings)
         # Per-step aux loss bookkeeping. Schedule weights are evaluated once
         # per step (constant within a step, lerp across waypoints). Per-head
         # unweighted CE values accumulate across micro-batches for logging.
@@ -1146,6 +1197,29 @@ def train_loop(
                         "total_loss is None at step {} — no main loss and no aux losses".format(step)
                     )
 
+                # Z-loss: select the SAME head that drives main_loss_for_log —
+                # the deepest active aux tap under SCS scaffold, else the
+                # model's main head — and fold alpha_eff * zloss into the
+                # objective. Shallow scaffolding aux taps never contribute.
+                # Added BEFORE the trunc/grad-accum scaling below so the z term
+                # gets the identical normalisation as the rest of total_loss.
+                # The raw (pre-alpha) value is accumulated for logging; the
+                # headline ls:/ppl stay pure CE (they read main_loss_accum).
+                if zloss_enabled:
+                    raw_for_z = fwd_model._orig_mod if hasattr(fwd_model, '_orig_mod') else fwd_model
+                    if scaffold_mode and scs_deepest_tap is not None:
+                        z_sel = (getattr(raw_for_z, '_last_aux_zloss', None) or {}).get(scs_deepest_tap)
+                        logz_sel = (getattr(raw_for_z, '_last_aux_logz', None) or {}).get(scs_deepest_tap)
+                    else:
+                        z_sel = getattr(raw_for_z, '_last_zloss', None)
+                        logz_sel = getattr(raw_for_z, '_last_logz', None)
+                    if z_sel is not None:
+                        if zloss_alpha_eff != 0.0:
+                            total_loss = total_loss + zloss_alpha_eff * z_sel
+                        zloss_accum += z_sel.detach().float() / grad_accum_steps
+                        if logz_sel is not None:
+                            logZ_accum += logz_sel.detach().float() / grad_accum_steps
+
                 # Apply the same truncation weighting + grad-accum normalisation
                 # to both. backward() runs on total_loss so the optimiser sees
                 # the combined objective; main_loss_for_log is recorded for
@@ -1172,6 +1246,9 @@ def train_loop(
             dist.all_reduce(total_loss_accum, op=dist.ReduceOp.AVG)
             for _li in aux_loss_accum:
                 dist.all_reduce(aux_loss_accum[_li], op=dist.ReduceOp.AVG)
+            if zloss_enabled:
+                dist.all_reduce(zloss_accum, op=dist.ReduceOp.AVG)
+                dist.all_reduce(logZ_accum, op=dist.ReduceOp.AVG)
 
         # Moonlight-style: unified LR for all param groups
         # With rms_scale=True, the 0.2*sqrt(max(A,B)) scaling in Muon
@@ -1392,12 +1469,24 @@ def train_loop(
                 aux_pairs = sorted((li, v.item()) for li, v in aux_loss_accum.items())
                 aux_tag = " | " + " ".join(f"aux_l{li}: {v:.4f}" for li, v in aux_pairs)
                 aux_silent = "|" + "|".join(f"aux_l{li}={v:.6f}" for li, v in aux_pairs)
+            # Z-loss columns: zloss (raw mean(logZ**2), pre-alpha), logZ
+            # (mean logZ), z_a (effective alpha applied this step). These are
+            # display-only diagnostics — the headline ls:/ppl above stay PURE
+            # CE for comparability across runs. Appended last so existing
+            # log parsers for non-zloss runs are unaffected.
+            z_tag = ""
+            z_silent = ""
+            if zloss_enabled:
+                zloss_val = zloss_accum.item()
+                logZ_val = logZ_accum.item()
+                z_tag = f" | zloss: {zloss_val:.4f} | logZ: {logZ_val:.4f} | z_a: {zloss_alpha_eff:.4e}"
+                z_silent = f"|zloss={zloss_val:.6f}|logZ={logZ_val:.6f}|z_a={zloss_alpha_eff:.6e}"
             logger.print_and_log(
-                f"st: {step:5d} | ls: {main_loss_val:.6f} | ppl: {ppl:.2f} | lr: {lr:.4e} | nrm: {norm:.4f} [{clip_value:.1f}] | dt: {dt:.2f}s | t_tk: {total_tokens_processed:11,d} | tok/s: {tokens_per_sec:.0f} | MFU: {mfu:.0f}%{bal_tag}{drp_tag}{trunc_tag}{scs_tag}{tot_tag}{aux_tag}",
+                f"st: {step:5d} | ls: {main_loss_val:.6f} | ppl: {ppl:.2f} | lr: {lr:.4e} | nrm: {norm:.4f} [{clip_value:.1f}] | dt: {dt:.2f}s | t_tk: {total_tokens_processed:11,d} | tok/s: {tokens_per_sec:.0f} | MFU: {mfu:.0f}%{bal_tag}{drp_tag}{trunc_tag}{scs_tag}{tot_tag}{aux_tag}{z_tag}",
             )
 
             logger.print_and_log(
-                f"{step:5d}|{main_loss_val:.6f}|{ppl:.2f}|{lr:.4e}|{norm:.4f}|{dt:.2f}|{total_tokens_processed:11d}|{tokens_per_sec:.0f}{tot_silent}{aux_silent}",
+                f"{step:5d}|{main_loss_val:.6f}|{ppl:.2f}|{lr:.4e}|{norm:.4f}|{dt:.2f}|{total_tokens_processed:11d}|{tokens_per_sec:.0f}{tot_silent}{aux_silent}{z_silent}",
                 True, settings.train_log_file, silent=True
             )
 
@@ -3248,6 +3337,49 @@ class Settings:
                             f"auxiliary_heads.new_layer_lr_multiplier must be a float in [0, 1], got {nlm!r}"
                         )
 
+        # --- z_loss: optional confidence penalty on logsumexp (log-partition) ---
+        # Mirrors adaptive_wd/auxiliary_heads normalization: default None, and
+        # collapse to None unless explicitly enabled so downstream code only
+        # checks `settings.z_loss is not None`. The block is read by
+        # get_zloss_alpha(step, settings) — a pure function of the global step,
+        # so nothing here needs to persist in the checkpoint.
+        if not hasattr(self, 'z_loss'):
+            self.z_loss = None
+        elif isinstance(self.z_loss, dict):
+            if not self.z_loss.get('enabled', False):
+                self.z_loss = None
+            else:
+                zl = self.z_loss
+                a = zl.get('alpha', None)
+                if not isinstance(a, (int, float)) or float(a) < 0.0:
+                    fatal_error(
+                        f"z_loss.alpha must be a non-negative number, got {a!r}"
+                    )
+                warmup = zl.get('warmup')
+                if warmup is not None:
+                    if not isinstance(warmup, dict):
+                        fatal_error(
+                            f"z_loss.warmup must be a dict, got {type(warmup).__name__}"
+                        )
+                    if warmup.get('enabled', False):
+                        ss = warmup.get('start_step', 0)
+                        if not isinstance(ss, int) or ss < 0:
+                            fatal_error(
+                                f"z_loss.warmup.start_step must be a non-negative int, got {ss!r}"
+                            )
+                        ds = warmup.get('duration_steps', None)
+                        if not isinstance(ds, int) or ds <= 0:
+                            fatal_error(
+                                f"z_loss.warmup.duration_steps must be a positive int, got {ds!r}"
+                            )
+                        shp = warmup.get('shape', 'cosine')
+                        if shp not in ('cosine', 'linear'):
+                            fatal_error(
+                                f"z_loss.warmup.shape must be 'cosine' or 'linear', got {shp!r}"
+                            )
+        elif self.z_loss is not None:
+            fatal_error(f"z_loss must be a dict, got {type(self.z_loss).__name__}")
+
         # --- GDN hybrid attention ---
         if not hasattr(self, 'gdn_enabled'):
             self.gdn_enabled = False
@@ -3603,6 +3735,14 @@ if __name__ == "__main__":
 
     # ----------------------- Create and shard model -----------------------
     model = create_and_shard_model(model_cfg, mesh, ep_mesh, edp_mesh, device, settings, logger)
+
+    # Z-loss is a trainer/loss-path concern, not a ModelArgs/architecture knob,
+    # so flip the flag on the raw module post-build (before per-submodule
+    # compile at the bottom of setup; that leaves the root unwrapped, so the
+    # flag persists). When False the model's loss path is byte-for-byte
+    # identical to baseline — return_lse is never requested.
+    _raw_for_zloss = model._orig_mod if hasattr(model, "_orig_mod") else model
+    _raw_for_zloss._compute_zloss = settings.z_loss is not None
 
     # ----------------------- Print model summary -----------------------
     flops_per_token = 0

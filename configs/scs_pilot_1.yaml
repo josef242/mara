@@ -94,6 +94,22 @@ auxiliary_heads:
     - layer: 52
       weight: [[0, 0.0], [9750, 1.0], [12250, 1.0], [13000, 0.1]]
 
+# z-loss: log-partition regularization (confidence penalty on logsumexp).
+# Penalizes mean(logZ**2) on whichever head is the live LM readout (main head
+# normally, deepest active aux tap under SCS scaffold) — tethering absolute
+# logit magnitude without penalizing logit differences. OFF by default ->
+# byte-for-byte identical to baseline. alpha is sweepable (1e-5 .. 1e-3).
+# The optional warmup ramps alpha 0 -> target by ABSOLUTE global step, so it
+# is resume-safe (no checkpoint state; kill/resume yields the same alpha_eff).
+z_loss:
+  enabled: false          # master switch; false -> no z-loss at all
+  alpha: 1.0e-4           # target coefficient on mean(logZ**2)
+  warmup:
+    enabled: false        # false -> alpha applied at full target immediately
+    start_step: 0         # absolute global step at which the ramp begins
+    duration_steps: 3000  # steps over which alpha goes 0 -> target
+    shape: cosine         # cosine (default, zero-slope ends) | linear
+
 data_root_path: ../../notebooks/datasets/tokenized/llama/
 groups:
   - [stories, 50.0]             #
