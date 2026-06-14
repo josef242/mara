@@ -119,6 +119,13 @@ auxiliary_heads:
 z_loss:
   enabled: false          # master switch; false -> no z-loss at all
   alpha: 1.0e-4           # target coefficient on mean(logZ**2)
+  # backend: gradient precision vs memory. logZ is reconstructed from CCE
+  # (which lacks return_lse) as CE_none + target_logit, a bf16 catastrophic
+  # cancellation. Measured on rig (CCE 25.4.3):
+  #   fp32_accum (default): fp32 accumulation in CCE's backward -> grad cosine
+  #     ~0.999 vs analytic truth, ~+0.45 GB at the head shape. Trustworthy.
+  #   bf16: lightest memory, grad cosine ~0.990 (fine for a small annealed reg).
+  backend: fp32_accum     # fp32_accum (default) | bf16
   warmup:
     enabled: false        # false -> alpha applied at full target immediately
     start_step: 0         # absolute global step at which the ramp begins

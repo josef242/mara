@@ -3355,6 +3355,18 @@ class Settings:
                     fatal_error(
                         f"z_loss.alpha must be a non-negative number, got {a!r}"
                     )
+                # backend: precision/memory tradeoff for the option-D z-loss
+                # gradient (CCE 25.4.3 has no return_lse; logZ is reconstructed
+                # as CE_none + target_logit, a bf16 catastrophic cancellation).
+                #   'fp32_accum' (default): CCE accum_e/c_fp32 in the backward ->
+                #       grad cosine ~0.999 vs fp32 truth, ~+0.45 GB at the head.
+                #   'bf16': lightest memory, grad cosine ~0.990 (fine for a small
+                #       annealed regularizer).
+                bk = zl.get('backend', 'fp32_accum')
+                if bk not in ('bf16', 'fp32_accum'):
+                    fatal_error(
+                        f"z_loss.backend must be 'bf16' or 'fp32_accum', got {bk!r}"
+                    )
                 warmup = zl.get('warmup')
                 if warmup is not None:
                     if not isinstance(warmup, dict):
@@ -3737,12 +3749,17 @@ if __name__ == "__main__":
     model = create_and_shard_model(model_cfg, mesh, ep_mesh, edp_mesh, device, settings, logger)
 
     # Z-loss is a trainer/loss-path concern, not a ModelArgs/architecture knob,
-    # so flip the flag on the raw module post-build (before per-submodule
+    # so set the backend flag on the raw module post-build (before per-submodule
     # compile at the bottom of setup; that leaves the root unwrapped, so the
-    # flag persists). When False the model's loss path is byte-for-byte
-    # identical to baseline — return_lse is never requested.
+    # flag persists). _zloss_fp32_accum: None=off (loss path byte-for-byte
+    # identical to baseline) | False=bf16 backend | True=fp32_accum backend.
     _raw_for_zloss = model._orig_mod if hasattr(model, "_orig_mod") else model
-    _raw_for_zloss._compute_zloss = settings.z_loss is not None
+    if settings.z_loss is None:
+        _raw_for_zloss._zloss_fp32_accum = None
+    else:
+        _raw_for_zloss._zloss_fp32_accum = (
+            settings.z_loss.get('backend', 'fp32_accum') == 'fp32_accum'
+        )
 
     # ----------------------- Print model summary -----------------------
     flops_per_token = 0

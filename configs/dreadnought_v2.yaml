@@ -116,6 +116,45 @@ auxiliary_heads:
     - layer: 60
       weight: [[11000, 0.0], [11700, 0.04], [13250, 0.1109], [15000, 0.12]]
 
+# z-loss: log-partition regularization (confidence penalty on logsumexp).
+# Adds alpha * mean(logZ**2) to the objective on the live LM readout head
+# (the main head here — aux heads at L50/L55/L60 are auxiliary, not scaffold,
+# so the main head is doing the LM prediction). It tethers the *absolute*
+# magnitude of the logit vector without penalizing logit *differences*, which
+# counteracts the unbounded-softmax pressure that grows the output head's
+# dominant singular value (and its grad norm) over long training.
+#
+# OFF by default -> byte-for-byte identical to baseline. Commented out below so
+# nothing changes until you opt in.
+#
+# Example schedule tuned for dreadnought_v2's CURRENT state (≈ step 17.6k of
+# 200k, ~8.8% in; settled at train-loss ~2.0 / val-ppl ~6.96; LR on the cosine
+# tail near max). Because the run has equilibrated for ~17k steps WITHOUT a
+# z-penalty, switching it on at full strength would be a regime change — the
+# first-step corrective gradient is proportional to the current (large,
+# unrestrained) logZ. So we ANNEAL: alpha ramps 0 -> target so the force starts
+# infinitesimal and grows gradually, letting the head/body relocate to the new
+# (smaller-logit) equilibrium smoothly. Cosine starts AND ends with zero slope
+# -> gentlest possible onset, no kink at full strength.
+#
+# start_step is keyed to the ABSOLUTE global step (resume-safe: no checkpoint
+# state, identical alpha at a given step across kill/resume). Set it a few
+# hundred steps ahead of "now" so the ramp begins from a clean known point —
+# 18000 here. duration 4000 (18k->22k, ≈100M tokens at B3*T8192) is a gentle
+# ~2%-of-training ramp; shorten to ~2000 for a faster phase-in or lengthen if
+# you see a transient. Watch the new logZ column come DOWN as z_a ramps UP,
+# with no cliff in val ppl or generation quality.
+# z_loss:
+#   enabled: true
+#   alpha: 1.0e-4           # target coefficient (ST-MoE/PaLM default; sweep 1e-5..1e-3)
+#   backend: fp32_accum     # fp32_accum (default): grad cos ~0.999, ~+0.45 GB at head
+#                           # bf16: lightest memory, grad cos ~0.990 (ok for small reg)
+#   warmup:
+#     enabled: true
+#     start_step: 18000     # absolute global step at which the ramp begins
+#     duration_steps: 4000  # 18000 -> 22000 ramp (0 -> alpha)
+#     shape: cosine         # cosine (default, zero-slope ends) | linear
+
 # weight_decay:
 #   - [all, 0.02]
 #   - [emb, 0.02]
