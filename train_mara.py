@@ -3964,6 +3964,36 @@ if __name__ == "__main__":
         )
         logger.print_and_log(f"  ] During scaffold: main head + final norm frozen via lr_scale=0; inactive tail likewise.")
 
+    # ----------------------- Log z-loss (log-partition regularization) --------
+    _zl = getattr(settings, 'z_loss', None)
+    if _zl is not None and ddp_rank == 0:
+        _zl_alpha = float(_zl.get('alpha', 0.0))
+        _zl_backend = _zl.get('backend', 'fp32_accum')
+        _zl_grad = '~0.999 cos / ~0.05 norm-rel' if _zl_backend == 'fp32_accum' \
+            else '~0.990 cos / ~0.12 norm-rel'
+        logger.print_and_log(f"Z-Loss (log-partition regularization):")
+        logger.print_and_log(
+            f"  ] objective      = CE + alpha * mean(logZ^2) on the live LM readout head"
+        )
+        logger.print_and_log(f"  ] alpha (target) = {_zl_alpha:.3e}")
+        logger.print_and_log(
+            f"  ] backend        = {_zl_backend}  (option-D reconstruction; grad {_zl_grad} vs fp32 truth)"
+        )
+        _zw = _zl.get('warmup') or {}
+        if _zw.get('enabled', False):
+            _zw_start = int(_zw.get('start_step', 0))
+            _zw_dur = int(_zw.get('duration_steps', 1))
+            _zw_shape = _zw.get('shape', 'cosine')
+            logger.print_and_log(
+                f"  ] alpha warmup   = {_zw_shape} ramp 0 -> {_zl_alpha:.3e} "
+                f"over steps {_zw_start:,}..{_zw_start + _zw_dur:,} (absolute global step, resume-safe)"
+            )
+        else:
+            logger.print_and_log(f"  ] alpha warmup   = disabled (full alpha applied immediately)")
+        logger.print_and_log(
+            f"  ] headline ls/ppl stay PURE CE; zloss/logZ/logZ_rms/logZ_p95/z_a + head metrics (hd_*) logged separately"
+        )
+
     # ----------------------- Log training configuration -----------------------
     if ddp_rank == 0:
         logger.print_and_log(f"Training Config:")
