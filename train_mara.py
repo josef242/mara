@@ -1165,6 +1165,7 @@ def train_loop(
         logZ_accum = torch.zeros((), device=device)
         logZ_p95_last = 0.0          # last micro-step's logZ 95th pctile (snapshot)
         zloss_alpha_eff = get_zloss_alpha(step, settings)
+        zloss_diag = None            # snapshot dict for diagnostics.jsonl (None when z-loss off)
         # Per-step aux loss bookkeeping. Schedule weights are evaluated once
         # per step (constant within a step, lerp across waypoints). Per-head
         # unweighted CE values accumulate across micro-batches for logging.
@@ -1561,6 +1562,15 @@ def train_loop(
                             f"|z_a={zloss_alpha_eff:.6e}"
                             f"|hd_wn={(head_w_norm or 0.0):.6f}|hd_gn={(head_g_norm or 0.0):.6e}"
                             f"|hd_gr={hd_gr:.6f}")
+                # Snapshot the latest per-step z-loss stats so the val-cadence
+                # diagnostics record (diagnostics.jsonl) can carry a structured
+                # z_loss block. Per-step resolution stays in train_log.txt.
+                zloss_diag = {
+                    'zloss': zloss_val, 'logZ': logZ_val, 'logZ_rms': logZ_rms,
+                    'logZ_p95': logZ_p95_last, 'z_a': zloss_alpha_eff,
+                    'hd_wn': (head_w_norm or 0.0), 'hd_gn': (head_g_norm or 0.0),
+                    'hd_gr': hd_gr,
+                }
             logger.print_and_log(
                 f"st: {step:5d} | ls: {main_loss_val:.6f} | ppl: {ppl:.2f} | lr: {lr:.4e} | nrm: {norm:.4f} [{clip_value:.1f}] | dt: {dt:.2f}s | t_tk: {total_tokens_processed:11,d} | tok/s: {tokens_per_sec:.0f} | MFU: {mfu:.0f}%{bal_tag}{drp_tag}{trunc_tag}{scs_tag}{tot_tag}{aux_tag}{z_tag}",
             )
@@ -1716,6 +1726,7 @@ def train_loop(
                     step, settings.nas_path, total_tokens_processed,
                     awd_data=awd_diag, moe_data=moe_diag,
                     activation_data=activation_data,
+                    zloss_data=zloss_diag,
                 )
                 diagnostics.print_summary(snapshot, logger, awd_data=awd_diag, moe_data=moe_diag)
 
