@@ -26,7 +26,7 @@ reshard_after_forward: true
 
 # Resume training settings
 resume_training: true
-resume_step: 13_250
+resume_step: 18_500
 resume_data_reset: continue
 
 # Gradient clipping
@@ -144,16 +144,29 @@ auxiliary_heads:
 # ~2%-of-training ramp; shorten to ~2000 for a faster phase-in or lengthen if
 # you see a transient. Watch the new logZ column come DOWN as z_a ramps UP,
 # with no cliff in val ppl or generation quality.
-# z_loss:
-#   enabled: true
-#   alpha: 1.0e-4           # target coefficient (ST-MoE/PaLM default; sweep 1e-5..1e-3)
-#   backend: fp32_accum     # fp32_accum (default): grad cos ~0.999, ~+0.45 GB at head
-#                           # bf16: lightest memory, grad cos ~0.990 (ok for small reg)
-#   warmup:
-#     enabled: true
-#     start_step: 18000     # absolute global step at which the ramp begins
-#     duration_steps: 4000  # 18000 -> 22000 ramp (0 -> alpha)
-#     shape: cosine         # cosine (default, zero-slope ends) | linear
+# z-loss is OFF while row_center_head is on. After centering the head, h.mu->0,
+# so a raw-logZ z-loss would silently become CENTERED z-loss (the CE-visible
+# regularizer we shelved) — the trainer hard-asserts against running both.
+z_loss:
+  enabled: false
+  alpha: 1.0e-6           # tuned to dreadnought's logZ~490: z-term ≈ ~11-12% of CE
+                          # (1e-4 default assumes logZ~10; here it'd be ~14x CE — catastrophic)
+  backend: fp32_accum
+  warmup:
+    enabled: true
+    start_step: 18250
+    duration_steps: 100
+    shape: cosine
+
+# Row-center the LM head (gauge subtraction). Removes the CE-invisible
+# common-mode mu from the readout every step (probe: ~78-81% of dn2's raw logZ
+# is this inert gauge; u1.ones~0.93). Function-preserving — does NOT change the
+# next-token distribution; it's a GAUGE CHOICE, not a regularizer and not
+# centered z-loss. Also strips the gauge from the Adam 1st moment so it can't
+# regrow. Full projection from step 0 (no anneal — function-preserving at every
+# fraction of mu). Requires untied head (true here) + z_loss off (above).
+# Telemetry: rc_muW (pre = regrowth rate), rc_muWp (post ~0), rc_mbar, rc_ratio.
+row_center_head: true
 
 # weight_decay:
 #   - [all, 0.02]

@@ -900,6 +900,29 @@ def _head_param(raw_model):
     return getattr(out, "weight", None) if out is not None else None
 
 
+def _row_center_head_step(model, optimizer, want_exp_avg=True):
+    """Project the CE-invisible common-mode gauge out of the LM head in place
+    (and out of the Adam first moment, so it can't regrow). Function-preserving:
+    subtracts the same scalar h.mu from every vocab logit -> CE/softmax/sampling
+    unchanged. Call AFTER optimizer.step(), under eager (the projection does an
+    all-reduce + a bf16 stochastic-rounding randint, both of which dislike being
+    traced — same reason the 16-bit Adam step is kept out of compile).
+
+    Returns the telemetry dict from row_center_head_ (or None if no head found).
+    `want_exp_avg=False` projects only the weight (used for the pre-first-forward
+    projection on init/resume, where stripping momentum isn't needed yet)."""
+    from row_center import row_center_head_
+    raw = model._orig_mod if hasattr(model, '_orig_mod') else model
+    p = _head_param(raw)
+    if p is None:
+        return None
+    exp_avg = None
+    if want_exp_avg:
+        st = optimizer.state.get(p, {})
+        exp_avg = st.get("exp_avg", None)  # None before the head's first step
+    return row_center_head_(p, exp_avg=exp_avg, vocab_dim=0)
+
+
 # -------------------------- Training Loop --------------------------
 def train_loop(
         model, optimizer, train_loader, val_loader, device, ddp, ddp_rank, ddp_local_rank, ddp_world_size, start_step,
@@ -925,6 +948,9 @@ def train_loop(
     # z-loss gate (single source of truth for the micro-step fold + log emit).
     # settings.z_loss is None exactly when disabled (normalized in Settings).
     zloss_enabled = getattr(settings, 'z_loss', None) is not None
+
+    # row-center gate (gauge subtraction on the LM head, post-step projection).
+    row_center_enabled = bool(getattr(settings, 'row_center_head', False))
 
     # ── SCS (Scaffolded Cascading Supervision) per-loop state ───────────────
     # Active when `auxiliary_heads.compute_inactive_layers: false`. The trainer
@@ -1093,6 +1119,21 @@ def train_loop(
                 f"current SCS scale is 1.0)."
             )
 
+    # Row-center the head BEFORE the first forward pass (incl. the baseline
+    # validation below). Handles two cases with the flag on: a fresh run (head
+    # starts ~uncentered) and a resume from a checkpoint that wasn't centered
+    # (the gauge already grew). Project weight only here — the Adam 1st moment
+    # is empty before the head's first step, and is handled per-step thereafter.
+    # Function-preserving, so this never perturbs the baseline val number.
+    if row_center_enabled:
+        _rc0 = _row_center_head_step(model, optimizer, want_exp_avg=False)
+        if _rc0 is not None and ddp_rank == 0:
+            logger.print_and_log(
+                f"[row-center] pre-first-forward projection: "
+                f"||mu(W)|| {_rc0['mu_w_pre']:.4g} -> {_rc0['mu_w_post']:.2e} "
+                f"(proj_ratio {_rc0['proj_ratio']:.4f})"
+            )
+
     # Do a baseline validation before training
     if start_step == 1:
         sync_val_loader()
@@ -1166,6 +1207,7 @@ def train_loop(
         logZ_p95_last = 0.0          # last micro-step's logZ 95th pctile (snapshot)
         zloss_alpha_eff = get_zloss_alpha(step, settings)
         zloss_diag = None            # snapshot dict for diagnostics.jsonl (None when z-loss off)
+        rc_diag = None               # row-center snapshot for diagnostics.jsonl (None when off)
         # Per-step aux loss bookkeeping. Schedule weights are evaluated once
         # per step (constant within a step, lerp across waypoints). Per-head
         # unweighted CE values accumulate across micro-batches for logging.
@@ -1488,6 +1530,16 @@ def train_loop(
         # Compute update norms from pre/post step diff
         if is_diag_step:
             diagnostics.capture_updates()
+
+        # Row-center the LM head (gauge subtraction). AFTER capture_updates() so
+        # the update-norm diagnostic reflects the true optimizer update, not the
+        # gauge projection (which is logged separately as rc_*). Function-
+        # preserving: subtracts the scalar h.mu from every logit -> no change to
+        # CE/probs. Also strips the gauge from the Adam 1st moment so it can't
+        # regrow. Eager + no_grad (inside the helper) — kept out of compile.
+        rc_tel = None
+        if row_center_enabled:
+            rc_tel = _row_center_head_step(model, optimizer, want_exp_avg=True)
         # Synchronization slows down training, so rough (unsynchronized) timings are fine!
         #if device_type == "cuda":
         #    torch.cuda.synchronize()
@@ -1571,12 +1623,32 @@ def train_loop(
                     'hd_wn': (head_w_norm or 0.0), 'hd_gn': (head_g_norm or 0.0),
                     'hd_gr': hd_gr,
                 }
+            # Row-center columns: rc_muW (PRE-projection ||mu(W)|| — the real
+            # diagnostic: per-step gauge regrowth rate, i.e. how hard Adam is
+            # fighting the projection), rc_muWp (POST ||mu(W)|| — ~0 by
+            # construction; nonzero means something's broken), rc_mbar (1st-
+            # moment gauge stripped this step), rc_ratio (||1 mu^T||_F/||W||_F).
+            # Display-only; the headline ls/ppl stay untouched (function-
+            # preserving op). Appended last so log parsers are unaffected.
+            rc_tag = ""
+            rc_silent = ""
+            if row_center_enabled and rc_tel is not None:
+                _mbar = rc_tel['m_bar'] if rc_tel['m_bar'] is not None else 0.0
+                rc_tag = (f" | rc_muW: {rc_tel['mu_w_pre']:.4e} | rc_muWp: {rc_tel['mu_w_post']:.2e}"
+                          f" | rc_mbar: {_mbar:.4e} | rc_ratio: {rc_tel['proj_ratio']:.4f}")
+                rc_silent = (f"|rc_muW={rc_tel['mu_w_pre']:.6e}|rc_muWp={rc_tel['mu_w_post']:.6e}"
+                             f"|rc_mbar={_mbar:.6e}|rc_ratio={rc_tel['proj_ratio']:.6f}")
+                rc_diag = {
+                    'muW_pre': rc_tel['mu_w_pre'], 'muW_post': rc_tel['mu_w_post'],
+                    'm_bar': _mbar, 'proj_fro': rc_tel['proj_fro'],
+                    'proj_ratio': rc_tel['proj_ratio'],
+                }
             logger.print_and_log(
-                f"st: {step:5d} | ls: {main_loss_val:.6f} | ppl: {ppl:.2f} | lr: {lr:.4e} | nrm: {norm:.4f} [{clip_value:.1f}] | dt: {dt:.2f}s | t_tk: {total_tokens_processed:11,d} | tok/s: {tokens_per_sec:.0f} | MFU: {mfu:.0f}%{bal_tag}{drp_tag}{trunc_tag}{scs_tag}{tot_tag}{aux_tag}{z_tag}",
+                f"st: {step:5d} | ls: {main_loss_val:.6f} | ppl: {ppl:.2f} | lr: {lr:.4e} | nrm: {norm:.4f} [{clip_value:.1f}] | dt: {dt:.2f}s | t_tk: {total_tokens_processed:11,d} | tok/s: {tokens_per_sec:.0f} | MFU: {mfu:.0f}%{bal_tag}{drp_tag}{trunc_tag}{scs_tag}{tot_tag}{aux_tag}{z_tag}{rc_tag}",
             )
 
             logger.print_and_log(
-                f"{step:5d}|{main_loss_val:.6f}|{ppl:.2f}|{lr:.4e}|{norm:.4f}|{dt:.2f}|{total_tokens_processed:11d}|{tokens_per_sec:.0f}{tot_silent}{aux_silent}{z_silent}",
+                f"{step:5d}|{main_loss_val:.6f}|{ppl:.2f}|{lr:.4e}|{norm:.4f}|{dt:.2f}|{total_tokens_processed:11d}|{tokens_per_sec:.0f}{tot_silent}{aux_silent}{z_silent}{rc_silent}",
                 True, settings.train_log_file, silent=True
             )
 
@@ -1727,6 +1799,7 @@ def train_loop(
                     awd_data=awd_diag, moe_data=moe_diag,
                     activation_data=activation_data,
                     zloss_data=zloss_diag,
+                    rc_data=rc_diag,
                 )
                 diagnostics.print_summary(snapshot, logger, awd_data=awd_diag, moe_data=moe_diag)
 
@@ -3483,6 +3556,42 @@ class Settings:
         elif self.z_loss is not None:
             fatal_error(f"z_loss must be a dict, got {type(self.z_loss).__name__}")
 
+        # --- row_center_head: gauge subtraction on the LM readout head ---
+        # Flat bool gate (mirrors the other feature flags). When on, the trainer
+        # subtracts the vocab-row mean mu from the main head every step (and from
+        # the Adam first moment), removing the CE-invisible common-mode gauge.
+        # Function-preserving: it does NOT change the next-token distribution.
+        # See common_fsdp2/row_center.py. NOT centered z-loss (which stays
+        # shelved). Assumes the head is UNTIED and bias-free (the dn2 case).
+        if not hasattr(self, 'row_center_head'):
+            self.row_center_head = False
+        if not isinstance(self.row_center_head, bool):
+            fatal_error(
+                f"row_center_head must be a bool, got {type(self.row_center_head).__name__}"
+            )
+        # Escape hatch reserved for a deliberate ablation only.
+        if not hasattr(self, 'allow_row_center_with_z_loss'):
+            self.allow_row_center_with_z_loss = False
+        if self.row_center_head:
+            if self.tie_word_embeddings:
+                fatal_error(
+                    "row_center_head requires an UNTIED output head: subtracting "
+                    "the row-mean from a tied head also shifts the input "
+                    "embeddings, which is NOT function-preserving. Set "
+                    "tie_word_embeddings: false or disable row_center_head."
+                )
+            # HARD ASSERT: z-loss must be off. Once the head is centered, h.mu->0,
+            # so a raw-logZ z-loss silently becomes CENTERED z-loss — the
+            # CE-visible regularizer we deliberately shelved. Fail loudly.
+            if self.z_loss is not None and not self.allow_row_center_with_z_loss:
+                fatal_error(
+                    "row_center_head and z_loss are both enabled. After "
+                    "row-centering the head, raw-logZ z-loss becomes CENTERED "
+                    "z-loss (a real regularizer, not the inert gauge). Disable "
+                    "z_loss, or set allow_row_center_with_z_loss: true for a "
+                    "deliberate ablation."
+                )
+
         # --- GDN hybrid attention ---
         if not hasattr(self, 'gdn_enabled'):
             self.gdn_enabled = False
@@ -4003,6 +4112,29 @@ if __name__ == "__main__":
             logger.print_and_log(f"  ] alpha warmup   = disabled (full alpha applied immediately)")
         logger.print_and_log(
             f"  ] headline ls/ppl stay PURE CE; zloss/logZ/logZ_rms/logZ_p95/z_a + head metrics (hd_*) logged separately"
+        )
+
+    # ----------------------- Log row-center head (gauge subtraction) ----------
+    if getattr(settings, 'row_center_head', False) and ddp_rank == 0:
+        logger.print_and_log(f"Row-Center Head (gauge subtraction):")
+        logger.print_and_log(
+            f"  ] operation      = W <- W - 1 mu^T (mu = global vocab-row mean), full projection from step 0"
+        )
+        logger.print_and_log(
+            f"  ] function-preserving: shifts every token's logits by the scalar h.mu -> CE/softmax/sampling UNCHANGED"
+        )
+        logger.print_and_log(
+            f"  ] also projects Adam 1st moment (exp_avg) by ITS OWN row-mean each step so the gauge can't regrow"
+        )
+        logger.print_and_log(
+            f"  ] NOT centered z-loss (z_loss must be off); main LM head only; assumes untied + bias-free head"
+        )
+        if getattr(settings, 'allow_row_center_with_z_loss', False):
+            logger.print_and_log(
+                f"  ] [!] allow_row_center_with_z_loss=TRUE — z-loss runs as CENTERED z-loss (deliberate ablation)"
+            )
+        logger.print_and_log(
+            f"  ] telemetry      = rc_muW_pre/post, rc_mbar, rc_proj_fro, rc_proj_ratio (diagnostics.jsonl at val cadence)"
         )
 
     # ----------------------- Log training configuration -----------------------
