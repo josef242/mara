@@ -923,6 +923,21 @@ def _row_center_head_step(model, optimizer, want_exp_avg=True):
     return row_center_head_(p, exp_avg=exp_avg, vocab_dim=0)
 
 
+def _centered_geometry_step(model, already_centered):
+    """Centered head-geometry health metrics (Item B) at val cadence. Returns the
+    centered_geometry dict (||W_c||, s1_c, spec_conc_c, eff_rank, small-sigma) or
+    None if no head. already_centered=True when row_center_head is on (the stored
+    weight is centered every step, so G = W^T W directly); False otherwise (the
+    helper subtracts the global row-mean first). Cheap [D,D] eigh — only call at
+    val cadence, not per step."""
+    from row_center import centered_geometry
+    raw = model._orig_mod if hasattr(model, '_orig_mod') else model
+    p = _head_param(raw)
+    if p is None:
+        return None
+    return centered_geometry(p, vocab_dim=0, already_centered=already_centered)
+
+
 # -------------------------- Training Loop --------------------------
 def train_loop(
         model, optimizer, train_loader, val_loader, device, ddp, ddp_rank, ddp_local_rank, ddp_world_size, start_step,
@@ -1790,6 +1805,16 @@ def train_loop(
                     if ddp_rank == 0:
                         logger.print_and_log(f"  activation_probe failed: {type(e).__name__}: {e}")
 
+            # Centered head-geometry health metrics (Item B). The CANONICAL
+            # head-health metrics post-row-centering (raw hd_wn is gauge-
+            # contaminated). Also the dn1-collapse early-warning: rising
+            # spectral_concentration_c + eroding small singular values was the
+            # death signature. Cheap [D,D] gram->eigh; computed only here at val
+            # cadence. MUST run on all ranks (the gram all-reduce is collective).
+            # already_centered: the stored head is row-centered every step when
+            # the feature is on, so G = W^T W directly; else center first.
+            cg_diag = _centered_geometry_step(model, already_centered=row_center_enabled)
+
             # Log layer diagnostics after validation
             if diagnostics is not None:
                 awd_diag = awd.get_diagnostics_data() if awd is not None else None
@@ -1800,8 +1825,18 @@ def train_loop(
                     activation_data=activation_data,
                     zloss_data=zloss_diag,
                     rc_data=rc_diag,
+                    cg_data=cg_diag,
                 )
                 diagnostics.print_summary(snapshot, logger, awd_data=awd_diag, moe_data=moe_diag)
+                if cg_diag is not None and ddp_rank == 0:
+                    logger.print_and_log(
+                        f"  [centered-geom] ||W_c||={cg_diag['Wc_fro']:.2f} "
+                        f"s1_c={cg_diag['s1_c']:.2f} "
+                        f"spec_conc_c={cg_diag['spectral_concentration_c']:.4f} "
+                        f"eff_rank={cg_diag['effective_rank_c']:.1f} "
+                        f"small_sig(p1/p5/p10)={cg_diag['small_sigma_p1']:.3f}/"
+                        f"{cg_diag['small_sigma_p5']:.3f}/{cg_diag['small_sigma_p10']:.3f}"
+                    )
 
             # Log MoE expert utilization (only on rank 0, only when MoE is active)
             if moe_stats[0] and ddp_rank == 0:
