@@ -268,25 +268,125 @@ def get_zloss_alpha(step: int, settings) -> float:
     if z is None:
         return 0.0
     alpha = float(z.get('alpha', 0.0))
+    # --- warmup (ramp 0 -> alpha) ---
     warmup = z.get('warmup') or {}
+    if warmup.get('enabled', False):
+        start_step = int(warmup.get('start_step', 0))
+        duration = int(warmup.get('duration_steps', 1))
+        shape = warmup.get('shape', 'cosine')
+        if step <= start_step:
+            alpha = 0.0
+        elif duration > 0:
+            progress = (step - start_step) / duration
+            if progress < 1.0:
+                progress = max(0.0, progress)
+                if shape == 'linear':
+                    alpha = alpha * progress
+                else:  # cosine: zero-slope ends — gentlest onset, no kink
+                    alpha = alpha * (1.0 - math.cos(math.pi * progress)) / 2.0
+    # --- warmdown (ramp alpha -> 0), half-open [start, start+duration) per
+    # Guardrail 4: alpha must be EXACTLY 0 from start+duration onward, before
+    # row-centering's s goes nonzero at the same global step. Applied as a
+    # multiplier on the (post-warmup) alpha so the two ramps compose cleanly. ---
+    warmdown = z.get('warmdown') or {}
+    if warmdown.get('enabled', False):
+        wd_start = int(warmdown.get('start_step', 0))
+        wd_dur = int(warmdown.get('duration_steps', 1))
+        wd_shape = warmdown.get('shape', 'cosine')
+        if step >= wd_start + max(1, wd_dur):
+            return 0.0                       # fully warmed down -> exactly 0
+        if step >= wd_start and wd_dur > 0:
+            u = (step - wd_start) / wd_dur   # in [0, 1)
+            if wd_shape == 'linear':
+                alpha = alpha * (1.0 - u)
+            else:  # cosine_down(u) = 0.5*(1+cos(pi*u))
+                alpha = alpha * 0.5 * (1.0 + math.cos(math.pi * u))
+    return alpha
+
+
+def _row_center_cfg(settings):
+    """Normalize the row_center_head config to a dict with keys
+    {enabled: bool, warmup: dict|None}. Accepts BOTH the flat bool form
+    (`row_center_head: true`, steady-state full projection from step 0) and the
+    nested dict form (`row_center_head: {enabled, warmup: {...}}`, staged warmup).
+    Returns {'enabled': False} when off."""
+    rc = getattr(settings, 'row_center_head', False)
+    if isinstance(rc, bool):
+        return {'enabled': rc, 'warmup': None}
+    if isinstance(rc, dict):
+        return {'enabled': bool(rc.get('enabled', False)), 'warmup': rc.get('warmup')}
+    return {'enabled': False, 'warmup': None}
+
+
+def get_row_center_s(step, settings):
+    """Row-center warmup scalar s(t) in [0,1] at absolute global `step`. Pure
+    function of (step + static config) -> resume-safe like get_zloss_alpha.
+
+    s scales the TARGET-GAUGE schedule: mu_target = (1-s)*mu0, so s=0 leaves the
+    gauge at its captured start value (projection is a no-op) and s=1 is fully
+    centered (steady-state projection to mean->0). Returns:
+      - 0.0 when row-centering is disabled
+      - 1.0 when enabled with NO warmup (flat-bool / steady-state: always full)
+      - the cosine/linear ramp 0->1 over [start, start+duration) when warmup on,
+        1.0 at/after start+duration, 0.0 before start.
+    cosine_up(u) = 0.5*(1 - cos(pi*u))."""
+    cfg = _row_center_cfg(settings)
+    if not cfg['enabled']:
+        return 0.0
+    warmup = cfg['warmup'] or {}
     if not warmup.get('enabled', False):
-        return alpha
+        return 1.0                            # steady-state: full projection
     start_step = int(warmup.get('start_step', 0))
     duration = int(warmup.get('duration_steps', 1))
     shape = warmup.get('shape', 'cosine')
-    if step <= start_step:
+    if step < start_step:
         return 0.0
-    if duration <= 0:
-        return alpha
-    progress = (step - start_step) / duration
-    if progress >= 1.0:
-        return alpha
-    if progress < 0.0:
-        progress = 0.0
+    if step >= start_step + max(1, duration):
+        return 1.0
+    u = (step - start_step) / duration        # in [0, 1)
     if shape == 'linear':
-        return alpha * progress
-    # cosine (default): zero-slope at both ends — gentlest onset, no kink.
-    return alpha * (1.0 - math.cos(math.pi * progress)) / 2.0
+        return u
+    return 0.5 * (1.0 - math.cos(math.pi * u))
+
+
+def _find_rowcenter_zloss_overlap(settings):
+    """Return the first global step where BOTH z-loss alpha_eff > 0 AND
+    row-center s > 0 (i.e. they're concurrently active), or None if disjoint.
+    Step-active check (Guardrail 2): scans the union of the schedules' plausible
+    active ranges rather than trusting the static flags."""
+    z = getattr(settings, 'z_loss', None)
+    cfg = _row_center_cfg(settings)
+    if z is None or not cfg['enabled']:
+        return None
+    # Candidate step bounds from both schedules. z-loss can be active from its
+    # warmup start (or step 0 if no warmup) through its warmdown end (or
+    # unbounded). row-center s>0 from its warmup start (or step 0 if steady-state)
+    # onward. We only need to find ANY overlap, so scan a bounded window that
+    # covers both schedules' transition regions plus a margin.
+    bounds = []
+    wu = z.get('warmup') or {}
+    wd = z.get('warmdown') or {}
+    rcw = cfg['warmup'] or {}
+    for blk in (wu, wd, rcw):
+        if blk.get('enabled', False):
+            bounds.append(int(blk.get('start_step', 0)))
+            bounds.append(int(blk.get('start_step', 0)) + int(blk.get('duration_steps', 1)))
+    if not bounds:
+        # Both steady-state on (flat row_center + z-loss no schedule): they
+        # overlap everywhere -> report step 0.
+        if get_zloss_alpha(0, settings) > 0 and get_row_center_s(0, settings) > 0:
+            return 0
+        return None
+    lo = max(0, min(bounds) - 2)
+    hi = max(bounds) + 2
+    # If z-loss has no warmdown it stays active indefinitely after warmup; if
+    # row-center is steady-state (no warmup) it's active from 0. The bounded scan
+    # over the transition region catches the staged-handoff case; extend hi a bit
+    # past the row-center warmup end to be safe.
+    for step in range(lo, hi + 1):
+        if get_zloss_alpha(step, settings) > 0.0 and get_row_center_s(step, settings) > 0.0:
+            return step
+    return None
 
 
 def interpolate_lr_mod(schedule, step):
@@ -923,6 +1023,32 @@ def _row_center_head_step(model, optimizer, want_exp_avg=True):
     return row_center_head_(p, exp_avg=exp_avg, vocab_dim=0)
 
 
+def _row_center_capture_gauge(model, optimizer):
+    """Capture the warmup start gauges (mu0, mbar0) from the live head + Adam
+    first moment. Returns the capture_gauge dict (fp32 CPU tensors), or None if
+    no head. Called once at warmup start_step (then checkpoint-persisted)."""
+    from row_center import capture_gauge
+    raw = model._orig_mod if hasattr(model, '_orig_mod') else model
+    p = _head_param(raw)
+    if p is None:
+        return None
+    exp_avg = optimizer.state.get(p, {}).get("exp_avg", None)
+    return capture_gauge(p, exp_avg=exp_avg, vocab_dim=0)
+
+
+def _row_center_warmup_step(model, optimizer, s, mu0, mbar0):
+    """Per-step TARGET-GAUGE warmup projection (Stage 2). Pins the stored gauge to
+    (1-s)*mu0 (and exp_avg to (1-s)*mbar0). mu0/mbar0 are the start-of-warmup
+    captures (NOT recomputed). Returns telemetry or None if no head."""
+    from row_center import row_center_head_warmup_
+    raw = model._orig_mod if hasattr(model, '_orig_mod') else model
+    p = _head_param(raw)
+    if p is None:
+        return None
+    exp_avg = optimizer.state.get(p, {}).get("exp_avg", None)
+    return row_center_head_warmup_(p, s, mu0, exp_avg=exp_avg, mbar0=mbar0, vocab_dim=0)
+
+
 def _centered_geometry_step(model, already_centered):
     """Centered head-geometry health metrics (Item B) at val cadence. Returns the
     centered_geometry dict (||W_c||, s1_c, spec_conc_c, eff_rank, small-sigma) or
@@ -965,7 +1091,26 @@ def train_loop(
     zloss_enabled = getattr(settings, 'z_loss', None) is not None
 
     # row-center gate (gauge subtraction on the LM head, post-step projection).
-    row_center_enabled = bool(getattr(settings, 'row_center_head', False))
+    # Accepts flat-bool (steady-state) or nested-dict (staged warmup) config.
+    _rc_cfg = _row_center_cfg(settings)
+    row_center_enabled = _rc_cfg['enabled']
+    _rc_warmup = _rc_cfg['warmup'] or {}
+    row_center_warmup_on = bool(_rc_warmup.get('enabled', False))
+    row_center_warmup_start = int(_rc_warmup.get('start_step', 0)) if row_center_warmup_on else None
+    # Warmup target gauges (mu0/mbar0), captured once at warmup start and
+    # checkpoint-persisted (Guardrail 1). Restored from checkpoint if mid-warmup.
+    # Held as fp32 tensors; None until captured. _rc_captured guards single capture.
+    rc_warmup_mu0 = getattr(train_loop, '_rc_restore_mu0', None)
+    rc_warmup_mbar0 = getattr(train_loop, '_rc_restore_mbar0', None)
+    rc_warmup_captured = rc_warmup_mu0 is not None
+
+    # Guardrail 5 (advisory): transition health guard. Loud WARNING log ONLY — no
+    # auto-pause / auto-checkpoint / auto-intervene (Josef keeps manual control).
+    # Off unless transition_health_guard: true in config. Thresholds from the hard
+    # branch's nrm=5.61 event: nrm>5 once, nrm>3 for N repeated steps, eff_rank_c<7,
+    # spec_conc_c>0.45.
+    health_guard_on = bool(getattr(settings, 'transition_health_guard', False))
+    _hg_nrm_run = 0   # consecutive steps with nrm > 3
 
     # ── SCS (Scaffolded Cascading Supervision) per-loop state ───────────────
     # Active when `auxiliary_heads.compute_inactive_layers: false`. The trainer
@@ -1135,12 +1280,17 @@ def train_loop(
             )
 
     # Row-center the head BEFORE the first forward pass (incl. the baseline
-    # validation below). Handles two cases with the flag on: a fresh run (head
-    # starts ~uncentered) and a resume from a checkpoint that wasn't centered
-    # (the gauge already grew). Project weight only here — the Adam 1st moment
-    # is empty before the head's first step, and is handled per-step thereafter.
+    # validation below). Project weight only here — the Adam 1st moment is empty
+    # before the head's first step, and is handled per-step thereafter.
     # Function-preserving, so this never perturbs the baseline val number.
-    if row_center_enabled:
+    #
+    # REQ 1 (load-bearing): when warmup is enabled, SUPPRESS this hard projection.
+    # Under warmup the SCHEDULE is the sole path to centered — hard-projecting here
+    # would wipe the gauge cold (the exact optimizer shock the staged transition
+    # exists to avoid) and then "warm up" from an already-centered head, defeating
+    # the redo. The per-step warmup projection (target-gauge, starting at s=0 =
+    # no-op) takes over at start_step.
+    if row_center_enabled and not row_center_warmup_on:
         _rc0 = _row_center_head_step(model, optimizer, want_exp_avg=False)
         if _rc0 is not None and ddp_rank == 0:
             logger.print_and_log(
@@ -1148,6 +1298,13 @@ def train_loop(
                 f"||mu(W)|| {_rc0['mu_w_pre']:.4g} -> {_rc0['mu_w_post']:.2e} "
                 f"(proj_ratio {_rc0['proj_ratio']:.4f})"
             )
+    elif row_center_enabled and row_center_warmup_on and ddp_rank == 0:
+        logger.print_and_log(
+            f"[row-center] warmup enabled (start {row_center_warmup_start}, "
+            f"{int(_rc_warmup.get('duration_steps', 0))} steps, "
+            f"{_rc_warmup.get('shape', 'cosine')}) — hard pre-forward projection "
+            f"SUPPRESSED; schedule is the sole path to centered."
+        )
 
     # Do a baseline validation before training
     if start_step == 1:
@@ -1548,13 +1705,35 @@ def train_loop(
 
         # Row-center the LM head (gauge subtraction). AFTER capture_updates() so
         # the update-norm diagnostic reflects the true optimizer update, not the
-        # gauge projection (which is logged separately as rc_*). Function-
-        # preserving: subtracts the scalar h.mu from every logit -> no change to
-        # CE/probs. Also strips the gauge from the Adam 1st moment so it can't
-        # regrow. Eager + no_grad (inside the helper) — kept out of compile.
+        # gauge projection (logged separately as rc_*). Function-preserving on the
+        # output; strips the gauge from the Adam 1st moment too. Eager + no_grad
+        # (inside the helper) — kept out of compile.
         rc_tel = None
+        rc_s_eff = 0.0
         if row_center_enabled:
-            rc_tel = _row_center_head_step(model, optimizer, want_exp_avg=True)
+            if row_center_warmup_on:
+                rc_s_eff = get_row_center_s(step, settings)
+                if step >= row_center_warmup_start:
+                    # Capture the start gauge ONCE (first in-window step) unless it
+                    # was restored from a mid-warmup checkpoint (Guardrail 1).
+                    if not rc_warmup_captured:
+                        _cap = _row_center_capture_gauge(model, optimizer)
+                        if _cap is not None:
+                            rc_warmup_mu0 = _cap["mu0"]
+                            rc_warmup_mbar0 = _cap["mbar0"]
+                            rc_warmup_captured = True
+                            if ddp_rank == 0:
+                                _mb = rc_warmup_mbar0.norm().item() if rc_warmup_mbar0 is not None else 0.0
+                                logger.print_and_log(
+                                    f"[row-center] warmup start @ {step}: captured "
+                                    f"mu0={rc_warmup_mu0.norm().item():.4f} mbar0={_mb:.4f}"
+                                )
+                    if rc_warmup_captured:
+                        rc_tel = _row_center_warmup_step(
+                            model, optimizer, rc_s_eff, rc_warmup_mu0, rc_warmup_mbar0)
+            else:
+                rc_s_eff = 1.0
+                rc_tel = _row_center_head_step(model, optimizer, want_exp_avg=True)
         # Synchronization slows down training, so rough (unsynchronized) timings are fine!
         #if device_type == "cuda":
         #    torch.cuda.synchronize()
@@ -1649,23 +1828,51 @@ def train_loop(
             rc_silent = ""
             if row_center_enabled and rc_tel is not None:
                 _mbar = rc_tel['m_bar'] if rc_tel['m_bar'] is not None else 0.0
+                # proj_ratio only in the steady-state dict; warmup dict has 's'.
+                _ratio = rc_tel.get('proj_ratio')
+                _ratio_tag = f" | rc_ratio: {_ratio:.4f}" if _ratio is not None else ""
+                _ratio_silent = f"|rc_ratio={_ratio:.6f}" if _ratio is not None else ""
                 rc_tag = (f" | rc_muW: {rc_tel['mu_w_pre']:.4e} | rc_muWp: {rc_tel['mu_w_post']:.2e}"
-                          f" | rc_mbar: {_mbar:.4e} | rc_ratio: {rc_tel['proj_ratio']:.4f}")
+                          f" | rc_mbar: {_mbar:.4e}{_ratio_tag}")
                 rc_silent = (f"|rc_muW={rc_tel['mu_w_pre']:.6e}|rc_muWp={rc_tel['mu_w_post']:.6e}"
-                             f"|rc_mbar={_mbar:.6e}|rc_ratio={rc_tel['proj_ratio']:.6f}")
+                             f"|rc_mbar={_mbar:.6e}{_ratio_silent}")
                 rc_diag = {
                     'muW_pre': rc_tel['mu_w_pre'], 'muW_post': rc_tel['mu_w_post'],
-                    'm_bar': _mbar, 'proj_fro': rc_tel['proj_fro'],
-                    'proj_ratio': rc_tel['proj_ratio'],
+                    'm_bar': _mbar, 'proj_ratio': _ratio,
+                    's': rc_tel.get('s'),
                 }
+            # Guardrail 3: log the EFFECTIVE schedule scalars every step during a
+            # staged transition (z-loss warmdown OR row-center warmup active or
+            # pending) so the temporal separation is VISIBLE — we can confirm at a
+            # glance that alpha hit exactly 0 before s went nonzero.
+            sched_tag = ""
+            if zloss_enabled or (row_center_enabled and row_center_warmup_on):
+                sched_tag = f" | z_a_eff: {zloss_alpha_eff:.3e} | rc_s: {rc_s_eff:.4f}"
             logger.print_and_log(
-                f"st: {step:5d} | ls: {main_loss_val:.6f} | ppl: {ppl:.2f} | lr: {lr:.4e} | nrm: {norm:.4f} [{clip_value:.1f}] | dt: {dt:.2f}s | t_tk: {total_tokens_processed:11,d} | tok/s: {tokens_per_sec:.0f} | MFU: {mfu:.0f}%{bal_tag}{drp_tag}{trunc_tag}{scs_tag}{tot_tag}{aux_tag}{z_tag}{rc_tag}",
+                f"st: {step:5d} | ls: {main_loss_val:.6f} | ppl: {ppl:.2f} | lr: {lr:.4e} | nrm: {norm:.4f} [{clip_value:.1f}] | dt: {dt:.2f}s | t_tk: {total_tokens_processed:11,d} | tok/s: {tokens_per_sec:.0f} | MFU: {mfu:.0f}%{bal_tag}{drp_tag}{trunc_tag}{scs_tag}{tot_tag}{aux_tag}{z_tag}{rc_tag}{sched_tag}",
             )
 
+            _sched_silent = f"|z_a_eff={zloss_alpha_eff:.6e}|rc_s={rc_s_eff:.6f}" if sched_tag else ""
             logger.print_and_log(
-                f"{step:5d}|{main_loss_val:.6f}|{ppl:.2f}|{lr:.4e}|{norm:.4f}|{dt:.2f}|{total_tokens_processed:11d}|{tokens_per_sec:.0f}{tot_silent}{aux_silent}{z_silent}{rc_silent}",
+                f"{step:5d}|{main_loss_val:.6f}|{ppl:.2f}|{lr:.4e}|{norm:.4f}|{dt:.2f}|{total_tokens_processed:11d}|{tokens_per_sec:.0f}{tot_silent}{aux_silent}{z_silent}{rc_silent}{_sched_silent}",
                 True, settings.train_log_file, silent=True
             )
+
+            # Guardrail 5: transition health guard — grad-norm part (per logged
+            # step). WARNING only; never auto-acts. _hg_nrm_run tracks repeats.
+            if health_guard_on:
+                if norm > 3.0:
+                    _hg_nrm_run += 1
+                else:
+                    _hg_nrm_run = 0
+                if norm > 5.0:
+                    logger.print_and_log(
+                        f"  [HEALTH WARNING @ {step}] nrm={norm:.2f} > 5 (single-step "
+                        f"spike; cf. hard-branch nrm=5.61@18540). Advisory only — no auto-action.")
+                elif _hg_nrm_run >= 3:
+                    logger.print_and_log(
+                        f"  [HEALTH WARNING @ {step}] nrm={norm:.2f} > 3 for {_hg_nrm_run} "
+                        f"consecutive steps. Advisory only — no auto-action.")
 
             # SCS effective-LR debug line — shows per-compartment, output-head,
             # and per-aux-head lr_scale values at this step. Lets you eyeball
@@ -1811,9 +2018,29 @@ def train_loop(
             # spectral_concentration_c + eroding small singular values was the
             # death signature. Cheap [D,D] gram->eigh; computed only here at val
             # cadence. MUST run on all ranks (the gram all-reduce is collective).
-            # already_centered: the stored head is row-centered every step when
-            # the feature is on, so G = W^T W directly; else center first.
-            cg_diag = _centered_geometry_step(model, already_centered=row_center_enabled)
+            # already_centered: ONLY true when the stored head is fully centered
+            # every step (steady-state projection, s==1) -> G = W^T W directly.
+            # During warmup the head carries a partial gauge ((1-s)*mu0), so we
+            # must center-first in the metric (already_centered=False); the helper
+            # is correct either way, this just skips a redundant subtract at s=1.
+            _cg_centered = row_center_enabled and (not row_center_warmup_on or rc_s_eff >= 1.0)
+            cg_diag = _centered_geometry_step(model, already_centered=_cg_centered)
+
+            # Guardrail 5: transition health guard — geometry part (val cadence).
+            # WARNING only; never auto-acts. Thresholds from the family calibration
+            # (Nexus #156/#157): eff_rank_c < 7 warn, spec_conc_c > 0.45.
+            if health_guard_on and cg_diag is not None and ddp_rank == 0:
+                _er = cg_diag.get('effective_rank_c')
+                _sc = cg_diag.get('spectral_concentration_c')
+                if _er is not None and _er < 7.0:
+                    logger.print_and_log(
+                        f"  [HEALTH WARNING @ {step}] eff_rank_c={_er:.2f} < 7 "
+                        f"(spec_conc_c={_sc:.3f}) — approaching low-rank collapse "
+                        f"(dead dn1@14k=4.3). Advisory only; investigate, do NOT engage z-loss.")
+                elif _sc is not None and _sc > 0.45:
+                    logger.print_and_log(
+                        f"  [HEALTH WARNING @ {step}] spec_conc_c={_sc:.3f} > 0.45 "
+                        f"(eff_rank_c={_er:.2f}). Advisory only — watch for persistence.")
 
             # Log layer diagnostics after validation
             if diagnostics is not None:
@@ -1864,7 +2091,17 @@ def train_loop(
 
         if step > 0 and (step % settings.save_step == 0 or last_step):
             train_loader.log_detailed_dataloader_status(step, ddp_rank)
-            save_model(model, optimizer, model_cfg, step, ddp_rank, ddp_local_rank, train_loader, total_tokens_processed, settings, awd=awd)
+            # Row-center warmup targets to persist (Guardrail 1): only meaningful
+            # once captured (warmup started). start_step/duration recorded so a
+            # forensic tool can see which schedule produced the checkpoint.
+            _rc_ws = None
+            if row_center_enabled and row_center_warmup_on and rc_warmup_captured:
+                _rc_ws = {
+                    "mu0": rc_warmup_mu0, "mbar0": rc_warmup_mbar0,
+                    "start_step": row_center_warmup_start,
+                    "duration": int(_rc_warmup.get('duration_steps', 0)),
+                }
+            save_model(model, optimizer, model_cfg, step, ddp_rank, ddp_local_rank, train_loader, total_tokens_processed, settings, awd=awd, rc_warmup_state=_rc_ws)
 
 # -------------------------- Checkpointing and Resuming --------------------------
 # Helper function to get the seeds for all random number generators
@@ -1878,7 +2115,7 @@ def get_rank_rng_state():
     return checkpoint_data
 
 # Save the model, optimizer state, RNG state, trainloader state, etc.
-def save_model(model, optimizer, model_config, step, ddp_rank, ddp_local_rank, train_loader, total_tokens_processed, settings, awd=None):
+def save_model(model, optimizer, model_config, step, ddp_rank, ddp_local_rank, train_loader, total_tokens_processed, settings, awd=None, rc_warmup_state=None):
     # DEBUG: Print rank info at the very start
     logger.print_and_log("SAVE_MODEL: Starting checkpoint save...")
     os.makedirs(settings.local_checkpoint_dir, exist_ok=True)               # Ensure the checkpoint directory exists
@@ -2087,6 +2324,22 @@ def save_model(model, optimizer, model_config, step, ddp_rank, ddp_local_rank, t
         awd_path = os.path.join(settings.local_checkpoint_dir, f"awd_state_step_{step:06d}.pt")
         torch.save(awd.state_dict(), awd_path)
         logger.print_and_log(f"  ] AWD state saved")
+
+    # Save row-center WARMUP targets (Guardrail 1). The target-gauge schedule
+    # anchors to the gauge captured at warmup start (mu0/mbar0); a 200-step warmup
+    # spans checkpoints, so on resume we MUST restore these rather than recapture
+    # from the now-partially-centered head (which would silently re-anchor the ramp
+    # to a smaller gauge and stall it). Global D-vectors, identical across ranks ->
+    # rank 0 only. Only written while a capture exists (i.e. warmup has started).
+    if rc_warmup_state is not None and rc_warmup_state.get("mu0") is not None and ddp_rank == 0:
+        rc_path = os.path.join(settings.local_checkpoint_dir, f"rowcenter_warmup_step_{step:06d}.pt")
+        torch.save({
+            "mu0": rc_warmup_state["mu0"],          # fp32 CPU [D]
+            "mbar0": rc_warmup_state.get("mbar0"),  # fp32 CPU [D] or None
+            "start_step": rc_warmup_state.get("start_step"),
+            "duration": rc_warmup_state.get("duration"),
+        }, rc_path)
+        logger.print_and_log(f"  ] row-center warmup targets saved")
 
     # Save MoE expert_bias buffers explicitly (rank 0 only — identical across ranks).
     # FSDP2's get_model_state_dict may silently drop non-DTensor persistent buffers,
@@ -2373,6 +2626,27 @@ def resume_training(model, optimizer, train_loader, ddp_rank, settings, grad_acc
             logger.print_and_log(f"  ] AWD state restored", r0_only=True)
         else:
             logger.print_and_log(f"  ] AWD state not found — starting fresh", r0_only=True)
+
+    # ---------------------------------------------------------------------------
+    # Restore row-center WARMUP targets (Guardrail 1). If a checkpoint was saved
+    # mid-warmup, the captured mu0/mbar0 are restored and stashed on train_loop so
+    # the schedule re-anchors to the ORIGINAL start gauge — NOT recaptured from the
+    # now-partially-centered head (which would shrink the anchor and stall the
+    # ramp). Stash on the function object since train_loop reads it at loop top.
+    # Clear any stale stash first so a fresh (non-mid-warmup) resume starts clean.
+    train_loop._rc_restore_mu0 = None
+    train_loop._rc_restore_mbar0 = None
+    rc_warmup_path = os.path.join(pth, f"rowcenter_warmup_step_{shard_step:06d}.pt")
+    if os.path.exists(rc_warmup_path):
+        _rcw = torch.load(rc_warmup_path, weights_only=True)
+        train_loop._rc_restore_mu0 = _rcw.get("mu0")
+        train_loop._rc_restore_mbar0 = _rcw.get("mbar0")
+        _mu0n = train_loop._rc_restore_mu0.norm().item() if train_loop._rc_restore_mu0 is not None else 0.0
+        logger.print_and_log(
+            f"  ] row-center warmup targets restored (mu0={_mu0n:.4f}, "
+            f"start={_rcw.get('start_step')}, dur={_rcw.get('duration')}) "
+            f"— resuming mid-warmup, schedule re-anchored to original gauge",
+            r0_only=True)
 
     # ---------------------------------------------------------------------------
     # STEP 3c: RESTORE MoE expert_bias (if available)
@@ -3588,26 +3862,80 @@ class Settings:
                             fatal_error(
                                 f"z_loss.warmup.shape must be 'cosine' or 'linear', got {shp!r}"
                             )
+                # warmdown: ramp alpha -> 0 (staged transition Stage 1). Same
+                # validation shape as warmup. alpha hits exactly 0 at
+                # start_step + duration_steps (half-open), before row-centering's
+                # s goes nonzero — see get_zloss_alpha + the overlap assert below.
+                warmdown = zl.get('warmdown')
+                if warmdown is not None:
+                    if not isinstance(warmdown, dict):
+                        fatal_error(
+                            f"z_loss.warmdown must be a dict, got {type(warmdown).__name__}"
+                        )
+                    if warmdown.get('enabled', False):
+                        ss = warmdown.get('start_step', 0)
+                        if not isinstance(ss, int) or ss < 0:
+                            fatal_error(
+                                f"z_loss.warmdown.start_step must be a non-negative int, got {ss!r}"
+                            )
+                        ds = warmdown.get('duration_steps', None)
+                        if not isinstance(ds, int) or ds <= 0:
+                            fatal_error(
+                                f"z_loss.warmdown.duration_steps must be a positive int, got {ds!r}"
+                            )
+                        shp = warmdown.get('shape', 'cosine')
+                        if shp not in ('cosine', 'linear'):
+                            fatal_error(
+                                f"z_loss.warmdown.shape must be 'cosine' or 'linear', got {shp!r}"
+                            )
         elif self.z_loss is not None:
             fatal_error(f"z_loss must be a dict, got {type(self.z_loss).__name__}")
 
         # --- row_center_head: gauge subtraction on the LM readout head ---
-        # Flat bool gate (mirrors the other feature flags). When on, the trainer
-        # subtracts the vocab-row mean mu from the main head every step (and from
-        # the Adam first moment), removing the CE-invisible common-mode gauge.
-        # Function-preserving: it does NOT change the next-token distribution.
-        # See common_fsdp2/row_center.py. NOT centered z-loss (which stays
-        # shelved). Assumes the head is UNTIED and bias-free (the dn2 case).
+        # Accepts BOTH forms:
+        #   flat bool   row_center_head: true      -> steady-state full projection
+        #   nested dict row_center_head: {enabled: true, warmup: {start_step,
+        #               duration_steps, shape}}    -> staged target-gauge warmup
+        # When on, the trainer subtracts the vocab-row mean mu from the main head
+        # every step (and from the Adam first moment), removing the CE-invisible
+        # common-mode gauge. Function-preserving on the MODEL OUTPUT (not on the
+        # optimizer trajectory — hence the staged warmup for mid-run resumes).
+        # See common_fsdp2/row_center.py. Assumes UNTIED + bias-free head.
         if not hasattr(self, 'row_center_head'):
             self.row_center_head = False
-        if not isinstance(self.row_center_head, bool):
-            fatal_error(
-                f"row_center_head must be a bool, got {type(self.row_center_head).__name__}"
-            )
+        rc = self.row_center_head
+        if isinstance(rc, dict):
+            if not isinstance(rc.get('enabled', False), bool):
+                fatal_error("row_center_head.enabled must be a bool")
+            rcw = rc.get('warmup')
+            if rcw is not None:
+                if not isinstance(rcw, dict):
+                    fatal_error(f"row_center_head.warmup must be a dict, got {type(rcw).__name__}")
+                if rcw.get('enabled', False):
+                    ss = rcw.get('start_step', 0)
+                    if not isinstance(ss, int) or ss < 0:
+                        fatal_error(f"row_center_head.warmup.start_step must be a non-negative int, got {ss!r}")
+                    ds = rcw.get('duration_steps', None)
+                    if not isinstance(ds, int) or ds <= 0:
+                        fatal_error(f"row_center_head.warmup.duration_steps must be a positive int, got {ds!r}")
+                    shp = rcw.get('shape', 'cosine')
+                    if shp not in ('cosine', 'linear'):
+                        fatal_error(f"row_center_head.warmup.shape must be 'cosine' or 'linear', got {shp!r}")
+            rc_enabled = bool(rc.get('enabled', False))
+        elif isinstance(rc, bool):
+            rc_enabled = rc
+        else:
+            fatal_error(f"row_center_head must be a bool or dict, got {type(rc).__name__}")
         # Escape hatch reserved for a deliberate ablation only.
         if not hasattr(self, 'allow_row_center_with_z_loss'):
             self.allow_row_center_with_z_loss = False
-        if self.row_center_head:
+        # Guardrail 5: advisory transition health guard (WARNING logs only, no
+        # auto-action). Off by default — Josef flips it on for a staged transition.
+        if not hasattr(self, 'transition_health_guard'):
+            self.transition_health_guard = False
+        elif not isinstance(self.transition_health_guard, bool):
+            fatal_error(f"transition_health_guard must be a bool, got {type(self.transition_health_guard).__name__}")
+        if rc_enabled:
             if self.tie_word_embeddings:
                 fatal_error(
                     "row_center_head requires an UNTIED output head: subtracting "
@@ -3615,17 +3943,26 @@ class Settings:
                     "embeddings, which is NOT function-preserving. Set "
                     "tie_word_embeddings: false or disable row_center_head."
                 )
-            # HARD ASSERT: z-loss must be off. Once the head is centered, h.mu->0,
-            # so a raw-logZ z-loss silently becomes CENTERED z-loss — the
-            # CE-visible regularizer we deliberately shelved. Fail loudly.
+            # STEP-ACTIVE OVERLAP ASSERT (Guardrail 2): the incompatibility is
+            # ACTIVE overlap, not static co-enablement. row_center s and z-loss
+            # alpha can both be CONFIGURED on (staged transition) as long as their
+            # schedules are temporally disjoint. Fail only if some global step has
+            # BOTH s(step) > 0 AND alpha_eff(step) > 0 (then raw z-loss would be
+            # acting as centered z-loss). Scan the union of the schedules' active
+            # ranges. Override allows a deliberate ablation.
             if self.z_loss is not None and not self.allow_row_center_with_z_loss:
-                fatal_error(
-                    "row_center_head and z_loss are both enabled. After "
-                    "row-centering the head, raw-logZ z-loss becomes CENTERED "
-                    "z-loss (a real regularizer, not the inert gauge). Disable "
-                    "z_loss, or set allow_row_center_with_z_loss: true for a "
-                    "deliberate ablation."
-                )
+                overlap_step = _find_rowcenter_zloss_overlap(self)
+                if overlap_step is not None:
+                    a = get_zloss_alpha(overlap_step, self)
+                    s = get_row_center_s(overlap_step, self)
+                    fatal_error(
+                        f"row_center_head and z_loss are ACTIVE at the same step "
+                        f"{overlap_step} (alpha_eff={a:.3e}, s={s:.3f}). Centering a "
+                        f"head while raw-logZ z-loss is nonzero makes it CENTERED "
+                        f"z-loss (a real regularizer, not the inert gauge). Stage "
+                        f"them disjoint (z-loss warmdown ends at/before row-center "
+                        f"warmup start), or set allow_row_center_with_z_loss: true."
+                    )
 
         # --- GDN hybrid attention ---
         if not hasattr(self, 'gdn_enabled'):

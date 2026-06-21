@@ -25,8 +25,13 @@ FSDP_buffer_dtype: bf16
 reshard_after_forward: true
 
 # Resume training settings
+# Resuming from 18000 — the PRE-z-loss checkpoint. z-loss (first applied at
+# 18250) compressed the healthy KEEL centered margin (logZ_c 108->80) for no
+# productive gain, so we rewind past it and recompute 18000->onward cleanly with
+# z-loss OFF and row-centering annealed in. Discards the ~500 z-loss steps as
+# un-productive noise.
 resume_training: true
-resume_step: 18_500
+resume_step: 18_000
 resume_data_reset: continue
 
 # Gradient clipping
@@ -144,29 +149,36 @@ auxiliary_heads:
 # ~2%-of-training ramp; shorten to ~2000 for a faster phase-in or lengthen if
 # you see a transient. Watch the new logZ column come DOWN as z_a ramps UP,
 # with no cliff in val ppl or generation quality.
-# z-loss is OFF while row_center_head is on. After centering the head, h.mu->0,
-# so a raw-logZ z-loss would silently become CENTERED z-loss (the CE-visible
-# regularizer we shelved) — the trainer hard-asserts against running both.
+# z-loss OFF — permanently, for this run. We resume from the PRE-z-loss 18000
+# checkpoint (z-loss never touched the weights or optimizer state at/before
+# 18000), so there is nothing to anneal OUT — no warmdown, no overlap concern.
+# Consensus (Josef/Rook/Chatty): z-loss not conclusively helpful, possibly
+# harmful; it compressed a healthy KEEL margin for no gain.
 z_loss:
   enabled: false
-  alpha: 1.0e-6           # tuned to dreadnought's logZ~490: z-term ≈ ~11-12% of CE
-                          # (1e-4 default assumes logZ~10; here it'd be ~14x CE — catastrophic)
+  alpha: 1.0e-6
   backend: fp32_accum
+
+# Row-center warmup (single transition). Anneal the gauge subtraction in over 300
+# steps starting AT the 18000 resume. Target-gauge schedule: pins the stored gauge
+# to (1-s)*mu0 each step (mu0 captured at warmup start = 18000, checkpoint-
+# persisted across the ~300-step window). s=0 at the first step => projection is a
+# NO-OP at the resume boundary itself (no shock), ramping to fully centered by
+# 18300. The hard pre-first-forward projection is SUPPRESSED under warmup; the
+# schedule is the sole path to centered. Row-centering is function-preserving on
+# the MODEL OUTPUT but NOT on OPTIMIZER STATE — the anneal is what keeps the
+# optimizer-coordinate change gentle. Telemetry: rc_muW/rc_muWp/rc_mbar + rc_s.
+row_center_head:
+  enabled: true
   warmup:
     enabled: true
-    start_step: 18250
-    duration_steps: 100
+    start_step: 18000
+    duration_steps: 300
     shape: cosine
 
-# Row-center the LM head (gauge subtraction). Removes the CE-invisible
-# common-mode mu from the readout every step (probe: ~78-81% of dn2's raw logZ
-# is this inert gauge; u1.ones~0.93). Function-preserving — does NOT change the
-# next-token distribution; it's a GAUGE CHOICE, not a regularizer and not
-# centered z-loss. Also strips the gauge from the Adam 1st moment so it can't
-# regrow. Full projection from step 0 (no anneal — function-preserving at every
-# fraction of mu). Requires untied head (true here) + z_loss off (above).
-# Telemetry: rc_muW (pre = regrowth rate), rc_muWp (post ~0), rc_mbar, rc_ratio.
-row_center_head: true
+# Advisory health guard: WARNING logs only (nrm>5, nrm>3 repeated, eff_rank_c<7,
+# spec_conc_c>0.45). No auto-action — manual control. Watches the 18000+ window.
+transition_health_guard: true
 
 # weight_decay:
 #   - [all, 0.02]
