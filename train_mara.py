@@ -1064,6 +1064,61 @@ def _centered_geometry_step(model, already_centered):
     return centered_geometry(p, vocab_dim=0, already_centered=already_centered)
 
 
+def _logz_c_at_val(model, tokens, max_tok=4096, tok_chunk=1024):
+    """DATA-SIDE centered logZ_c on a small batch, at VAL CADENCE only.
+
+    logZ_c = mean_token logsumexp(h @ (W - mu)^T) — the centered log-partition.
+    This is NOT free in the training forward: CCE fuses the loss and never
+    materializes the [N,V] logits, so we re-run a bounded [<=max_tok, V] matmul +
+    logsumexp here (once per val_step, capped tokens) rather than per step. Logged
+    REGARDLESS of z-loss (z-loss only ever surfaced RAW logZ, and only when on).
+
+    Captures the post-final-norm hidden via a forward hook on model.norm, then
+    centers the head (W - mu, mu the global row-mean) and reduces in token chunks
+    to bound VRAM. Returns logZ_c mean (float) or None. Caller runs at val cadence;
+    all ranks (no collective here — head/h are full on each rank in this codebase's
+    eval path; if vocab-sharded, this would need the same all-reduce as the probe,
+    but the live head is replicated for the metric)."""
+    import torch as _t
+    raw = model._orig_mod if hasattr(model, '_orig_mod') else model
+    p = _head_param(raw)
+    if p is None:
+        return None
+    cap = {}
+
+    def _hook(_m, _inp, out):
+        cap['h'] = out.detach()
+
+    # Bound the token count: take a single <=max_tok window (no need for the full
+    # batch — this is a trend metric, not the exact full-batch mean).
+    toks = tokens[:, :max_tok] if tokens.size(1) > max_tok else tokens
+    handle = raw.norm.register_forward_hook(_hook)
+    try:
+        with _t.no_grad():
+            if _t.cuda.is_available():
+                with _t.autocast("cuda", dtype=_t.bfloat16):
+                    model(toks)
+            else:
+                model(toks)
+    finally:
+        handle.remove()
+    if 'h' not in cap:
+        return None
+    h = cap['h'].reshape(-1, cap['h'].size(-1)).float()
+    W = p.detach().float() if not hasattr(p, '_local_tensor') else p._local_tensor.detach().float()
+    mu = W.mean(dim=0)
+    Wc = W - mu.unsqueeze(0)
+    N = h.shape[0]
+    acc = 0.0
+    cnt = 0
+    for s in range(0, N, tok_chunk):
+        hc = h[s:s + tok_chunk].to(W.device)
+        logits_c = hc @ Wc.t()                      # [c, V] centered
+        acc += _t.logsumexp(logits_c, dim=-1).sum().item()
+        cnt += hc.shape[0]
+    return acc / max(1, cnt)
+
+
 # -------------------------- Training Loop --------------------------
 def train_loop(
         model, optimizer, train_loader, val_loader, device, ddp, ddp_rank, ddp_local_rank, ddp_world_size, start_step,
@@ -2026,6 +2081,26 @@ def train_loop(
             _cg_centered = row_center_enabled and (not row_center_warmup_on or rc_s_eff >= 1.0)
             cg_diag = _centered_geometry_step(model, already_centered=_cg_centered)
 
+            # DATA-SIDE logZ_c at val cadence (bounded forward; NOT per-step — see
+            # _logz_c_at_val). Logged regardless of z-loss so we always have the
+            # centered log-partition trend (z-loss only ever surfaced RAW logZ).
+            logz_c_val = None
+            _was_training = model.training
+            try:
+                _vx, _vy = val_loader.next_batch(step=step)
+                model.eval()
+                logz_c_val = _logz_c_at_val(model, _vx.to(device))
+            except Exception as _e:
+                if ddp_rank == 0:
+                    logger.print_and_log(f"  logZ_c@val failed: {type(_e).__name__}: {_e}")
+            finally:
+                if _was_training:
+                    model.train()   # restore the mode we found
+            # Fold the data-side logZ_c into the centered-geom record so it lands
+            # in diagnostics.jsonl['centered_geom'] regardless of z-loss state.
+            if logz_c_val is not None and cg_diag is not None:
+                cg_diag['logZ_c'] = logz_c_val
+
             # Guardrail 5: transition health guard — geometry part (val cadence).
             # WARNING only; never auto-acts. Thresholds from the family calibration
             # (Nexus #156/#157): eff_rank_c < 7 warn, spec_conc_c > 0.45.
@@ -2056,8 +2131,10 @@ def train_loop(
                 )
                 diagnostics.print_summary(snapshot, logger, awd_data=awd_diag, moe_data=moe_diag)
                 if cg_diag is not None and ddp_rank == 0:
+                    _lzc = cg_diag.get('logZ_c')
+                    _lzc_tag = f" logZ_c={_lzc:.2f}" if _lzc is not None else ""
                     logger.print_and_log(
-                        f"  [centered-geom] ||W_c||={cg_diag['Wc_fro']:.2f} "
+                        f"  [centered-geom]{_lzc_tag} ||W_c||={cg_diag['Wc_fro']:.2f} "
                         f"s1_c={cg_diag['s1_c']:.2f} "
                         f"spec_conc_c={cg_diag['spectral_concentration_c']:.4f} "
                         f"eff_rank={cg_diag['effective_rank_c']:.1f} "
