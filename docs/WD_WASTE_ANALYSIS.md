@@ -108,7 +108,7 @@ NOT via clipping (decoupled, see above). So: **worth correcting**, but the harm 
 
 ## Implications
 
-- **Body correction (if we act):** a **RENORM** (rescale pre-norm matrices toward a target `||W||`) is **function-safe** — it lives in the loss-null scale direction, so model outputs are invariant (the body analog of head row-centering being function-preserving). It reclaims effective-LR + numerical headroom. BUT: function-safe ≠ optimizer-state-safe (the head lesson — the hard switch shocked Adam at 18500). So **ANNEAL** any renorm, don't apply cold.
+- **Body correction (if we act):** a **RENORM** (rescale pre-norm matrices toward a target `||W||`) lives in the **locally** loss-null scale direction. **IMPORTANT CAVEAT (Chatty review):** `cos(g_loss,W)≈0` proves the *infinitesimal radial* direction is loss-null; it does **NOT** prove `L(cW)=L(W)` for a large finite `c`. The head case is *exactly* function-preserving (the `z_i'=z_i-h·μ` identity is algebraic, holds at any magnitude); the body case is an *empirical local orthogonality* that finite rescale could break via RMSNorm epsilon, KEEL residual/highway ratios, gated-MLP (`w1`/`w3`) coupling, or QK-norm placement. So: **finite-rescale invariance is an OPEN EMPIRICAL QUESTION (see Finite-Rescale Probe below), not established.** If it holds for moderate `c`, renorm is a gentle-control tool with a known safe range; if not, it's off the table. Either way: function-safe ≠ optimizer-state-safe (the head lesson — the hard switch shocked Adam at 18500), so **ANNEAL** any renorm and handle optimizer state, and prefer a **next-run-from-step-0 gauge** over mid-run surgery.
 - **Do NOT use more WD to fight it:** dn1 ramped head-WD to 0.1 to fight head growth and **died** (coherency collapse). WD is a blunt radial pull that interacts badly with the optimizer/gauge; it is not a clean null-space correction. Renorm is; WD is not.
 - **Head:** the gauge fix is **row-centering** (live on dn2 @18000+), correct and sufficient for the head.
 
@@ -123,6 +123,99 @@ NOT via clipping (decoupled, see above). So: **worth correcting**, but the harm 
 5. The **body_in vs body_proj split:** body_in (reads normed input) has slightly higher tail `|cos|` (p99 up to 0.011–0.025) than body_proj (output→Post-LN, p99 ~0.003–0.005). Is body_in's weaker scale-invariance (input side, epsilon / partial-dependence) the reason, and does it matter?
 
 ---
+
+## Pending tests (Chatty math review, 2026-06-22)
+
+The cos test measured the **gradient** `g_loss`; under NorMuon the **actual step** is the
+orthogonalized/normalized update, not the gradient — so two follow-ups:
+
+1. **Finite-rescale invariance probe (DECISION-MAKER, forward-only, cheap):** per class
+   `{wo, w2, wq, wk, wv, w1, w3}`, rescale that class by `c ∈ {0.95,0.9,0.8,0.7}` and
+   measure `ΔCE, Δlogp_y, Δlogits, Δhidden-RMS` on a fixed batch. If CE is allclose at
+   `c=0.9` but not `c=0.7`, renorm is a **gentle-control tool with a known safe range**,
+   not a hard gauge projection. If even `0.95×` moves CE, renorm is off the table.
+   `body_proj`={wo,w2} expected safest (cleaner cos); `body_in` (esp. gated `w1`/`w3`)
+   more cautious — may need PAIRED scaling (scaling `w1` alone ≠ scaling the branch).
+2. **Actual-update decomposition (mechanism):** capture the NorMuon update `ΔW_Muon`
+   (pre-decoupled-WD) and report `cos(ΔW_Muon, W)`, radial/tangential fractions, and
+   `<ΔW_Muon, W>`. If the normalized update has a small radial component, it FEEDS the
+   ramp even when raw CE grads are radial-null — the gradient-based cos can't see this.
+
+Equilibrium note (Chatty): `||W_{t+1}||² ≈ (1-ηλ)²||W_t||² + ||U_t||²` with `U_t ⟂ W_t`;
+equilibrium at `||U||² ≈ 2ηλ||W||²`. With `ηλ ≈ 2.96e-4·0.02 ≈ 5.9e-6` and body slope
+~+2.24%/kstep, dn2 body may still be well below balance — "probably bounded, possibly at
+an uncomfortably high scale (~2× current?)", NOT proven unbounded. But NorMuon's
+fixed-magnitude tangential injection may push that equilibrium far out.
+
+Optimizer-state under a scale transform `W←cW` (if renorm is ever applied): exact-scale-
+invariance implies `g←g/c`, so a consistent Adam transform would be `m←m/c, v←v/c²`;
+Muon momentum `M←M/c` but Muon normalizes the update so the exact consequence needs an
+empirical test. Do NOT implement renorm as "just scale the weights."
+
+Sequencing: this is a TELEMETRY + BRANCH item, NOT for the current live transition.
+Live priority: finish row-centering → (optional) SCS cleanup → later head-LR dampener.
+Body renorm, if green-lit, is best as a **next-run step-0 gauge** (start in the chosen
+gauge) or a slow log-space-annealed norm ceiling on a branch, never bolted onto the
+current run.
+
+## Finite-rescale invariance — RESULT (2026-06-22): RENORM IS **NOT** FUNCTION-SAFE
+
+The decision-maker ran (`tools/finite_rescale_probe.py`, forward-only). **Verdict:
+finite body rescale is NOT loss-invariant — Chatty's caution was empirically
+correct. `cos(g_loss,W)≈0` (infinitesimal radial loss-null) does NOT extend to
+finite `c`.** Post-hoc renorm is OFF the table as a "free" gauge correction.
+
+ΔCE from rescaling each class by `c` (per-class matrices ×c, re-forward, restore):
+
+### mf-35k (baseline CE 2.609)
+| class | c=0.95 | c=0.9 | c=0.8 | c=0.7 |
+|---|---|---|---|---|
+| wo | 0.039 | 0.047 | 0.018 | 0.112 |
+| w2 | 0.0022 | 0.018 | 0.103 | 0.333 |
+| wq | 0.0009 | 0.018 | 0.004 | 0.012 |
+| wk | 0.0026 | 0.005 | 0.009 | 0.003 |
+| wv | 0.015 | 0.043 | 0.013 | 0.112 |
+| w1 | 0.009 | 0.032 | 0.179 | 0.507 |
+| w3 | 0.014 | 0.015 | 0.120 | 0.323 |
+| head | 0.008 | 0.022 | 0.107 | 0.057 |
+| **w1w3 paired** | 0.020 | 0.141 | 0.600 | **2.21** |
+
+### dn1-14k DEAD (baseline CE 2.915)
+| class | c=0.95 | c=0.9 | c=0.8 | c=0.7 |
+|---|---|---|---|---|
+| wo | 0.025 | 0.029 | 0.008 | 0.061 |
+| w2 | 0.029 | 0.029 | 0.169 | 0.463 |
+| wq | 0.026 | 0.031 | 0.012 | 0.013 |
+| wk | 0.016 | 0.008 | 0.028 | 0.012 |
+| wv | 0.011 | 0.050 | 0.004 | 0.067 |
+| w1 | 0.013 | 0.003 | 0.231 | 0.911 |
+| w3 | 0.029 | 0.014 | 0.188 | 0.528 |
+| head | 0.032 | 0.006 | 0.096 | 0.361 |
+| **w1w3 paired** | 0.026 | 0.160 | 0.823 | **2.06** |
+
+dn1-14k SAFE RANGE: **NOT safe even at c=0.95 for ANY class** (dCE_rel ≥ 1e-3 everywhere).
+mf SAFE RANGE: only wq/wk/w2 squeak under the 1e-3 bar at c=0.95; all break by c=0.9.
+(dn2-18000 pending; expected to confirm.)
+
+### What this means
+- **NOT the head analog.** Head row-centering is *algebraically exact* at any
+  magnitude (`z_i'=z_i-h·μ`); body rescale changes CE measurably even at 5%.
+- **ΔCE is non-monotonic / jagged** (e.g. wo 0.039→0.047→0.018→0.112) — not the
+  smooth signature of a true gauge; finite scale genuinely couples into the output
+  via RMSNorm epsilon, KEEL residual/highway ratios, gated-MLP structure.
+- **Gated-MLP w1w3 paired is catastrophic** (c=0.7 ΔCE ~2.1, ~70-85% loss increase) —
+  SwiGLU's two legs compound ~quadratically; scaling one leg ≠ scaling the branch.
+  Confirmed across both architectures.
+- **The WD-waste finding (infinitesimal loss-null) STANDS; the proposed FIX (renorm)
+  is DEAD.** You cannot project the body scale out the way you can the head gauge.
+
+### Revised implication for the body ramp
+If the body ramp is worth addressing (the effective-LR cost is real), it must be a
+**TRAINING-DYNAMICS** approach, NOT post-hoc rescale:
+- The NorMuon **actual-update decomposition** (pending test #2): is the normalized
+  update itself feeding radial drift? That's the mechanism to target.
+- A next-run **gauge/WD-schedule choice from step 0** (start in a controlled regime).
+- NOT: post-hoc renorm (breaks the function), and NOT: more WD (killed dn1).
 
 ## Reproduce
 ```
