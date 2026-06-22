@@ -2497,11 +2497,32 @@ def resume_training(model, optimizer, train_loader, ddp_rank, settings, grad_acc
 
     # FSDP2: Use set_model_state_dict to load and distribute weights
     logger.print_and_log("  ] Distributing model weights across ranks...")
+
+    # REMOVAL-direction reconciliation (aux heads turned OFF at resume): when the
+    # auxiliary_heads block is removed from config, the model no longer constructs
+    # aux_heads.* but the checkpoint still contains those (~251.7M) params -> they'd
+    # be UNEXPECTED keys and strict load would RuntimeError. Drop the orphaned
+    # aux_heads.* keys from the loaded state_dict so the slimmed model loads cleanly
+    # (and strict stays valid, still catching any OTHER unexpected key). Scoped to
+    # aux_heads.* and only fires when the model has no aux-head params at all, so
+    # it's a no-op on normal resumes and on the turn-ON path below.
+    model_keys = set(raw_model.state_dict().keys())
+    model_has_aux = any(k.startswith('aux_heads.') for k in model_keys)
+    if not model_has_aux:
+        orphan_aux = [k for k in state_dict if k.startswith('aux_heads.')]
+        if orphan_aux:
+            for k in orphan_aux:
+                del state_dict[k]
+            logger.print_and_log(
+                f"  ] aux heads removed from config — dropped {len(orphan_aux)} "
+                f"orphaned aux_heads.* param(s) from the checkpoint load (the head "
+                f"weights remain in the checkpoint file; just not loaded)."
+            )
+
     # Detect new modules added since the checkpoint (e.g. auxiliary heads when
     # the intervention is being turned on at resume). Missing keys are tolerated
     # so freshly-initialized weights survive the load; unexpected keys would
     # still indicate a real config mismatch and we want to know about those.
-    model_keys = set(raw_model.state_dict().keys())
     ckpt_keys = set(state_dict.keys())
     missing_in_ckpt = sorted(model_keys - ckpt_keys)
     has_new_aux = any(k.startswith('aux_heads.') for k in missing_in_ckpt)
@@ -2631,6 +2652,33 @@ def resume_training(model, optimizer, train_loader, ddp_rank, settings, grad_acc
                 state_dict[fqn] = {}
             saved_sd['state'] = state_dict
 
+        def _drop_removed_aux_state(saved_sd: dict, log_prefix: str = ""):
+            """Symmetric to _inject_empty_state_for_new_params, for the aux-heads-
+            REMOVED case: when the current model has no aux_heads.* params but the
+            saved optimizer state does, strip those orphaned entries from both
+            'state' and each param_group's 'params' FQN list. Otherwise
+            set_optimizer_state_dict would try to map state onto params that no
+            longer exist (or trip the param_groups<->params consistency checks).
+            No-op when the model still has aux heads (normal resume / turn-ON)."""
+            model_fqns = set(name for name, _ in raw_model.named_parameters())
+            if any(f.startswith('aux_heads.') for f in model_fqns):
+                return  # model still has aux heads -> nothing to drop
+            st = saved_sd.get('state', {})
+            orphan = [k for k in st if k.startswith('aux_heads.')]
+            for k in orphan:
+                del st[k]
+            n_pg = 0
+            for pg in saved_sd.get('param_groups', []):
+                if 'params' in pg:
+                    before = len(pg['params'])
+                    pg['params'] = [p for p in pg['params'] if not (isinstance(p, str) and p.startswith('aux_heads.'))]
+                    n_pg += before - len(pg['params'])
+            if orphan or n_pg:
+                logger.print_and_log(
+                    f"  ] {log_prefix}aux heads removed — dropped {len(orphan)} "
+                    f"orphaned optimizer-state entr(ies) + {n_pg} param-group ref(s)."
+                )
+
         if use_full_optim:
             # Full state dict — all ranks load the same file, FSDP distributes automatically.
             # Strip param_group metadata: the current optimizer already has the correct
@@ -2638,6 +2686,9 @@ def resume_training(model, optimizer, train_loader, ddp_rank, settings, grad_acc
             # redistribution. Custom param_group keys (MuonFSDP2's momentum/beta2 vs
             # Adam's betas) cause KeyErrors in _unflatten_state_dict if left in.
             optim_sd = torch.load(optim_full_path, map_location="cpu")
+            # Drop orphaned aux-head state/refs FIRST (aux-heads-removed case) so the
+            # param_group 'params' lists below match the slimmed model.
+            _drop_removed_aux_state(optim_sd)
             # Sync param_group metadata with the current optimizer.  The saved dict's
             # param_groups may have extra keys injected during consolidation (e.g.
             # 'betas' on Muon groups) that cause KeyErrors in _unflatten_state_dict.
@@ -2662,6 +2713,7 @@ def resume_training(model, optimizer, train_loader, ddp_rank, settings, grad_acc
         else:
             # Sharded state dict — each rank loads its own shard (requires same world_size)
             optim_shard = torch.load(optim_shard_path, map_location="cpu")
+            _drop_removed_aux_state(optim_shard, log_prefix=f"[R{ddp_rank}] ")
             _inject_empty_state_for_new_params(optim_shard, log_prefix=f"[R{ddp_rank}] ")
             optim_options = StateDictOptions(full_state_dict=False)
             set_optimizer_state_dict(raw_model, load_optim, optim_shard, options=optim_options)
