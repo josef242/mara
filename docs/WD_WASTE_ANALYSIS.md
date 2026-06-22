@@ -217,6 +217,71 @@ If the body ramp is worth addressing (the effective-LR cost is real), it must be
 - A next-run **gauge/WD-schedule choice from step 0** (start in a controlled regime).
 - NOT: post-hoc renorm (breaks the function), and NOT: more WD (killed dn1).
 
+## Taming battery (2026-06-22) — mechanism test + an OPEN PUZZLE
+
+Goal: find how to TAME the body norm ramp (Josef; restart-from-scratch acceptable;
+"leave it alone" rejected). Built Test 1 (NorMuon actual-update decomposition) +
+Test 2 (WD-equilibrium) + a ground-truth cross-check. Result: ruled out the simple
+mechanisms and **falsified the toy equilibrium model** — the real growth force is
+currently unaccounted-for. This is the live question for the Math Agent.
+
+### Test 1 — NorMuon actual-update decomposition (tools/normuon_update_decomp.py)
+Part B measured `cos(g_loss,W)` (gradient). NorMuon steps along the
+Newton-Schulz-orthogonalized + neuron-normalized update, not the gradient. Replicated
+the EXACT transform (`apply_momentum → zeropower_via_newtonschulz5 → apply_scaling →
+apply_normuon`, real muon_fsdp2 funcs) and measured `cos(update, W)`. **mf-35k, exact
+single-card, COLD momentum/2nd-moment buffers:**
+| class | cos(grad,W) | cos(UPDATE,W) |
+|---|---|---|
+| body_proj | 0.0010 | 0.0019 |
+| body_in | 0.0005 | 0.0014 |
+| head* | 0.0001 | 0.117* |
+
+NS orthogonalization DOES inject a radial component (~2-3× the gradient's), but on
+the body it stays **negligible** (cos~0.002, 99.9998% tangential). *head 0.117 is a
+PROBE ARTIFACT — the head is the Adam group, not Muon; the NS transform doesn't apply
+to it in production. Body numbers are valid.
+
+### Ground-truth cross-check (no model) vs the toy equilibrium model — CONTRADICTION
+Toy model (Math Agent): `||W_{t+1}||² ≈ (1-ηλ)²||W_t||² + ||U_t||²`, equilibrium
+`||W_eq|| = ||U||/√(2ηλ)`. With mf measured `||update||≈28.7`, `η≈3.3e-4`, `λ=0.02`:
+- per-step tangential `||U|| = η·||update|| ≈ 0.0095`
+- WD removal/step `= ηλ||W|| ≈ 0.0036` (DOWN, at ||W||≈540 block)
+- tangential add/step `= ||U||²/(2||W||) ≈ 8e-8` (UP) — **negligible**
+- ⟹ model predicts net `d||W||/step ≈ −0.0036` (should SHRINK)
+
+**ACTUAL (mf L35 ffn block, diagnostics.jsonl, steps 35200→35600, zero modeling):**
+`d||W|| = +0.0031/step (+0.57%/kstep)` — **GROWING.**
+
+⟹ The toy model has the **WRONG SIGN** and is ~2× off. There is an unaccounted
+**+~0.0067/step radial (+W) growth force** that none of our measured sources explain:
+NOT the gradient (cos≈0), NOT NS radial injection (cos 0.002 → ~1.9e-5/step, 350× too
+small), NOT tangential quadrature (8e-8). And it OVERWHELMS a WD removal two orders
+larger than any visible injection term.
+
+### Leading hypotheses (for the Math Agent)
+1. **Warm buffers.** The probe used COLD momentum (β=0.95, ~20-step memory) and 2nd-
+   moment buffers. In real training these are warm — the momentum buffer may carry a
+   persistent radial component, and `apply_normuon`'s norm-preserving rescale (it forces
+   `||update|| = ||pre-norm||` via the warm 2nd-moment `second_momentum`) could make the
+   real per-step `||U||` much larger / differently-directed than the cold 28.7.
+2. **`||U||` underestimated.** If warm `||U||` is ~10-30× the cold estimate, the
+   tangential quadratic term becomes significant and equilibrium moves far out (could
+   reconcile both the growth AND the "still ramping at 18k" observation).
+3. **A genuine small persistent radial bias** in the warm update that single-step cold
+   analysis can't resolve.
+
+### Implication for taming (provisional)
+- The "just turn up WD" dial (Test 2) is **not validated** — the toy model it rests on
+  is falsified, so its equilibrium predictions (eq@1x≈2.6 while actual=107) are wrong.
+  DO NOT size a WD change off that model until the real force balance is known.
+- The right next test is **warm-buffer**: measure `cos(update,W)` and `||U||` with the
+  momentum + 2nd-moment buffers RESTORED from the checkpoint's optimizer state (not
+  cold), and/or decompose the ACTUAL `ΔW` between two adjacent real training steps.
+- Renorm remains OFF (finite-rescale unsafe, separate result above). The taming lever,
+  if any, is in the optimizer dynamics (warm-update radial component) — once we know
+  what's actually adding the +0.0067/step, the fix targets THAT.
+
 ## Reproduce
 ```
 # Part A (offline, log-parse, no GPU):
