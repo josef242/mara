@@ -1049,19 +1049,18 @@ def _row_center_warmup_step(model, optimizer, s, mu0, mbar0):
     return row_center_head_warmup_(p, s, mu0, exp_avg=exp_avg, mbar0=mbar0, vocab_dim=0)
 
 
-def _centered_geometry_step(model, already_centered):
+def _centered_geometry_step(model):
     """Centered head-geometry health metrics (Item B) at val cadence. Returns the
     centered_geometry dict (||W_c||, s1_c, spec_conc_c, eff_rank, small-sigma) or
-    None if no head. already_centered=True when row_center_head is on (the stored
-    weight is centered every step, so G = W^T W directly); False otherwise (the
-    helper subtracts the global row-mean first). Cheap [D,D] eigh — only call at
-    val cadence, not per step."""
+    None if no head. centered_geometry always subtracts the current row-mean, so it
+    reads true at any ramp position (Nexus #163). Cheap [D,D] eigh — val cadence
+    only, not per step."""
     from row_center import centered_geometry
     raw = model._orig_mod if hasattr(model, '_orig_mod') else model
     p = _head_param(raw)
     if p is None:
         return None
-    return centered_geometry(p, vocab_dim=0, already_centered=already_centered)
+    return centered_geometry(p, vocab_dim=0)
 
 
 def _logz_c_at_val(model, tokens, max_tok=4096, tok_chunk=1024):
@@ -2073,13 +2072,11 @@ def train_loop(
             # spectral_concentration_c + eroding small singular values was the
             # death signature. Cheap [D,D] gram->eigh; computed only here at val
             # cadence. MUST run on all ranks (the gram all-reduce is collective).
-            # already_centered: ONLY true when the stored head is fully centered
-            # every step (steady-state projection, s==1) -> G = W^T W directly.
-            # During warmup the head carries a partial gauge ((1-s)*mu0), so we
-            # must center-first in the metric (already_centered=False); the helper
-            # is correct either way, this just skips a redundant subtract at s=1.
-            _cg_centered = row_center_enabled and (not row_center_warmup_on or rc_s_eff >= 1.0)
-            cg_diag = _centered_geometry_step(model, already_centered=_cg_centered)
+            # centered_geometry ALWAYS subtracts the current row-mean now (Nexus
+            # #163), so it reads the TRUE centered geometry at any ramp position —
+            # no already_centered flag needed (a mid-ramp weight carries a residual
+            # gauge that, unsubtracted, faked a rank-~1.6 collapse).
+            cg_diag = _centered_geometry_step(model)
 
             # DATA-SIDE logZ_c at val cadence (bounded forward; NOT per-step — see
             # _logz_c_at_val). Logged regardless of z-loss so we always have the
