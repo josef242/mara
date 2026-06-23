@@ -1783,6 +1783,20 @@ def train_loop(
             import torch.distributed as _dist
             from torch.distributed.tensor import DTensor as _DT
             _raw_is = model._orig_mod if hasattr(model, '_orig_mod') else model
+            # WARM stage-trace: replay the NorMuon stages on the WARM momentum buffer
+            # (post-step, the buffer that PRODUCED this update) to find WHERE the
+            # radial bias cos(.,W) enters: grad -> warm-momentum -> NS -> scaling ->
+            # normuon. Tests the momentum-curvature hypothesis (cold replay CAN'T —
+            # cold momentum == grad). Uses the real optimizer.state buffers.
+            try:
+                from muon_fsdp2 import (zeropower_via_newtonschulz5 as _ns,
+                                        apply_scaling as _ascale, apply_normuon as _anorm)
+                _ns_steps = int(getattr(settings, 'muon_ns_steps', 5) or 5)
+                _b2 = float(getattr(settings, 'normuon_beta2', 0.95) or 0.95)
+                _rmss = bool(getattr(settings, 'muon_rms_scale', False))
+                _have_stage = True
+            except Exception:
+                _have_stage = False
             _rows = []
             for _n, _p in _raw_is.named_parameters():
                 if _n not in _insitu_snap:
@@ -1790,27 +1804,54 @@ def train_loop(
                 _W0, _efflr, _wd = _insitu_snap[_n]
                 _W1 = (_p._local_tensor if isinstance(_p, _DT) else _p).detach().float()
                 _total = _W1 - _W0
-                # decoupled WD term that was applied this step: ΔW_wd = -efflr*wd*W0
                 _wd_dW = (-(_efflr * _wd)) * _W0
-                _muon_dW = _total - _wd_dW  # the loss-driven (optimizer update) part
+                _muon_dW = _total - _wd_dW
                 def _gsum(_t, _ref=_p):
                     _v = _t
                     if isinstance(_ref, _DT) and _dist.is_available() and _dist.is_initialized():
                         _v = _v.clone(); _dist.all_reduce(_v, group=_ref.device_mesh.get_group())
                     return _v
+                def _cos(_a, _b):  # global cos(a,b) over the param's mesh
+                    _d = _gsum((_a*_b).sum()).item()
+                    _an = _gsum((_a*_a).sum()).clamp_min(0).sqrt().item()
+                    _bn = _gsum((_b*_b).sum()).clamp_min(0).sqrt().item()
+                    return (_d/(_an*_bn)) if (_an>0 and _bn>0) else 0.0
                 _wsq = _gsum((_W0*_W0).sum()); _wn = _wsq.clamp_min(0).sqrt().item()
                 _tot_dot = _gsum((_total*_W0).sum()).item()
                 _mu_dot = _gsum((_muon_dW*_W0).sum()).item()
                 _mu_sq = _gsum((_muon_dW*_muon_dW).sum()); _mun = _mu_sq.clamp_min(0).sqrt().item()
-                _rows.append({
+                _row = {
                     'name': _n, 'w_norm': _wn,
-                    'total_dW_radial': (_tot_dot/_wn) if _wn>0 else 0.0,   # actual d||W||/step
-                    'muon_dW_norm': _mun,                                  # ||U|| ACTUAL
-                    'muon_radial': (_mu_dot/_wn) if _wn>0 else 0.0,        # update's radial push
+                    'total_dW_radial': (_tot_dot/_wn) if _wn>0 else 0.0,
+                    'muon_dW_norm': _mun,
+                    'muon_radial': (_mu_dot/_wn) if _wn>0 else 0.0,
                     'muon_cos': (_mu_dot/(_mun*_wn)) if (_mun>0 and _wn>0) else 0.0,
-                    'wd_radial': -(_efflr*_wd)*_wn,                        # WD pull (down)
+                    'wd_radial': -(_efflr*_wd)*_wn,
                     'eff_lr': _efflr, 'wd': _wd,
-                })
+                }
+                # WARM stage-trace (Muon body params only — those with momentum_buffer)
+                if _have_stage:
+                    _st = optimizer.state.get(_p, {})
+                    _mb = _st.get('momentum_buffer')
+                    if _mb is not None and _p.grad is not None and _p.dim() == 2:
+                        try:
+                            _Wl = _W0  # pre-step weight (local), the buffer's reference
+                            _g = (_p.grad._local_tensor if isinstance(_p.grad, _DT) else _p.grad).detach().float()
+                            _m = (_mb._local_tensor if isinstance(_mb, _DT) else _mb).detach().float()
+                            _row['cos_grad_W'] = _cos(_g, _Wl)
+                            _row['cos_warmmom_W'] = _cos(_m, _Wl)            # <-- momentum-curvature shows HERE
+                            _u = _ns(_m.clone(), _ns_steps).type_as(_m).float()
+                            _row['cos_afterNS_W'] = _cos(_u, _Wl)
+                            _u = _ascale(_u, _rmss)
+                            _row['cos_afterscale_W'] = _cos(_u, _Wl)
+                            _smb = _st.get('second_momentum_buffer')
+                            if _smb is not None:
+                                _sm = (_smb._local_tensor if isinstance(_smb, _DT) else _smb).detach().float().clone()
+                                _u = _anorm(_u, _sm, _b2)
+                                _row['cos_afternormuon_W'] = _cos(_u, _Wl)
+                        except Exception as _e:
+                            _row['stage_err'] = f"{type(_e).__name__}"
+                _rows.append(_row)
             if ddp_rank == 0:
                 import json as _json
                 _outp = os.environ.get('WD_INSITU_OUT', 'wd_insitu.json')
