@@ -405,13 +405,20 @@ z_loss=None, 0 aux matrices in the run). So the −0.0129 anti-radial lean on 10
 matrices arises under **plain next-token CE training** on this KEEL/RMSNorm architecture.
 The aux-head hypothesis is DEAD — removing aux heads will NOT fix the body ramp.
 
-**This CONTRADICTS Part B and is important:** Part B measured `cos(g_loss,W)≈+0.0005`
-(near-zero / loss-null); this real-training gradient is `−0.0129` — an order of magnitude
-larger AND opposite-signed, so not noise. Both are essentially pure-CE on mf, so the
-difference is NOT aux/z-loss/dropout. The remaining candidates: **eval-branch forward (Part B)
-vs train-branch forward (in-situ)**, batch/seq composition, or that Part B's `cos` measured a
-subtly different quantity. The real-training gradient is the operative one (it's what trains),
-and it is NOT loss-null. (Finite-rescale renorm-unsafe result stands independently.)
+**This CONTRADICTS Part B — and reconciliation SHARPENS it (signed-vs-magnitude checked):**
+Part B's headline "+0.0005" was the |cos| MAGNITUDE mean (my reporting). The SIGNED Part B
+body cos(g,W) is **+0.0003 mean, median exactly 0.0, ~41% negative / 59% positive — sign-RANDOM
+around zero.** That is a genuinely radial-null gradient (Part B was correct; sign-random
+confirms it). The in-situ train-branch gradient is **−0.0129 on 100% of matrices** — a
+dead-consistent systematic inward lean. So the two are CATEGORICALLY different and it is NOT a
+reporting artifact and NOT aux/z/dropout (all ruled out): the difference lives in the FORWARD
+PATH. Part B uses the **eval branch** (`self.output(h)` then external `F.cross_entropy`); in-situ
+uses the **train branch** (the model's fused-CCE `(None, loss)` at model_v2:1961, model.train()
+mode, activation-checkpoint recompute). Something in the train-branch forward introduces the
+consistent anti-radial lean the eval-branch forward does not. The real-training gradient is the
+operative one (it's what trains) and it is NOT loss-null. NEXT TEST: measure fresh-gradient
+radial cos under BOTH forward paths on the SAME batch to isolate which train-branch element
+(fused-CCE numerics? act-ckpt recompute?) produces the lean. (Finite-rescale result stands.)
 
 **Revised picture & taming implications:**
 - WD lever still valid (WD is radial, opposes the push) and still the simplest dial.
