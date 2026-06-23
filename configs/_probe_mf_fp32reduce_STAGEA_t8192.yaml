@@ -16,7 +16,7 @@ ga_schedule:
 B: 1                          # Batch size per GPU
 #T: 8192                       # Context size (sequence length)
 #T: 10240                      # Context size (sequence length)
-T: 12288                      # Context size (sequence length)
+T: 8192                      # Context size (sequence length)
 max_steps: 200_000            # Maximum number of training steps
 eval_iters: 2                 # Number of iterations for evaluation x ranks
 val_step: 100                 # Validation step frequency in steps
@@ -25,7 +25,7 @@ save_step: 250                # Checkpoint saving frequency in steps
 # Data type settings
 data_type: bf16
 FSDP_param_dtype: bf16
-FSDP_reduce_dtype: bf16
+FSDP_reduce_dtype: fp32
 FSDP_buffer_dtype: bf16
 reshard_after_forward: false
 

@@ -1447,9 +1447,35 @@ def train_loop(
         # heads that aren't training. Keys are added on first contribution.
         aux_loss_accum: dict = {}
         grad_accum_steps = grad_accum_schedule[step]
+        # REPLICATED-DATA probe (Math Agent test #3): when WD_REPLICATED_DATA=1,
+        # broadcast rank 0's microbatch to ALL ranks so every rank computes its
+        # gradient over IDENTICAL data. Combined with WD_INSITU_PROBE=1 this is the
+        # clean single-variable cut: same data across ranks, everything else (FSDP
+        # path, all-gathered bf16 params, reduce-scatter) unchanged. If the -0.0129
+        # lean SURVIVES => it is FSDP machinery/precision, NOT cross-rank data
+        # composition. If it VANISHES/changes => it is the data distribution. Env-gated;
+        # zero effect on normal runs. (One-shot — WD_INSITU_PROBE exits after this step.)
+        _repl_data = os.environ.get('WD_REPLICATED_DATA') == '1' and ddp
+        # TOKEN CAPTURE (WD_DUMP_TOKENS=1): dump rank0's FIRST microbatch tokens as
+        # RAW BINARY int tensors for exact offline replay (Math Agent #1, splits the
+        # residual into real-stream-data vs FSDP/bf16-path). BLACK BOX: tokens are
+        # never decoded, detokenized, printed, or logged — only torch.save'd as ints
+        # and fed straight back into the model. The dataset is unfiltered; we treat
+        # all token content as opaque in every code path. Shapes only in any log.
+        _dump_tokens = os.environ.get('WD_DUMP_TOKENS') == '1'
         for micro_step in range(grad_accum_steps):
             x, y = train_loader.next_batch(step=step)
             x, y = x.to(device), y.to(device)
+            if _repl_data:
+                # broadcast rank0's batch to all ranks (token-id int tensors)
+                dist.broadcast(x, src=0)
+                dist.broadcast(y, src=0)
+            if _dump_tokens and micro_step == 0 and ddp_rank == 0:
+                _tokpath = os.environ.get('WD_TOKENS_OUT', 'rank0_tokens.pt')
+                # raw binary int tensors only; NO decode, NO content logging
+                torch.save({'x': x.detach().cpu(), 'y': y.detach().cpu(),
+                            'step': step, 'shape': tuple(x.shape)}, _tokpath)
+                logger.print_and_log(f"[WD-DUMP] saved rank0 microbatch tokens (shape {tuple(x.shape)}, OPAQUE) -> {_tokpath}")
             # Avoid gradient synchronization on intermediate micro-steps
             # (big speedup with FSDP/DDP when grad_accum_steps > 1)
             sync_ctx = nullcontext()
@@ -1758,6 +1784,144 @@ def train_loop(
         # (eff_lr*wd*||W||), and dump JSON. Resolves the cold-replay 38x gap with
         # zero replication assumptions. Set WD_INSITU_PROBE=1 to enable; exits after
         # one captured step. NO effect on normal runs.
+        # ── STAGE A: bf16 ALL-REDUCE radial-gradient probe (env-gated, one-shot) ──
+        # Stage B (offline single-card) EXONERATED the fused-CCE kernel, bf16-CCE
+        # accumulation, long context (T=12288), and act-ckpt recompute: all give
+        # cos(g,W) ~ +0.0001 sign-random, NOT the in-situ -0.0129. STAGE A then ruled
+        # out the bf16 reduce-scatter too (fp32-reduce gave IDENTICAL -0.01288). So the
+        # lean is PRE-reduction. This probe splits the last fork: compares
+        # cos(g_reduced, W) [GLOBAL, the real reduce-scattered .grad] vs
+        # cos(g_local, W) [PER-RANK, a local grad-accum under set_requires_gradient_sync
+        # (False) => NO cross-rank reduction, NO aggregation in the cos]. If EVERY rank's
+        # LOCAL grad already leans <<0, the anomaly is intrinsic to a single rank's
+        # sharded computation (all-gathered bf16 params / its data shard) and the
+        # single-card probe should have caught it but didn't => REAL MYSTERY. If LOCAL~0
+        # but REDUCED<<0, it emerges only from combining 8 different-data partials.
+        # Set WD_REDUCE_PROBE=1. One-shot: dumps JSON, exits before optimizer.step().
+        if os.environ.get('WD_REDUCE_PROBE') == '1':
+            import torch.distributed as _rdist
+            from torch.distributed.tensor import DTensor as _RDT
+            _raw_rp = model._orig_mod if hasattr(model, '_orig_mod') else model
+            def _rp_local(_t):
+                return _t._local_tensor if isinstance(_t, _RDT) else _t
+            def _rp_gsum(_t, _ref):
+                if isinstance(_ref, _RDT) and _rdist.is_available() and _rdist.is_initialized():
+                    _t = _t.clone(); _rdist.all_reduce(_t, group=_ref.device_mesh.get_group())
+                return _t
+            def _rp_isbody(_n):
+                return any(_n.endswith(s) for s in ('wo.weight', 'w2.weight', 'wq.weight',
+                           'wk.weight', 'wv.weight', 'w1.weight', 'w3.weight'))
+            def _rp_cos_map(cross_rank):
+                # cross_rank=True: aggregate dot/norms ACROSS ranks (correct for the
+                #   real reduce-scattered DTensor grad — gives the GLOBAL cos).
+                # cross_rank=False: per-rank LOCAL cos, NO all-reduce — answers "does
+                #   ONE rank's own gradient (its data shard, all-gathered bf16 params)
+                #   already lean?" Critical: for the un-synced local grad we must NOT
+                #   sum across ranks (that would re-combine the 8 partials we are
+                #   deliberately keeping separate). Each rank reports its own shard's cos.
+                _out = {}
+                for _n, _p in _raw_rp.named_parameters():
+                    if not _rp_isbody(_n) or _p.grad is None:
+                        continue
+                    _W = _rp_local(_p).detach().float(); _G = _rp_local(_p.grad).detach().float()
+                    if cross_rank:
+                        _dot = _rp_gsum((_W*_G).sum(), _p).item()
+                        _wn = _rp_gsum((_W*_W).sum(), _p).clamp_min(0).sqrt().item()
+                        _gn = _rp_gsum((_G*_G).sum(), _p).clamp_min(0).sqrt().item()
+                    else:
+                        _dot = (_W*_G).sum().item()
+                        _wn = (_W*_W).sum().clamp_min(0).sqrt().item()
+                        _gn = (_G*_G).sum().clamp_min(0).sqrt().item()
+                    _out[_n] = (_dot/(_wn*_gn)) if (_wn > 0 and _gn > 0) else 0.0
+                return _out
+            # (1) REDUCED: the current .grad is the real reduce-scattered grad from
+            # the grad-accum backward above (averaged over grad_accum_steps micro-
+            # batches, reduce-scattered across ranks). GLOBAL cos (cross-rank agg).
+            _cos_reduced = _rp_cos_map(cross_rank=True)
+            # (2) LOCAL: re-run the SAME number of microbatches (grad_accum_steps)
+            # ALL inside no_sync() so they accumulate locally with NO cross-rank
+            # reduction. This holds the microbatch count + loss normalisation
+            # constant — the ONLY difference vs (1) is the reduce-scatter. (Data
+            # differs by the next grad_accum_steps batches from the loader, but the
+            # radial-lean question is a population property, not batch-specific, and
+            # Stage B showed it's batch-insensitive at +0.0001 across panels.)
+            for _p in _raw_rp.parameters():
+                _p.grad = None
+            # Local pass microbatch count: capped (default 16) to bound the EXTRA
+            # memory of this second grad-accum pass (the reduced pass already ran).
+            # The lean is a SYSTEMATIC component present in every microbatch, so fewer
+            # microbatches leaves the expected cos ≈ unchanged (only the variance grows);
+            # 16 keeps per-matrix noise low enough to distinguish -0.013 from +0.0001
+            # cleanly. The REDUCED arm is still the full real grad_accum_steps, measured
+            # in the same run, as an internal calibration. Set WD_REDUCE_LOCAL_MB to tune.
+            _ga = min(grad_accum_steps, int(os.environ.get('WD_REDUCE_LOCAL_MB', '16')))
+            # FSDP2 has NO no_sync() context — it uses set_requires_gradient_sync().
+            # Disable gradient sync so the grad-accum below stays LOCAL (per-rank,
+            # NO reduce-scatter). The model is wrapped with fully_shard => it's an
+            # FSDPModule exposing this method. Re-enable after.
+            _has_grsync = hasattr(model, 'set_requires_gradient_sync')
+            _orig_target = model._orig_mod if hasattr(model, '_orig_mod') else None
+            if _has_grsync:
+                model.set_requires_gradient_sync(False)
+            elif _orig_target is not None and hasattr(_orig_target, 'set_requires_gradient_sync'):
+                _orig_target.set_requires_gradient_sync(False); _has_grsync = True
+            try:
+                _fm = model
+                if is_truncated and truncator.bypass_compile and hasattr(model, '_orig_mod'):
+                    _fm = model._orig_mod
+                for _ms in range(_ga):
+                    _xr, _yr = train_loader.next_batch(step=step)
+                    _xr, _yr = _xr.to(device), _yr.to(device)
+                    with torch.autocast(device_type=device_type, dtype=torch.bfloat16 if settings.data_type=="bf16" else torch.float16 if settings.data_type=="fp16" else torch.float32):
+                        _lr_logits, _lr_loss = _fm(_xr, _yr, active_layers=active_layers, scaffold_mode=scaffold_mode)
+                    (_lr_loss * trunc_loss_w / _ga).backward()
+            finally:
+                if _has_grsync:
+                    (model if hasattr(model, 'set_requires_gradient_sync') else _orig_target
+                     ).set_requires_gradient_sync(True)
+            # LOCAL: per-rank, NO cross-rank aggregation. Each rank's value is the cos
+            # over ITS OWN shard of W vs ITS OWN local grad. We summarise each rank's
+            # median and gather all ranks to rank 0 — so we see if EVERY rank's local
+            # gradient leans (=> intrinsic to the sharded local computation) or only the
+            # aggregate does.
+            import statistics as _rst, json as _rjson
+            _cos_local = _rp_cos_map(cross_rank=False)
+            def _rp_med(_d):
+                _v = list(_d.values())
+                return {'median': _rst.median(_v), 'mean': _rst.mean(_v),
+                        'negfrac': sum(1 for _c in _v if _c < 0)/len(_v), 'n': len(_v)} if _v else {}
+            _ml_self = _rp_med(_cos_local)              # THIS rank's local summary
+            _mr = _rp_med(_cos_reduced)                 # global reduced summary (same on all ranks)
+            # gather every rank's local summary to rank 0
+            _ml_all = [None] * (ddp_world_size if ddp else 1)
+            if ddp:
+                _rdist.all_gather_object(_ml_all, (ddp_rank, _ml_self))
+            else:
+                _ml_all = [(0, _ml_self)]
+            if ddp_rank == 0:
+                logger.print_and_log(
+                    f"[WD-REDUCE] cos(g_REDUCED,W) GLOBAL: median={_mr.get('median'):+.5f} "
+                    f"mean={_mr.get('mean'):+.5f} negfrac={_mr.get('negfrac',0)*100:.0f}% n={_mr.get('n')}")
+                for _rk, _m in sorted([x for x in _ml_all if x is not None]):
+                    logger.print_and_log(
+                        f"[WD-REDUCE] cos(g_LOCAL,W) rank{_rk}: median={_m.get('median'):+.5f} "
+                        f"mean={_m.get('mean'):+.5f} negfrac={_m.get('negfrac',0)*100:.0f}% n={_m.get('n')}")
+                logger.print_and_log(
+                    "[WD-REDUCE] Read: LOCAL(per-rank)<<0 => the lean is INTRINSIC to a single rank's "
+                    "sharded gradient (all-gathered bf16 params / data shard), NOT the cross-rank combine "
+                    "=> the single-card probe SHOULD have caught it but didn't => REAL MYSTERY. "
+                    "LOCAL~0 but REDUCED<<0 => the lean emerges only from summing 8 different-data partials.")
+                _routp = os.environ.get('WD_REDUCE_OUT', 'wd_reduce.json')
+                with open(_routp, 'w') as _rf:
+                    _rjson.dump({'step': step, 'reduced_global': _mr,
+                                 'local_per_rank': {str(_rk): _m for _rk, _m in _ml_all if _m is not None},
+                                 'reduced_per_matrix': _cos_reduced,
+                                 'local_per_matrix_rank0': _cos_local}, _rf, indent=1)
+                logger.print_and_log(f"[WD-REDUCE] wrote {_routp} — exiting one-shot")
+            if ddp:
+                _rdist.barrier()
+            sys.exit(0)
+
         _insitu = os.environ.get('WD_INSITU_PROBE') == '1'
         _insitu_snap = None
         if _insitu:

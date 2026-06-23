@@ -25,7 +25,7 @@ save_step: 250                # Checkpoint saving frequency in steps
 # Data type settings
 data_type: bf16
 FSDP_param_dtype: bf16
-FSDP_reduce_dtype: bf16
+FSDP_reduce_dtype: fp32
 FSDP_buffer_dtype: bf16
 reshard_after_forward: false
 
