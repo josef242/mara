@@ -399,30 +399,37 @@ persistent OUTWARD push that grows ‖W‖. Verified by the sign flip: applied
 `cos(ΔW,W)=+0.0129 ≈ −cos(transformed update,W)=−(−0.0134)`. So the growth is
 **gradient-driven**, not optimizer-geometry-driven.
 
+**It's INTRINSIC to pure CE, not an aux/z-loss/dropout artifact.** CRITICAL: mf-low-lr
+has **NO aux heads, NO z-loss, dropout=0** (verified: config auxiliary_heads=None,
+z_loss=None, 0 aux matrices in the run). So the −0.0129 anti-radial lean on 100% of body
+matrices arises under **plain next-token CE training** on this KEEL/RMSNorm architecture.
+The aux-head hypothesis is DEAD — removing aux heads will NOT fix the body ramp.
+
 **This CONTRADICTS Part B and is important:** Part B measured `cos(g_loss,W)≈+0.0005`
-(loss-null) — but that used a CLEAN CE-only eval-branch forward. The REAL TRAINING
-gradient (real batch + real forward path: aux heads / dropout / whatever the live step
-includes) is `−0.0129` — NOT loss-null, opposite sign. So the body IS being pushed
-radially by the real gradient; Part B's "loss-null" was an artifact of the idealized
-probe. (The finite-rescale renorm-unsafe result still stands independently.)
+(near-zero / loss-null); this real-training gradient is `−0.0129` — an order of magnitude
+larger AND opposite-signed, so not noise. Both are essentially pure-CE on mf, so the
+difference is NOT aux/z-loss/dropout. The remaining candidates: **eval-branch forward (Part B)
+vs train-branch forward (in-situ)**, batch/seq composition, or that Part B's `cos` measured a
+subtly different quantity. The real-training gradient is the operative one (it's what trains),
+and it is NOT loss-null. (Finite-rescale renorm-unsafe result stands independently.)
 
 **Revised picture & taming implications:**
 - WD lever still valid (WD is radial, opposes the push) and still the simplest dial.
-- BUT the source being the real gradient opens a cleaner possibility: WHY does the body
-  gradient consistently lean inward (−1.3%)? Leading suspects: the AUX-HEAD losses
-  (L50/L55/L60) pulling on shared body reps, or the KEEL residual/highway structure.
-  **If the aux losses contribute the lean, the planned aux-head removal could REDUCE the
-  ramp for free** — a strong reason to sequence aux-head warmdown and re-measure the lean.
-- Open Qs for the Math Agent: (1) why anti-radial? mechanistic source of the −0.0129 lean.
-  (2) does it persist with aux-heads OFF / under pure CE training-grad (vs Part B's clean
-  CE which gave +0.0005 — is the difference the aux heads, the real-batch h, or dropout)?
-  (3) is a small consistent anti-radial gradient lean a known phenomenon in normalized
-  nets (it's the dual of weight-norm growth: descent on a scale-invariant-ish loss that
-  isn't perfectly scale-invariant)?
+- The lean is INTRINSIC to CE on a normalized body — the dual of weight-norm growth:
+  descent on a loss that is *nearly but not exactly* scale-invariant (RMSNorm ε, KEEL
+  residual/highway ratios, non-scale-invariant pieces) has a small persistent anti-radial
+  gradient component. Not configurable away; must be managed (WD) or fixed at the optimizer
+  level (tangent-projection of the body update — see below).
+- Open Qs for the Math Agent: (1) mechanistic source of the −0.0129 lean under pure CE — is
+  it RMSNorm-ε / KEEL-residual non-scale-invariance, and does its inward SIGN follow from
+  that? (2) why does Part B (eval-branch CE) give +0.0005 but train-branch CE give −0.0129 —
+  is the train/eval forward difference real or a probe subtlety? (3) is this a known
+  normalized-net phenomenon, and does it predict the const-vs-1/‖W‖ equilibrium scaling?
 
-**Tests still pending (now re-prioritized):** (a) re-run the warm stage-trace with aux-heads
-disabled (or on dn1 which differs) to see if the −0.0129 lean is aux-driven; (b) cross-
-checkpoint r_upd scaling (equilibrium law); (c) dn2 in-situ confirmation before any WD change.
+**Tests still pending (re-prioritized given aux-heads ruled out):** (a) reconcile the Part B
+(+0.0005 eval-CE) vs in-situ (−0.0129 train-CE) gradient-cos discrepancy — re-measure the
+fresh-gradient radial cos under BOTH forward paths on the same batch; (b) cross-checkpoint
+r_upd scaling (equilibrium law); (c) dn2 in-situ confirmation before any WD change.
 
 ## Reproduce
 ```
