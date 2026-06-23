@@ -491,6 +491,50 @@ norms/time to settle it.
    body only, exclude head/emb/norms/aux), slowly; NOT stacked with SCS removal / head-LR.
 KEEP: no head-WD increase ever (dn1). Aux-head removal is NOT a ramp fix (mf has none yet ramps).
 
+## KEEL radial probe (2026-06-23) — MECHANISM NOT CONFIRMED; the −0.0129 is REAL but its source is still open
+
+The consolidated probe did NOT confirm the branch-gain mechanism and surfaced that the
+−0.0129 vs +0.0003 contradiction is REAL (not a WD-subtraction artifact). Honest state:
+
+- **PROBE 1 (eval vs train cos(g,W)): BOTH gave +0.0003 sign-random** (reproduces Part B null,
+  does NOT reproduce in-situ −0.0129). **BUT this probe had a BUG:** `_ce_loss` always calls
+  `model(x)` → the EVAL branch (`output(h)`+external CE) regardless of train()/eval() mode, so
+  "train vs eval" was identical by construction — it never exercised the train-branch fused-CCE.
+  So probe 1 only proved the eval-path/short-context gradient is radial-null; it did NOT test the
+  train path.
+- **PROBE 2 (branch-gain dL/dlog g_l): +0.0028 POSITIVE** (would mean "wants LESS branch") —
+  but measured on the offline state that does NOT exhibit the lean, so it tested the wrong
+  gradient. Branch-gain mechanism NEITHER confirmed nor refuted.
+- **PROBE 3 (ε-sensitivity): no effect** (cos identical ε=1e-5→0). ε is NOT the source.
+- **finite-diff check is UNRELIABLE in bf16** (δ=1e-3 perturbation < bf16 precision → quantization
+  noise: eval +8.27, train −6.74, sum⟨g,W⟩ +1.39 all disagree). Needs fp32 weights to be valid.
+
+**KEY ISOLATION (rules out WD artifact):** the in-situ `cos_grad_W` is the RAW fresh `.grad` vs W
+— NO WD subtraction — and it's **−0.0129, 100% negative**. The offline probe's fresh-grad cos is
+**+0.0003, sign-random**. SAME quantity (CE gradient vs W, same mf checkpoint), two probes,
+OPPOSITE answers. So the lean is NOT a WD-subtraction artifact and NOT optimizer state — it's a
+genuine difference in the GRADIENT MEASUREMENT ENVIRONMENT:
+
+| | in-situ (−0.0129, 100% neg) | offline keel (+0.0003, random) |
+|---|---|---|
+| forward branch | TRAIN (fused-CCE) | EVAL (output(h)+external CE) |
+| sequence length | **T=10240** (grad-accum, B=1) | T=1024, 1 microbatch |
+| distribution | 8-GPU FSDP2 sharded | single-card |
+
+**OPEN — the narrow question now:** which of {train-branch fused-CCE, long context T=10240,
+grad-accumulation} produces the consistent −0.0129 lean? Ranked suspects: (1) **fused-CCE vs
+external CE** (different loss kernel/numerics — and my probe never actually tested it; the train
+branch returns `(None, loss)` with fused CCE, must backward THAT not external CE); (2) **long
+context** (T=10240 vs 1024 — gradient radial structure may be context-length-dependent); (3)
+grad-accumulation alignment. NEXT: fix the probe to actually backward the TRAIN-branch fused-CCE
+loss, and run at T=10240, single-microbatch, to isolate (1) vs (2). Until then: mechanism (branch-
+gain) UNPROVEN, and we do NOT know if the operative-training body gradient is truly anti-radial or
+whether the in-situ number itself has a subtlety (though raw-grad-cos rules out the WD path).
+
+DO-NOTs unchanged (no head-WD, no renorm, no body-WD change until this resolves). The body-WD
+lever sizing (λ_pin~0.03–0.037) rests on the −0.0129 being a real operative-gradient property —
+which is now IN QUESTION pending the train-branch/context isolation.
+
 ## Reproduce
 ```
 # Part A (offline, log-parse, no GPU):
