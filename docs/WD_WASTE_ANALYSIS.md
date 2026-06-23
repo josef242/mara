@@ -438,6 +438,59 @@ radial cos under BOTH forward paths on the SAME batch to isolate which train-bra
 fresh-gradient radial cos under BOTH forward paths on the same batch; (b) cross-checkpoint
 r_upd scaling (equilibrium law); (c) dn2 in-situ confirmation before any WD change.
 
+## MECHANISM (Math Agent, 2026-06-22) — body norm is an implicit KEEL BRANCH-GAIN knob; WD is a REAL dial, not free
+
+The Math Agent's mechanistic close (accepts the stage-trace, falsifies its own
+momentum-curvature): the operative CE gradient has a small SYSTEMATIC anti-radial
+component `⟨g,W⟩ < 0` ⟹ `dL/d log‖W‖ < 0` ⟹ **increasing body scale locally LOWERS
+training loss**; descent (−g) therefore grows ‖W‖. NorMuon merely PRESERVES this
+direction (every stage cos ≈ −0.013; applied ΔW flips to +0.013 because the step is −g).
+
+**WHY pure CE pushes body norm out (the key insight):** KEEL blocks are
+`x_{l+1} = Norm(α·x_l + F_l(Norm(x_l)))`. RMSNorm removes magnitude but NOT direction.
+Scaling a body matrix inside F_l changes the branch's influence in the normalized
+`α·x_l + F_l(·)` mixture. If the learned branch is useful and slightly underweighted vs
+the highway term `α·x_l`, increasing body weights increases branch influence → CE likes it
+→ `⟨g,W⟩<0`. **So body norm is partly an implicit BRANCH-GAIN knob** — the model finding its
+effective branch/highway balance under this parameterization. (Secondary, smaller: RMSNorm-ε
+effect — larger scale reduces ε damping; likely minor unless activations are tiny.)
+NOT pure gauge, NOT optimizer-created, NOT necessarily pathological.
+
+**POLICY CORRECTION (important, supersedes earlier wording):** "body WD points in a
+loss-null direction / is a free gauge correction" is **NO LONGER ACCURATE** for the operative
+train path. Since `⟨g,W⟩<0`, WD shrink OPPOSES a small but real CE preference. Correct framing:
+> **Body WD opposes a measured, small CE-preferred radial expansion; it is the measured
+> EQUILIBRIUM DIAL for body norm — not free.** Still far safer than head WD (different
+> softmax/common-mode gauge; dn1 died from head-WD). Branch-test + anneal; do NOT crank.
+(Part B's eval-CE radial-null result still holds for the EVAL path; the discrepancy is the
+train-vs-eval forward, see below — and the TRAIN gradient is the operative one.)
+
+**Corrected force balance:** `Δ‖W‖ ≈ ‖ΔW_learn‖·cos(ΔW_learn,W) − ηλ‖W‖ + tiny quadrature`.
+Ramp = CE anti-radial gradient vs WD radial shrink. Local pinning WD
+`λ_pin = r_CE/(η‖W‖)`: body_proj ≈ 0.0365, body_in ≈ 0.0315 → **λ_body ≈ 0.032–0.037**
+(current 0.02). Conservative first branch 0.03; ~pinning at 0.035.
+
+**Equilibrium law is NOW EMPIRICAL** (momentum-curvature 1/‖W‖ form falsified): depends on how
+`r_CE(W)` scales. const → ‖W_eq‖=r_CE/(ηλ) (~1.5–1.8×); ∝1/‖W‖ → √ form (~1.3–1.5×); ε-like →
+faster self-arrest; branch/highway-like → depends on α·x_l vs F_l alignment. Measure r_CE across
+norms/time to settle it.
+
+### NEXT PROBES (Math Agent's plan — read-only, then branch)
+1. **Same-batch train/eval radial gradient (2×2):** {train mode, eval mode} × {real training-loss
+   path, plain-CE path}, identical batch/targets/masks/dtype/reduction. Resolves Part B (+0.0003
+   sign-random eval) vs in-situ (−0.0129 train). Plus FINITE-DIFFERENCE check: `L(e^δ W)−L(e^−δ W)
+   /2δ ≈ ⟨g,W⟩` (δ=±1e-3) under both paths — confirms the anti-radial gradient is a real loss
+   derivative, not a backward/path artifact.
+2. **Branch-gain derivative (the mechanism confirmer):** insert a temp scalar gain g_l on the whole
+   residual branch `Norm(α·x_l + g_l·F_l(Norm(x_l)))`, compute `dL/d log g_l` at g_l=1, read-only.
+   If negative across layers ⟹ "model wants more branch" ⟹ directly explains the anti-radial body
+   gradient. (Math Agent's bet: this dominates over ε.)
+3. **Epsilon sensitivity:** same radial-grad probe with RMSNorm ε ∈ {1e-5,1e-6,1e-8,0}. If the
+   anti-radial cos vanishes as ε→0, ε is the source; if it remains, it's branch/highway mixing.
+4. dn2 in-situ λ_pin confirmation. 5. Branch-test body-only WD 0.02→0.03 (warmup 1–2k, NorMuon
+   body only, exclude head/emb/norms/aux), slowly; NOT stacked with SCS removal / head-LR.
+KEEP: no head-WD increase ever (dn1). Aux-head removal is NOT a ramp fix (mf has none yet ramps).
+
 ## Reproduce
 ```
 # Part A (offline, log-parse, no GPU):
