@@ -331,6 +331,49 @@ source) or to warm momentum? (3) does a body-WD increase compose cleanly with No
 or shift cos? (4) head radial bias is 9× the body (+0.116) — same mechanism amplified,
 or the gauge (handled separately by row-centering)?
 
+## CURRENT FRONTIER (2026-06-22) — mechanism plausible but cross-matrix data CONTRADICTS the clean model; stage-trace next
+
+Math Agent's mechanistic close: the +0.013 body radial cosine ≈ momentum curvature /
+stale-tangent accumulation: `cos(U,W) ≈ β/(1-β)·‖U‖/‖W‖`. With β=0.95 (memory ~19) and
+body ‖U‖/‖W‖ ≈ 7e-4: `19·7e-4 ≈ 0.013` — matches measured +0.013. And
+`κ = r_upd·‖W‖/‖U‖² ≈ 22 ≈ β/(1-β)=19`. Two equilibrium models follow:
+- **Model A** (r_upd constant): `‖W_eq‖ = r_upd/(ηλ)` → ~1.6–1.8× current; halve-norm costs ~2.7× WD.
+- **Model B** (r_upd ∝ 1/‖W‖, the momentum-curvature form): `‖W_eq‖ = √(r·W/(ηλ))` → ~1.3–1.5×; halve-norm costs ~**4×** WD.
+The two AGREE on bounded + on pinning-current WD (~0.03–0.037, i.e. 1.5–1.8× the 0.02), but
+DISAGREE on reduction cost. So sizing a *reduction* needs knowing which holds.
+
+**CONTRADICTION (must resolve before trusting any number):** the cross-matrix regression on
+the mf in-situ data (490 body matrices) does NOT cleanly confirm Model B:
+- `κ`: median 12.9 / mean 20.6 (straddles 19 — supports momentum-curvature IN AGGREGATE)
+- BUT `log(r_upd) vs log(‖W‖)` slope = **+0.98** (Model A predicts ~0, Model B ~−1; +1 is NEITHER)
+- AND `cos vs ‖U‖/‖W‖` slope = **−28** (Model B predicts +19; sign is WRONG)
+Likely cause: cross-matrix is CONFOUNDED (layers differ in ‖U‖, ‖W‖, AND curvature at once;
+body ‖W‖ range only 36–145). So a single-snapshot cross-matrix fit can't isolate the scaling.
+
+**NEXT TESTS (decided order, accuracy-first):**
+1. **Stage-by-stage cosine trace (offline, cheap, DO FIRST):** in normuon_update_decomp, log
+   `cos(.,W)` after EACH stage — fresh grad → apply_momentum → Newton-Schulz → apply_scaling →
+   apply_normuon → actual ΔW. Pinpoints WHERE the +0.013 radial bias enters. Jump right after
+   momentum ⇒ momentum-curvature confirmed mechanically. Jump at apply_normuon ⇒ the rescale is
+   structural and the story changes. This DIAGNOSES the mechanism (vs the κ-average which only
+   matched numerically while per-matrix scaling contradicted). 4080, no trainer launch.
+2. **Cross-CHECKPOINT r_upd scaling (in-situ, decisive, needs launches):** unconfounded const-vs-
+   1/‖W‖ — same matrices at DIFFERENT ‖W‖ via earlier mf checkpoints (resume each for 1 step,
+   WD_INSITU_PROBE=1). Determines A vs B → the real equilibrium + reduction law.
+3. **dn2 in-situ confirmation (in-situ, before ANY WD change):** confirm κ~20, λ_pin~0.03–0.04 hold on dn2.
+
+**TAMING LEVER (validated as a BRANCH, not yet mainline-proven):** modest BODY-ONLY WD increase,
+0.02 → 0.03–0.035 first branch (pin-ish), warmup 1000–2000 steps, NorMuon body matrices ONLY
+(exclude head, embeddings, norms/gains, aux heads). Safe because body scale is loss-null (Part B)
+and it's BODY not HEAD WD (head WD killed dn1). Do NOT stack with SCS removal or head-LR changes.
+Success = body-norm slope→0, val CE flat/better, grad-norm boring, head/rare-token/coherence
+unaffected. Do NOT jump to "halve norm" until A-vs-B settled (could be 4× not 2.7×).
+DO NOT touch HEAD WD. DO NOT renorm (finite-rescale unsafe). DO NOT change WD until in-situ confirmed on dn2.
+
+**Future surgical lever (next-run design, not now):** tangent-project the body update
+`ΔW ← ΔW − W·<ΔW,W>/‖W‖²` (remove the radial component at source). Elegant but needs a paired
+WD reduction or it shrinks the body; "next optimizer design" bucket.
+
 ## Reproduce
 ```
 # Part A (offline, log-parse, no GPU):
