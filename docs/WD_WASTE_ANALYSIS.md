@@ -374,6 +374,56 @@ DO NOT touch HEAD WD. DO NOT renorm (finite-rescale unsafe). DO NOT change WD un
 `ΔW ← ΔW − W·<ΔW,W>/‖W‖²` (remove the radial component at source). Elegant but needs a paired
 WD reduction or it shrinks the body; "next optimizer design" bucket.
 
+## MECHANISM CLOSED (2026-06-22) — warm stage-trace: it's an ANTI-RADIAL REAL-GRADIENT lean, NOT momentum curvature
+
+Warm in-situ stage-trace (real optimizer.state momentum/2nd-moment buffers, mf step
+35501, 490 body matrices). Median `cos(stage, W)` through the NorMuon pipeline:
+| stage | cos(·,W) |
+|---|---|
+| fresh REAL-training gradient | **−0.0129** |
+| warm momentum buffer | −0.0065 |
+| after Newton-Schulz | −0.0132 |
+| after apply_scaling | −0.0132 |
+| after apply_normuon | −0.0134 |
+| **ACTUAL applied ΔW** | **+0.0129** |
+
+**The momentum-curvature hypothesis is FALSIFIED.** Every stage of the update transform
+keeps cos NEGATIVE (~−0.013) — momentum/NS/scaling/normuon do NOT inject a positive
+radial component. The Math Agent's `cos≈β/(1-β)·‖U‖/‖W‖ ≈ 0.013` was a magnitude
+COINCIDENCE (right size, WRONG SIGN, wrong mechanism).
+
+**The real mechanism:** the **fresh real-training gradient itself leans slightly
+ANTI-radial: `cos(g,W) = −0.0129` on 100% (490/490) of body matrices.** Gradient
+DESCENT steps along −g, flipping that to `+0.0129` radial on the applied ΔW — a
+persistent OUTWARD push that grows ‖W‖. Verified by the sign flip: applied
+`cos(ΔW,W)=+0.0129 ≈ −cos(transformed update,W)=−(−0.0134)`. So the growth is
+**gradient-driven**, not optimizer-geometry-driven.
+
+**This CONTRADICTS Part B and is important:** Part B measured `cos(g_loss,W)≈+0.0005`
+(loss-null) — but that used a CLEAN CE-only eval-branch forward. The REAL TRAINING
+gradient (real batch + real forward path: aux heads / dropout / whatever the live step
+includes) is `−0.0129` — NOT loss-null, opposite sign. So the body IS being pushed
+radially by the real gradient; Part B's "loss-null" was an artifact of the idealized
+probe. (The finite-rescale renorm-unsafe result still stands independently.)
+
+**Revised picture & taming implications:**
+- WD lever still valid (WD is radial, opposes the push) and still the simplest dial.
+- BUT the source being the real gradient opens a cleaner possibility: WHY does the body
+  gradient consistently lean inward (−1.3%)? Leading suspects: the AUX-HEAD losses
+  (L50/L55/L60) pulling on shared body reps, or the KEEL residual/highway structure.
+  **If the aux losses contribute the lean, the planned aux-head removal could REDUCE the
+  ramp for free** — a strong reason to sequence aux-head warmdown and re-measure the lean.
+- Open Qs for the Math Agent: (1) why anti-radial? mechanistic source of the −0.0129 lean.
+  (2) does it persist with aux-heads OFF / under pure CE training-grad (vs Part B's clean
+  CE which gave +0.0005 — is the difference the aux heads, the real-batch h, or dropout)?
+  (3) is a small consistent anti-radial gradient lean a known phenomenon in normalized
+  nets (it's the dual of weight-norm growth: descent on a scale-invariant-ish loss that
+  isn't perfectly scale-invariant)?
+
+**Tests still pending (now re-prioritized):** (a) re-run the warm stage-trace with aux-heads
+disabled (or on dn1 which differs) to see if the −0.0129 lean is aux-driven; (b) cross-
+checkpoint r_upd scaling (equilibrium law); (c) dn2 in-situ confirmation before any WD change.
+
 ## Reproduce
 ```
 # Part A (offline, log-parse, no GPU):
