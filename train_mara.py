@@ -1751,7 +1751,74 @@ def train_loop(
         if is_diag_step:
             diagnostics.snapshot_weights()
 
+        # ── IN-SITU ΔW DECOMPOSITION (WD-waste investigation; env-gated, one-shot) ──
+        # Snapshot per-matrix W before optimizer.step(); after the step measure the
+        # ACTUAL ΔW on the genuine FSDP2 path with warm buffers, decompose into
+        # radial (<ΔW,W>/||W||) vs tangential, subtract the known decoupled-WD term
+        # (eff_lr*wd*||W||), and dump JSON. Resolves the cold-replay 38x gap with
+        # zero replication assumptions. Set WD_INSITU_PROBE=1 to enable; exits after
+        # one captured step. NO effect on normal runs.
+        _insitu = os.environ.get('WD_INSITU_PROBE') == '1'
+        _insitu_snap = None
+        if _insitu:
+            from torch.distributed.tensor import DTensor as _DT
+            _raw_is = model._orig_mod if hasattr(model, '_orig_mod') else model
+            # map param id -> (eff_lr, wd) from the optimizer groups for the WD term
+            _effmap = {}
+            for _g in optimizer.param_groups:
+                _lr = float(_g.get('lr', 0.0)); _w = float(_g.get('weight_decay', 0.0))
+                for _p in _g['params']:
+                    _effmap[id(_p)] = (_lr, _w)
+            _insitu_snap = {}
+            for _n, _p in _raw_is.named_parameters():
+                if _p.dim() == 2:
+                    _loc = _p._local_tensor if isinstance(_p, _DT) else _p
+                    _lr, _w = _effmap.get(id(_p), (0.0, 0.0))
+                    _ls = lr_scale_overrides.get(id(_p), 1.0) if lr_scale_overrides else 1.0
+                    _insitu_snap[_n] = (_loc.detach().float().clone(), _lr * _ls, _w)
+
         optimizer.step()
+
+        if _insitu:
+            import torch.distributed as _dist
+            from torch.distributed.tensor import DTensor as _DT
+            _raw_is = model._orig_mod if hasattr(model, '_orig_mod') else model
+            _rows = []
+            for _n, _p in _raw_is.named_parameters():
+                if _n not in _insitu_snap:
+                    continue
+                _W0, _efflr, _wd = _insitu_snap[_n]
+                _W1 = (_p._local_tensor if isinstance(_p, _DT) else _p).detach().float()
+                _total = _W1 - _W0
+                # decoupled WD term that was applied this step: ΔW_wd = -efflr*wd*W0
+                _wd_dW = (-(_efflr * _wd)) * _W0
+                _muon_dW = _total - _wd_dW  # the loss-driven (optimizer update) part
+                def _gsum(_t, _ref=_p):
+                    _v = _t
+                    if isinstance(_ref, _DT) and _dist.is_available() and _dist.is_initialized():
+                        _v = _v.clone(); _dist.all_reduce(_v, group=_ref.device_mesh.get_group())
+                    return _v
+                _wsq = _gsum((_W0*_W0).sum()); _wn = _wsq.clamp_min(0).sqrt().item()
+                _tot_dot = _gsum((_total*_W0).sum()).item()
+                _mu_dot = _gsum((_muon_dW*_W0).sum()).item()
+                _mu_sq = _gsum((_muon_dW*_muon_dW).sum()); _mun = _mu_sq.clamp_min(0).sqrt().item()
+                _rows.append({
+                    'name': _n, 'w_norm': _wn,
+                    'total_dW_radial': (_tot_dot/_wn) if _wn>0 else 0.0,   # actual d||W||/step
+                    'muon_dW_norm': _mun,                                  # ||U|| ACTUAL
+                    'muon_radial': (_mu_dot/_wn) if _wn>0 else 0.0,        # update's radial push
+                    'muon_cos': (_mu_dot/(_mun*_wn)) if (_mun>0 and _wn>0) else 0.0,
+                    'wd_radial': -(_efflr*_wd)*_wn,                        # WD pull (down)
+                    'eff_lr': _efflr, 'wd': _wd,
+                })
+            if ddp_rank == 0:
+                import json as _json
+                _outp = os.environ.get('WD_INSITU_OUT', 'wd_insitu.json')
+                with open(_outp, 'w') as _f:
+                    _json.dump({'step': step, 'per_matrix': _rows}, _f, indent=1)
+                logger.print_and_log(f"[WD-INSITU] wrote {_outp} ({len(_rows)} matrices) — exiting after one-shot capture")
+            if ddp: dist.barrier()
+            sys.exit(0)
 
         # Compute update norms from pre/post step diff
         if is_diag_step:

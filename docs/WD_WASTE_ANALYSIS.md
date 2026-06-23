@@ -282,6 +282,55 @@ larger than any visible injection term.
   if any, is in the optimizer dynamics (warm-update radial component) — once we know
   what's actually adding the +0.0067/step, the fix targets THAT.
 
+## RESOLVED (2026-06-22) — in-situ ΔW: the ramp is a small POSITIVE RADIAL bias in the warm update
+
+The open puzzle is closed by the in-situ ΔW decomposition (one real `optimizer.step()`
+on the genuine 8-GPU FSDP2 path with WARM momentum + 2nd-moment buffers, on paused
+mf-low-lr; `WD_INSITU_PROBE=1` one-shot in train_mara.py, exits before any save).
+Raw: `//valhalla/valhalla/code/ckpt/wd_insitu_mf.json` (492 matrices, step 35501).
+
+**Per-matrix force balance CLOSES** (`muon_radial + wd_radial = total_dW_radial` to
+3 sig figs every class):
+| class | n | ‖W‖ | ‖U‖(real) | total_dW_radial | upd_radial | wd_radial | cos(U,W) |
+|---|---|---|---|---|---|---|---|
+| body_proj | 140 | 112.8 | 0.0771 | +0.00065 | +0.00136 | −0.00074 | +0.0138 |
+| body_in | 350 | 107.0 | 0.0773 | +0.00055 | +0.00111 | −0.00070 | +0.0127 |
+| head | 1 | 761.4 | 0.3345 | +0.03387 | +0.03886 | −0.00499 | +0.1161 |
+| embedding | 1 | 390.1 | 0.4119 | +0.00428 | +0.00684 | −0.00256 | +0.0166 |
+
+**The 38× gap resolves on two counts:**
+1. **Warm ‖U‖ is ~5.5× the cold-replay** (0.077 vs 0.014) — warm momentum + 2nd-moment
+   make the real per-step update much larger than a cold single-step replica.
+2. **The warm update has a small but SYSTEMATICALLY POSITIVE radial cosine**
+   (`cos(update,W) ≈ +0.013` body, +0.116 head). Cold replay's cos was near-zero noise.
+
+**Mechanism (overturns the toy model):** growth is driven by the UPDATE's radial
+component `‖U‖·cos ≈ +0.0012/step` (body), NOT tangential quadrature
+(`‖U‖²/2‖W‖ ≈ +2.7e-5`, 44× smaller). The toy `‖W_eq‖=‖U‖/√(2ηλ)` model assumed the
+update is purely tangential; it isn't — there's a real +1.3% radial bias.
+
+**Approx dynamics:** `d‖W‖/step ≈ ‖U‖·cos − ηλ‖W‖`. Equilibrium (push=removal):
+`‖W_eq‖ ≈ ‖U‖·cos / (ηλ)`. Plugging body medians → **~150 (current ~110, ~1.3–1.5×).**
+So the ramp is **BOUNDED at a reachable scale**, not unbounded — a much better-behaved
+picture. (CAVEAT: this equilibrium number is a rough linearization; product-of-medians
+introduces ~2× slop vs the exact per-matrix balance, and ‖U‖/cos drift as ‖W‖ grows /
+LR decays. Treat ~150 as "≈1.3–1.5× current," not a precise target. Math Agent to verify.)
+
+**CORRECTED taming dial** (local linearization): λ to set equilibrium at a target ‖W‖:
+`λ_target ≈ ‖U‖·cos / (η·‖W_target‖)`. For mf body: pin at current ~110 → λ≈0.027 (1.4×);
+at 0.75× → λ≈0.036 (1.8×); at 0.5× → λ≈0.055 (2.7×). So a **modest body-WD increase
+(~1.4–2.7×) bounds/reduces the body norm** — and unlike dn1's fatal HEAD-WD bomb, this
+is BODY WD in a provably loss-null direction (Part B), so far safer. This is the first
+VALIDATED taming lever (the toy-model dial was wrong; this one rests on the measured
+radial force, not the falsified quadrature assumption).
+
+Open for the Math Agent: (1) verify the equilibrium linearization / how ‖U‖,cos drift
+with ‖W‖; (2) is the +0.013 radial cosine intrinsic to NorMuon's apply_normuon rescale
+(it preserves pre-norm magnitude via the warm 2nd-moment — a plausible radial-bias
+source) or to warm momentum? (3) does a body-WD increase compose cleanly with NorMuon,
+or shift cos? (4) head radial bias is 9× the body (+0.116) — same mechanism amplified,
+or the gauge (handled separately by row-centering)?
+
 ## Reproduce
 ```
 # Part A (offline, log-parse, no GPU):
