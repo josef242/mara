@@ -1,0 +1,154 @@
+# Keel Haul — the first ultra-deep run trained WITHOUT the Newton-Schulz body-norm tax.
+# We dragged that mystery under the keel and out the other side: the body-‖W‖ ramp was
+# NS spectral-flattening injecting an anti-radial update component (raw CE grad is null).
+# Tests:
+#  tangent-projection of the final Muon update against W, applied last (after NorMuon), with the global all-reduced coefficient
+#  row centering of the Head
+#  lowered body WD (7e-4) — the old "more WD" lever was fighting the NS push; with the push gone, WD goes DOWN not up
+run_name: keelhaul
+
+# Training settings
+ga_schedule:
+  - [0, 150_000]
+  - [4_000, 250_000]
+  - [8_000, 500_000]
+  - [17_000, 1_000_000]
+  - [20_000, 2_000_000]
+  - [24_000, 3_000_000]
+B: 8                          # Batch size per GPU
+T: 2048                       # Context size (sequence length)
+
+max_steps: 200_000            # Maximum number of training steps
+eval_iters: 2                 # Number of iterations for evaluation x ranks
+val_step: 100                 # Validation step frequency in steps
+save_step: 500                # Checkpoint saving frequency in steps
+
+# Data type settings
+data_type: bf16
+FSDP_param_dtype: bf16
+FSDP_reduce_dtype: bf16
+FSDP_buffer_dtype: bf16
+reshard_after_forward: false
+
+# Resume training settings
+resume_training: true
+resume_step: 3_500
+resume_data_reset: continue         # Modes are: continue (no reset), soft (reset pct window - change in pct), hard (reset all)
+
+# Gradient clipping
+clip_warmup: 2.0
+clip_standard: 2.0                # Raised 1.0->2.0 (2026-06-25): Probe A proved the Muon BODY is
+                                  # clip-INVARIANT (NS discards magnitude) and the global clip only
+                                  # throttles the magnitude-sensitive Adam groups. 2.0 lets the
+                                  # productive signal through (nrm operating point ~1.2-2.2) while
+                                  # still guarding genuine divergence spikes. See
+                                  # docs/PROBE_A_clip_replay_RESULTS.md + MATH_AGENT_BRIEF_5.
+track_gpm: true                   # Enable Gradient Productivity Metric tracking
+track_clip_groups: true           # Probe B: log per-group grad norms + clip coef (gn_body/gn_head/
+                                  # gn_emb/gn_other/clip_c) to see WHO the clip fires on. ~free.
+
+# Row-center the LM head: DISABLED for this run.
+# WHY: head row-centering has now killed TWO runs in two days — DN2 collapsed during the
+# mid-training row-center anneal (2026-06-22), and Keel Haul v1 DIVERGED from it (2026-06-23,
+# ~step 450: head output ‖W‖ ran away 462→33806, gauge muW_pre 0.0037→0.44, ppl→billions, while
+# the BODY norms stayed perfectly flat — confirming the tangent projection is clean and
+# row-centering is the culprit). Two corpses = systematic problem with the head-centering
+# intervention; it needs its OWN investigation, separately. Pulling it out here ISOLATES the
+# tangent-projection validation (one variable at a time) AND quarantines the repeat offender.
+# (A prior "no warmup, center from step 0" config — my change — made the divergence worse:
+# full-strength centering on an untrained volatile head is a runaway feedback loop. Re-enable
+# with the warmup anneal only after the head-centering instability is understood.)
+row_center_head:
+  enabled: false
+
+# Advisory health guard: WARNING logs only (nrm>5, nrm>3 repeated, eff_rank_c<7,
+# spec_conc_c>0.45). No auto-action — manual control.
+transition_health_guard: true
+# Suppress the grad-norm health warning for the first N steps. A from-scratch / fresh-resume
+# run always has high nrm while LR warms from ~0, so warning every step there is noise that
+# trains you to ignore the line before a REAL spike. Guard is for the steady state, not the
+# ramp. (Default is 100 even if unset; explicit here as an example / for easy tuning.)
+health_guard_warmup_steps: 150
+
+# Tokenizer settings
+tok_kind: llama
+tok_path: ../tokenizers/llama_tokenizer
+special_tokens: ../../notebooks/datasets/tokenized/llama/tokenizer_config.json  # Optional: add conversation special tokens
+
+# Model architecture
+use_keel: true                    # Enable KEEL ultra-deep architecture
+keel_alpha: null                  # Use default alpha value of layers * 2.0
+cfg_layers: 75
+cfg_heads: 32
+cfg_kv_heads: 16                  # NEW SETTING
+cfg_embd: 2048
+cfg_intermediate: 7560
+multiple_of: 128
+norm_eps: 1.0e-05
+dropout: 0.0
+use_activation_checkpointing: true
+qk_norm_mode: "before_rope"       # None, "before_rope", "after_rope_legacy", "after_rope_fixed"
+tie_word_embeddings: false         # Whether to tie word embeddings - false gives a small boost in quality but increases model size
+rope_theta: 500000.0              # # NEW SETTING: RoPE base frequency (higher = longer context support)
+
+# Compilation settings
+compile_model: true
+compile_mode: default
+
+# Learning rate schedule - Conservative Plateau with adjusted max_lr
+lr_schedule_type: "cosine"
+max_lr: 3.5e-04                   
+min_lr: 3.5e-05                   # 1% floor
+warmup_steps: 1500                # Match paper's deep runs
+
+# Optimizer settings
+optimizer_type: normuon_fsdp2
+beta1: 0.9
+beta2: 0.95
+weight_decay: 0.002                # Lowered ~10x (was 0.02): old high WD was fighting the NS radial push;
+                                   # with tangent projection removing it, WD goes DOWN. 0.002 = last rung of
+                                   # Math Agent's stepwise ladder (0.02->0.005->0.002). Theoretical pin ~7e-4
+                                   # but that's a floor to approach carefully, not jump to (esp. from-scratch).
+muon_momentum: 0.95
+muon_ns_steps: 5
+normuon_beta2: 0.99               # 0.95 - Aggressive, ~20 step window | 0.99 - Moderate, ~100 step window | 0.999 - Conservative, ~1000 step window
+
+# Tangent projection: strip the radial (∥W) component of the final Muon update against W,
+# applied last (after NorMuon), with the global all-reduced coefficient c=⟨U,W⟩/‖W‖².
+# Removes the Newton-Schulz-induced body-norm ramp at the source. Body Muon matrices only.
+# Validated (Probe 1): cos(U⊥,W) −0.0129 → 0.000, ‖U⊥‖/‖U‖ = 0.99992.
+tangent_project: true
+tangent_project_preserve_norm: false   # the removed component is ~1.3% of norm; rescale unnecessary
+
+data_root_path: ../../notebooks/datasets/tokenized/llama/
+groups:
+  # - [stories,      [[0, 25.0]]]
+  # - [ao3,          [[0, 25.0]]]
+  # - [books,        [[0, 25.0]]]
+  # - [preselect,    [[0, 7.0]]]
+  # - [code_python,  [[0, 6.0]]]
+  # - [code_c,       [[0, 6.0]]]
+  # - [edufineweb_1.5TT, [[0, 6.0]]]
+  - [stories,          [[0, 22.0]]]
+  - [ao3,              [[0, 22.0]]]
+  - [books,            [[0, 22.0]]]
+  - [preselect,        [[0, 11.0]]]
+  - [edufineweb_1.5TT, [[0, 11.0]]]
+  - [code_python,      [[0, 6.0]]]
+  - [code_c,           [[0, 6.0]]]
+  
+
+# Logging settings
+gen_log_file: gen_log.txt           # Will be saved in nas_root
+train_log_file: train_log.txt       # Will be saved in nas_root
+val_log_file: val_log.txt           # Will be saved in nas_root
+# server_host: localhost            # Will be derived from ddp
+server_port: 8888
+
+
+# Checkpoint Paths
+nas_root: /home/josef/brainbox/checkpoints/current/             # Defaults to ./log/ if not specified
+local_checkpoint_root: ~/checkpoints/                           # Defaults to ~/checkpoints/ if not specified
+# nas_path: ./log/4B-T-AC/                                      # Automatically derived from nas_root/run_name - can be overridden
+# resume_checkpoint_path: ./log/4B-T-AC/model_step_008500.pt    # Automatically derived from nas_root/run_name/model_step_resume_step - can be overridden
+# local_checkpoint_dir: ~/checkpoints/4B-T-AC                   # Automatically derived from local_checkpoint_root/run_name - can be overridden

@@ -37,6 +37,7 @@ resume_data_reset: continue
 # Gradient clipping
 clip_warmup: 2.0
 clip_standard: 1.0
+track_gpm: true                   # Enable Gradient Productivity Metric tracking
 
 # Model architecture — identical to dreadnought MoE minus the MoE
 use_keel: true

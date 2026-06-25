@@ -120,6 +120,10 @@ def summarize_optimizer_settings(settings, ddp_world_size, grad_accum, logger, m
             log(f"  ] NorMuon neuron-wise normalization enabled")
             log(f"  ] NorMuon beta2 = {normuon_beta2}")
 
+        if getattr(settings, 'tangent_project', False):
+            _tpn = getattr(settings, 'tangent_project_preserve_norm', False)
+            log(f"  ] Tangent projection = ON (preserve_norm={_tpn}) — body Muon update projected perpendicular to W")
+
         if optimizer_type in MUONSPHERE_VARIANTS:
             radius_scale = getattr(settings, 'muonsphere_radius_scale', 2.0)
             power_iters = getattr(settings, 'muonsphere_power_iters', 10)
@@ -232,6 +236,9 @@ def configure_optimizers(
     # MuonSphere settings
     muonsphere_radius_scale=2.0,
     muonsphere_power_iters=10,
+    # Tangent projection (strip radial component of final Muon update vs W)
+    tangent_project=False,
+    tangent_project_preserve_norm=False,
     # Dion2-specific
     dion2_fraction=0.25,
     dion2_ef_decay=0.95,
@@ -443,6 +450,13 @@ def configure_optimizers(
         # MuonSphere: weight decay handled by spectral retraction
         muon_weight_decay = 0.0 if use_muonsphere else wd_value
 
+        # Tangent projection: strip the radial (∥W) component of the final Muon update.
+        # Newton-Schulz's spectral flattening turns the radial-null CE gradient into an
+        # update with a small systematic anti-radial component → body ‖W‖ ramp. Projecting
+        # it out at the optimizer source removes the ramp; recommended with LOWER body WD
+        # (the WD was previously compensating the NS push). Body (Muon) matrices only.
+        # (tangent projection confirmation is logged by summarize_optimizer_settings;
+        #  no logger is available in configure_optimizers itself)
         param_groups = [
             dict(
                 params=muon_params,
@@ -459,6 +473,8 @@ def configure_optimizers(
                 use_muonsphere=use_muonsphere,
                 radius_scale=muonsphere_radius_scale,
                 power_iters=muonsphere_power_iters,
+                tangent_project=tangent_project,
+                tangent_project_preserve_norm=tangent_project_preserve_norm,
                 wd_group='default',
             ),
             dict(

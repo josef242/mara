@@ -1,5 +1,76 @@
 # Weight-Decay Gradient-Waste & Weight-Norm Ramp — Analysis
 
+## ⚠️⚠️ MAJOR CORRECTION (2026-06-23): the "−0.0129 gradient lean" is NEWTON-SCHULZ, not the raw gradient
+**A measurement-labeling error propagated through much of this doc.** The in-situ probe's
+`cos_grad_W` reads `p.grad` *after* `optimizer.step()` — but **Muon's step() scatters the
+Newton-Schulz-orthogonalized UPDATE back into `p.grad`** (`muon_fsdp2.py:357`). So
+`cos_grad_W` was measuring the **post-NS update**, NOT the raw CE gradient.
+
+**Decisive pre/post test (mf, bf16, T=8192, same step, `WD_PREPOST_PROBE`):**
+- `cos(RAW CE grad, W)` PRE-step = **−0.0000029, 58% neg → NULL** (matches Part B's +0.0003!)
+- `cos(.grad, W)` POST-step = **−0.01285, 100% neg** (the post-Newton-Schulz update)
+
+**Consequences — what this OVERTURNS:**
+- **Part B was RIGHT all along.** The raw CE gradient IS radial-null. There was NEVER a
+  "Part B vs in-situ contradiction" — in-situ measured a different quantity (post-NS update).
+- The **mechanism is Newton-Schulz orthogonalization**, NOT CE physics, NOT data, NOT FSDP
+  sharding, NOT bf16 precision. Every "−0.0129 gradient lean" / "anti-radial real-training
+  gradient" / "structural sharding" / "branch-gain" claim below is measuring the **NS update**.
+  The replicated-data (−0.0075), fp32 (−0.0159), and structural-sharding findings all measured
+  post-NS too — they lean because NS leans, not because of sharding/data/precision.
+- **The HARM is unchanged and real:** NS injects a +radial component into the applied ΔW (the
+  −0.01285 update flips to +0.01285 applied) → `‖W‖` grows → WD-starvation → finite run lifespan.
+  Self-consistent with the measured `cos(ΔW,W)=+0.0129` and log-parsed ‖W‖ ramp.
+- **The FIX becomes clean:** tangent-project the Muon update after NS:
+  `ΔW ← ΔW − W·⟨ΔW,W⟩/‖W‖²`. Strip the radial component at the optimizer source. No WD blunt
+  instrument, no precision change, no FSDP rewrite, no data intervention.
+
+### ⚠️ WD REVERSAL (Math Agent, 2026-06-23) — body WD should go DOWN, not up, after the fix
+**The entire prior "bump body-WD to 0.03–0.037 to pin the norm" conclusion is now BACKWARDS.**
+That lever was sized to fight the NS radial PUSH. Once tangent-projection removes that push at the
+source, the only radial forces left are WD's shrink (`−ηλ‖W‖`) + tiny quadrature (~2.7e-5/step,
+negligible). At `λ=0.02` with the push gone, **body norms would SHRINK** (~7e-4/step removed,
+nothing pushing back). The "pin norm after projection" WD is **~7e-4, NOT 0.02** — an order of
+magnitude LOWER. So:
+- The old "validated taming lever = more body WD" is **dead and points the wrong way.**
+- **DANGER:** "projection + MORE WD" would remove the inflation AND over-shrink → collapsing body
+  norms. (Echoes dn1's death: WD-as-blunt-instrument against a non-WD-shaped force.)
+- **Sequencing (do NOT change both at once):** (1) projection ON, **WD unchanged at 0.02** first;
+  watch the slope. (2) If it shrinks too fast, lower WD STEPWISE (0.02 → 0.005 → 0.002), not a
+  leap to 7e-4. λ_pin,projected ≈ ‖U⊥‖²/(2η‖W‖²) ≈ 7e-4 is a lower bound to APPROACH carefully.
+
+### Mechanism CONFIRMED (spectral audit, 2026-06-23, tools/ns_spectral_audit.py)
+Real CE gradient SVD on mf body matrices: `⟨G,W⟩` σ-WEIGHTED = **−2.7e-6 ≈ 0** (raw radial-null),
+but `⟨UVᵀ,W⟩` UNWEIGHTED = **−1.49 << 0** (polar/NS update leans anti-radial). Exactly Math's
+`Σσᵢaᵢ≈0` vs `Σaᵢ<0`. Bin Q0 (highest σ): weighted +8.9e-6 but unweighted −0.58 — high-σ modes
+carry big anti-radial `aᵢ` invisible in the weighted (cancelled) sum, dominant once NS flattens σ.
+CAVEAT: pure-polar `cos(polar,W)=−0.00054` is ~25× SMALLER than the in-situ −0.013 — the full
+magnitude needs the downstream stages (apply_scaling, apply_normuon) on top of NS. Direction
+confirmed; magnitude amplified downstream. (Random G⟂W gives NS≈0 → effect is gradient-STRUCTURE
+dependent, a property of trained-KEEL gradient spectra, explaining the 100% sign-consistency.)
+
+### ✅ FIX VALIDATED IN PRODUCTION (2026-06-23) — "Keel Haul" run, body norm PINNED FLAT
+Tangent projection live in a from-scratch ultra-deep run (dim 2048, 70L, 8×3090, config
+`keelhaul.yaml`: tangent_project ON, body WD 0.002, row-center from step 0). Body ‖W‖ over the
+first 300 steps:
+| step | attn median ‖W‖ | ffn median ‖W‖ |
+|---|---|---|
+| 100 | 167.27 | 315.45 |
+| 200 | 167.27 | 315.45 |
+| 300 | 167.28 | 315.45 |
+
+**Slope ≈ 0** (attn +0.07/kstep, ffn +0.008/kstep) — vs **+2.24%/kstep (dn2) / +0.91%/kstep (mf)**
+UNFIXED. ~30× flatter, effectively PINNED, uniform across all 70 layers (167.1–167.6). And it cost
+NOTHING: loss ppl 49637→98 by step 332, grad-norm relaxed to 3.45, val survived. **The body-norm
+ramp is TAMED at the optimizer source.** Probe 1 proved the projection zeros the radial component
+in isolation; Keel Haul proves it holds ‖W‖ flat across real training while learning normally.
+INVESTIGATION CLOSED. (Branch: body-ramp-fsdp-probe.)
+
+Everything below is preserved as investigation history but must be read through this lens:
+**`cos_grad_W` = post-Newton-Schulz update direction, not the raw gradient.**
+
+---
+
 **Status:** complete (Part A + Part B, 4 checkpoints across 2 architectures incl. a dead run).
 **Date:** 2026-06-22. **Nexus thread:** 139 (msg #167 hypothesis, #170 results).
 **Tools (offline):** `tools/wd_waste_probe.py` (Part A, log-parse), `tools/wd_waste_partb.py` (Part B, cos test).

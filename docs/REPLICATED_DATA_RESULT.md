@@ -1,7 +1,31 @@
 # Replicated-Data Test — RESULT (2026-06-23, autonomous run)
 
+## ⚠️ SUPERSEDED — the "structural FSDP2 sharding" conclusion below is WRONG
+**Root cause found later (see WD_WASTE_ANALYSIS.md top banner + newton_schulz_radial_finding):**
+the `cos_grad_W` probe read `p.grad` AFTER `optimizer.step()`, where Muon had overwritten it with
+the Newton-Schulz UPDATE. So every leaning number here (−0.0075 replicated, −0.0129 diverse, the
+"structural sharding" finding) is the **post-NS update**, not the raw gradient. The raw CE gradient
+is radial-null (Part B was right). The mechanism is **Newton-Schulz spectral flattening**, NOT
+sharding/data/precision. The "single-card null" baselines were null because the offline probe runs
+NO Muon step (no NS). The ~40% "data diversity" split is also post-NS-of-different-data, not raw-CE
+physics. **Fix:** tangent-project the Muon update (validated, Probe 1). This doc is kept as
+investigation history; read it knowing the lean it chases is the NS update.
+
+---
+
 **Math Agent test #3 (data-vs-machinery cut). Run autonomously overnight with Josef's
 go-ahead on the data hypothesis. NOTHING committed — staged for review.**
+
+## WHY THIS IS WORTH FIXING (motivation, Josef 2026-06-23)
+The body-norm ramp is NOT cosmetic. It is **self-amplifying and starves learning**: decoupled
+WD removes `ηλ‖W‖` per step, which GROWS as ‖W‖ grows, so WD's share of the update climbed to
+**99.8%** by mid-training (summed λ‖W‖ ~2200 vs loss-grad ~2–4). The optimizer ends up spending
+almost all its motion fighting its own weight decay; real learning gets crowded out. A run on
+this trajectory has a **finite useful lifespan** — it doesn't crash, it suffocates. So the ramp
+must be tamed. The decomposition below makes the fix TARGETABLE: ~40% is genuine CE/data
+pressure (leave it — that's learning), ~60% is the FSDP sharded-path artifact (**free growth
+that buys nothing — pure tax**). Goal: kill the ~60% artifact at its source WITHOUT over-decaying
+the ~40% real signal. (The pending fp32-param test says WHAT the artifact is → how to remove it.)
 
 ## Setup
 New env flag `WD_REPLICATED_DATA=1` (in `train_mara.py`, grad-accum loop): broadcasts
@@ -77,14 +101,46 @@ also showed single-card is T-insensitive, so T isn't confounding.
 1. **~40% cross-rank DATA diversity** (−0.0129 → −0.0075 when data made identical). REAL CE/data effect.
 2. **~60% FSDP/bf16 forward-PATH** (−0.0075 → +0.000003 when same tokens run single-card). NUMERICAL/path effect — the all-gathered bf16 parameter forward, NOT the data, NOT the reduce-scatter (ruled out earlier), NOT the CCE kernel (ruled out Stage B).
 
-## NEXT (precision ladder, Math Agent #5 — to pin the bf16-path mechanism)
-On the SAME exact tokens, single-card, vary the forward precision:
-- fp32 master weights / fp32 forward
-- bf16 weights dequantized to fp32 (same rounded values, fp32 matmul)
-- true bf16 matmul (mimic FSDP all-gather)
-If bf16-rounded-values-in-fp32-matmul reproduce the lean → it's the quantized VALUES.
-If only true-bf16-matmul reproduces it → it's the bf16 KERNEL/accumulation in the forward.
-This isolates WHICH part of the bf16 forward produces the anti-radial pressure.
+## fp32-PARAM TEST — DONE (rig-30, 8×3090). RESIDUAL IS **STRUCTURAL SHARDING**, NOT bf16.
+Ran the whole model in **full fp32** on the real 8-GPU FSDP2 path (`FSDP_param_dtype: fp32`,
+fp32 forward, `WD_CCE_IMPL=torch_compile` to bypass the fused-CCE bf16-only kernel — Josef's
+unblock), T=12288, in-situ probe. Result:
+
+| condition | cos_grad_W body median | negfrac | dtype in FSDP forward |
+|---|---|---|---|
+| single-card (exact tokens) | +0.000003 | 42% (null) | — (unsharded) |
+| FSDP bf16 | −0.0129 | 100% | bf16 |
+| **FSDP fp32-param** | **−0.01592** | **98%** | **fp32 (NO bf16 anywhere)** |
+
+Per-class: body_proj −0.0176, body_in −0.0143. `total_dW_radial` +0.00082, 96% pos — **‖W‖
+still grows in full fp32.**
+
+**VERDICT: removing bf16 ENTIRELY from the FSDP forward did NOT kill the lean — it persists at
+full strength (−0.0159, if anything stronger than bf16's −0.0129).** So the ~60% "residual" is
+**NOT a precision artifact** (not bf16 cast, not bf16 matmul, not bf16 values — all ruled out
+across this + the single-card replay + the reduce-scatter test). It is **STRUCTURAL FSDP2
+SHARDING**: the act of sharding/all-gathering/resharding the params produces the anti-radial
+gradient lean, independent of dtype. (Single-card unsharded = null; sharded = lean, in BOTH
+bf16 and fp32.) Josef's "sharded vs unsharded" instinct was correct as the WHOLE story for the
+non-data component.
+
+**Why fp32 is slightly STRONGER (−0.0159 vs −0.0129):** unconfirmed. Candidates: (a) noise
+(single step); (b) T=12288 vs 8192; (c) fp32 removes rounding noise that was blurring the
+systematic lean, so it reads sharper. Not over-read yet.
+
+## REVISED DECOMPOSITION of the −0.0129 lean
+1. ~40% cross-rank DATA diversity (real CE effect)
+2. ~60% **STRUCTURAL FSDP2 sharding** (dtype-independent — all-gather reconstruction /
+   reshard-recompute / sharded autograd). NOT precision, NOT data, NOT reduce-scatter, NOT CCE.
+
+## NEXT — FSDP1 (now the real test, not hypothetical)
+FSDP1 (FlatParameter: all-gather one flat buffer, unflatten/view slices) reconstructs params
+DIFFERENTLY than FSDP2 (per-param DTensor all-gather). If the lean is "how the gathered tensor
+is reconstructed," FSDP1 vs FSDP2 could differ → diagnostic. New run, larger surface (FSDP1
+wrapping, ckpt format, optimizer sharding), but on the table (Josef). If FSDP1 ALSO leans →
+the effect is intrinsic to sharded data-parallel reconstruction itself (deep water).
+Cheaper intermediate probes to consider first: vary `reshard_after_forward`, or a 1-GPU FSDP2
+run (world=1: full FSDP machinery, no real sharding) — isolates "FSDP wrapper" from "multi-shard".
 
 ## Status / policy (unchanged)
 - The −0.0129 lean is REAL and now PARTIALLY DECOMPOSED: ~40% cross-rank data diversity,

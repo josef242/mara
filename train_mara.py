@@ -318,6 +318,126 @@ def _row_center_cfg(settings):
     return {'enabled': False, 'warmup': None}
 
 
+class GPMTracker:
+    """Gradient Productivity Metric — live, on the status line.
+
+    Measures: when grad-norm spikes ABOVE its local trend, does loss drop MORE than its
+    local trend on the NEXT step? Positive => big gradients here are productive (strong
+    learning signal); ~0 => spikes are noise; negative => spikes are anti-productive.
+
+    Detrends BOTH nrm and dloss against a rolling median (so we measure LOCAL fluctuation
+    coupling, not the trivial shared early-vs-late training envelope), then takes a
+    Spearman rank correlation (robust to heavy-tailed nrm spikes). Lag-1: nrm[t] vs
+    dloss[t]=ls[t]-ls[t+1] (the spike precedes the drop — Josef's observed effect).
+
+    Two windows: GPM-S (short, responsive) and GPM-L (long, stable baseline). The GAP
+    between them is itself the signal: S>L => productivity rising (breakthrough igniting);
+    S<L => dipping (plateau/saturation). Validated offline (tools/gpm.py): KeelHaul ~+0.25
+    vs mf ~+0.13 vs DN2 ~+0.07 at W=51 — the tangent-projected regime has ~2-3.5x more
+    productive gradients (radial shock-absorber removed => norm spikes are all loss-relevant).
+
+    Trailing by 1 step (needs ls[t+1] to score nrm[t]); negligible compute (Spearman over
+    <=W points once per logged step). rank0 only.
+    """
+    def __init__(self, w_short=15, w_long=101):
+        from collections import deque
+        self.ws, self.wl = w_short, w_long
+        self.buf = deque(maxlen=w_long + 2)  # (nrm, ls) history, sized to the long window
+
+    def update(self, nrm, ls):
+        """Append this step's (grad-norm, loss). Call once per logged step, rank0."""
+        self.buf.append((float(nrm), float(ls)))
+
+    def seed_from_log(self, gen_log_path, before_step):
+        """Pre-fill the rolling buffer from a gen_log on resume, so GPM-L doesn't reset to a
+        cold short-memory window after a checkpoint restart (the deque isn't checkpointed —
+        but the log IS the persistent history). Loads the (nrm, ls) of training lines with
+        step < before_step, keeping the last w_long+2 of them: exactly what the live buffer
+        would have held had the run never paused. No-ops cleanly on a fresh run (missing log,
+        before_step<=1, or no parseable lines). Call once, right after construction, rank0.
+
+        Returns the number of points seeded (0 if it no-op'd)."""
+        try:
+            if not gen_log_path or before_step is None or before_step <= 1:
+                return 0
+            import os as _os, re as _re
+            if not _os.path.exists(gen_log_path):
+                return 0
+            # step / ls / nrm in the same order the trainer writes them on a training line.
+            pat = _re.compile(r"st:\s*(\d+).*?ls:\s*([0-9.]+).*?nrm:\s*([0-9.]+)")
+            rows = {}
+            with open(gen_log_path, encoding="utf-8", errors="ignore") as fh:
+                for line in fh:
+                    m = pat.search(line)
+                    if m:
+                        s = int(m.group(1))
+                        if s < before_step:
+                            rows[s] = (float(m.group(3)), float(m.group(2)))  # (nrm, ls)
+            if not rows:
+                return 0
+            # last w_long+2 steps in order -> exactly the deque's maxlen window
+            tail = [rows[s] for s in sorted(rows)][-(self.wl + 2):]
+            self.buf.clear()
+            self.buf.extend(tail)
+            return len(tail)
+        except Exception:
+            # Seeding is a best-effort warm-start; never let it break a resume.
+            return 0
+
+    @staticmethod
+    def _spearman(a, b):
+        n = len(a)
+        if n < 4:
+            return None
+        def ranks(v):
+            order = sorted(range(n), key=lambda i: v[i]); r = [0.0] * n; i = 0
+            while i < n:
+                j = i
+                while j + 1 < n and v[order[j + 1]] == v[order[i]]:
+                    j += 1
+                avg = (i + j) / 2.0 + 1
+                for k in range(i, j + 1):
+                    r[order[k]] = avg
+                i = j + 1
+            return r
+        ra, rb = ranks(a), ranks(b)
+        ma, mb = sum(ra) / n, sum(rb) / n
+        cov = sum((ra[i] - ma) * (rb[i] - mb) for i in range(n))
+        va = sum((x - ma) ** 2 for x in ra) ** 0.5
+        vb = sum((x - mb) ** 2 for x in rb) ** 0.5
+        return cov / (va * vb) if va > 0 and vb > 0 else 0.0
+
+    @staticmethod
+    def _resid(x):
+        """Residual vs centered rolling-median over the WHOLE passed window (the window IS
+        the locality here, since we pass exactly the last W points)."""
+        import statistics as _st
+        m = _st.median(x)
+        return [v - m for v in x]
+
+    def _gpm(self, W):
+        # use the last W+1 points; dloss[i]=ls[i]-ls[i+1], aligned with nrm[i]
+        pts = list(self.buf)[-(W + 1):]
+        if len(pts) < 5:
+            return None
+        nr = [p[0] for p in pts]; lsv = [p[1] for p in pts]
+        dloss = [lsv[i] - lsv[i + 1] for i in range(len(pts) - 1)]
+        nr_al = nr[:len(dloss)]
+        return self._spearman(self._resid(nr_al), self._resid(dloss))
+
+    def status_tag(self):
+        """' | gpm: +0.31/+0.25' (GPM-S/GPM-L) for the status line, or '' if not enough
+        history. No trend arrow: trending is read on the Dashboard (it plots both curves);
+        the status line stays compact. Format is byte-identical to the retrofit injector
+        so historical and live runs parse the same."""
+        gs, gl = self._gpm(self.ws), self._gpm(self.wl)
+        if gs is None and gl is None:
+            return ""
+        def f(v):
+            return f"{v:+.2f}" if v is not None else " -- "
+        return f" | gpm: {f(gs)}/{f(gl)}"
+
+
 def get_row_center_s(step, settings):
     """Row-center warmup scalar s(t) in [0,1] at absolute global `step`. Pure
     function of (step + static config) -> resume-safe like get_zloss_alpha.
@@ -918,7 +1038,36 @@ class ActivationProbe:
         return {'layers_by_idx': layers, **final}
 
 
-def _clip_grad_norm_mixed_mesh(model, max_norm, norm_type=2.0):
+def _clip_group_of(name):
+    """Bucket a param into a coarse group for clip telemetry (Probe B). Mirrors the
+    Muon-vs-Adam split that matters for the clip-throttle question: the Muon BODY is
+    clip-invariant (NS discards magnitude), the magnitude-sensitive Adam groups are not.
+      'body'  — Muon matrices (attn/ffn 2D weights)        [clip-invariant]
+      'head'  — output projection                          [magnitude-sensitive]
+      'emb'   — token embeddings                           [magnitude-sensitive]
+      'other' — norms / router / GDN-small / biases        [magnitude-sensitive]
+
+    NOTE: per-submodule torch.compile (`_apply_per_submodule_compile`) inserts an
+    `_orig_mod` segment into param paths — e.g. `layers.0.attention.wq.weight` becomes
+    `layers.0.attention._orig_mod.wq.weight`. We strip ALL `_orig_mod.` segments before
+    matching, else every compiled body matrix mis-buckets as 'other' (the gn_body=0 bug,
+    2026-06-25). The body grads are present and correctly trained — this only affected the
+    telemetry's bucketing, not the clip/nrm math (which sum every param regardless of group)."""
+    n = name.replace('_orig_mod.', '')   # undo per-submodule compile name mangling
+    if n.endswith('.weight') and any(s in n for s in (
+            'attention.wq', 'attention.wk', 'attention.wv', 'attention.wo',
+            'feed_forward.w1', 'feed_forward.w2', 'feed_forward.w3',
+            'gdn_attn.q_proj', 'gdn_attn.k_proj', 'gdn_attn.v_proj', 'gdn_attn.o_proj',
+            'shared_experts.w1', 'shared_experts.w2', 'shared_experts.w3', 'g_proj')):
+        return 'body'
+    if n.startswith('output.') or n.endswith('output.weight'):
+        return 'head'
+    if 'tok_embeddings' in n:
+        return 'emb'
+    return 'other'
+
+
+def _clip_grad_norm_mixed_mesh(model, max_norm, norm_type=2.0, group_telemetry=False):
     """clip_grad_norm_ that works with params on different DTensor meshes.
 
     Standard clip_grad_norm_ uses torch.stack on per-param norms, which fails
@@ -928,25 +1077,63 @@ def _clip_grad_norm_mixed_mesh(model, max_norm, norm_type=2.0):
     This is correct because:
       - FSDP sharded params: each rank has 1/N of the grad, sum of partial norms² = full norm²
       - EP expert params: each rank has unique experts, sum gives total expert norm²
+
+    Perf: norm² is accumulated ON-GPU (no per-param .item() sync); a single all-reduce
+    handles the total (+ 4 group sums when group_telemetry=True — same #all-reduces).
+
+    Returns total_norm (float). When group_telemetry=True, returns
+    (total_norm, {'body':n, 'head':n, 'emb':n, 'other':n, 'clip_coef':c}) — per-group
+    global grad norms (Probe B), computed in the SAME pass at negligible extra cost.
     """
     from torch.distributed.tensor import DTensor
 
-    total_local_norm_sq = 0.0
     grads = []
+    dev = None
+    if group_telemetry:
+        # 5 on-GPU accumulators: [total, body, head, emb, other] local norm²
+        acc = None
+        _gidx = {'body': 1, 'head': 2, 'emb': 3, 'other': 4}
+        for name, p in model.named_parameters():
+            if p.grad is None:
+                continue
+            grads.append(p.grad)
+            g = p.grad._local_tensor if isinstance(p.grad, DTensor) else p.grad
+            if acc is None:
+                dev = g.device
+                acc = torch.zeros(5, device=dev, dtype=torch.float64)
+            nsq = torch.linalg.vector_norm(g, norm_type).double() ** norm_type
+            acc[0] += nsq
+            acc[_gidx[_clip_group_of(name)]] += nsq
+        if not grads:
+            return 0.0, {'body': 0.0, 'head': 0.0, 'emb': 0.0, 'other': 0.0, 'clip_coef': 1.0}
+        dist.all_reduce(acc)
+        vals = acc.tolist()
+        total_norm = vals[0] ** (1.0 / norm_type)
+        clip_coef = max_norm / (total_norm + 1e-6)
+        if clip_coef < 1.0:
+            for g in grads:
+                g.mul_(clip_coef)
+        groups = {'body': vals[1] ** (1.0 / norm_type), 'head': vals[2] ** (1.0 / norm_type),
+                  'emb': vals[3] ** (1.0 / norm_type), 'other': vals[4] ** (1.0 / norm_type),
+                  'clip_coef': min(1.0, clip_coef)}
+        return total_norm, groups
+
+    # fast path (telemetry off): single on-GPU accumulator, one .item() sync total
+    acc = None
     for p in model.parameters():
         if p.grad is None:
             continue
         grads.append(p.grad)
         g = p.grad._local_tensor if isinstance(p.grad, DTensor) else p.grad
-        total_local_norm_sq += torch.linalg.vector_norm(g, norm_type).item() ** norm_type
+        if acc is None:
+            acc = torch.zeros(1, device=g.device, dtype=torch.float64)
+        acc += torch.linalg.vector_norm(g, norm_type).double() ** norm_type
 
     if not grads:
         return 0.0
 
-    # All-reduce local norms² to get global norm²
-    norm_tensor = torch.tensor(total_local_norm_sq, device=grads[0].device)
-    dist.all_reduce(norm_tensor)
-    total_norm = norm_tensor.item() ** (1.0 / norm_type)
+    dist.all_reduce(acc)
+    total_norm = acc.item() ** (1.0 / norm_type)
 
     clip_coef = max_norm / (total_norm + 1e-6)
     if clip_coef < 1.0:
@@ -1164,7 +1351,67 @@ def train_loop(
     # branch's nrm=5.61 event: nrm>5 once, nrm>3 for N repeated steps, eff_rank_c<7,
     # spec_conc_c>0.45.
     health_guard_on = bool(getattr(settings, 'transition_health_guard', False))
+    # Suppress the grad-norm guard for the first N steps (config:
+    # health_guard_warmup_steps, default 100). LR warmup => high nrm is expected and
+    # noisy at the start of any from-scratch / fresh-resume run; the guard is for the
+    # steady state, not the ramp.
+    health_guard_warmup_steps = int(getattr(settings, 'health_guard_warmup_steps', 100))
     _hg_nrm_run = 0   # consecutive steps with nrm > 3
+
+    # Gradient Productivity Metric (GPM) on the status line — opt-in via track_gpm: true.
+    # Live "are big gradients productive right now?" read (GPM-S/GPM-L; gap = rising/falling).
+    _gpm_cfg = getattr(settings, 'track_gpm', False)
+    gpm_tracker = None
+    if _gpm_cfg:
+        _gpm_ws = int(getattr(settings, 'gpm_window_short', 15))
+        _gpm_wl = int(getattr(settings, 'gpm_window_long', 101))
+        gpm_tracker = GPMTracker(w_short=_gpm_ws, w_long=_gpm_wl)
+        # Warm-start the rolling buffer from the gen_log on resume so GPM-L doesn't reset to a
+        # cold short-memory window after a checkpoint restart (no "seam" at the resume point).
+        # The deque isn't checkpointed, but the gen_log holds the full (nrm, ls) history.
+        # IMPORTANT: settings.gen_log_file is a BARE filename ('gen_log.txt'); the logger writes
+        # it under its logdir (set to settings.nas_path via logger._instance.set_logdir(), L4906)
+        # as nas_path/gen_log.txt (logger.py L299). seed_from_log needs that resolved path —
+        # passing the bare name made os.path.exists() check the trainer CWD and silently no-op
+        # (priming bug v1, 2026-06-25). Note: `logger` here is the MODULE; get_dir() lives on
+        # logger._instance, so resolve via settings.nas_path directly (the value the logdir was
+        # set from) rather than logger.get_dir() — module has no get_dir (priming bug v2).
+        if start_step > 1:
+            _glf = getattr(settings, 'gen_log_file', None)
+            _gpaths = []
+            if _glf:
+                _nasp = getattr(settings, 'nas_path', None)
+                if _nasp:
+                    _gpaths.append(os.path.join(_nasp, _glf))
+                try:
+                    _gpaths.append(os.path.join(logger._instance.get_dir(), _glf))
+                except Exception:
+                    pass
+                _gpaths.append(_glf)  # fallback: bare/relative (covers absolute paths too)
+            _seeded = 0
+            for _gp in _gpaths:
+                _seeded = gpm_tracker.seed_from_log(_gp, start_step)
+                if _seeded:
+                    break
+            if ddp_rank == 0:
+                if _seeded:
+                    logger.print_and_log(f"  ] GPM: warm-started buffer with {_seeded} pre-resume "
+                                         f"points from gen_log (no restart seam).")
+                else:
+                    logger.print_and_log(f"  ] GPM: no warm-start (gen_log not found at "
+                                         f"{_gpaths or '[none]'}; cold start).")
+
+    # Probe B — per-group clip telemetry (opt-in via track_clip_groups: true). Logs the
+    # global grad-norm split by group + the clip coefficient, so we can SEE who the global
+    # clip is firing on (Muon body is clip-invariant; Adam groups are magnitude-sensitive —
+    # see docs/PROBE_A_clip_replay_RESULTS.md). Folded into the existing clip pass → ~free.
+    _clip_groups_cfg = bool(getattr(settings, 'track_clip_groups', False))
+
+    # Body relative-step pdr = ||dW||/||W|| on the status line — the effective-LR metric for the
+    # tangent-projection annealing experiment (Math Brief #6). Sourced from the periodic
+    # diagnostics snapshot (same number as diagnostics.jsonl, so live == dashboard), held between
+    # diag steps since pdr is slow-moving. Shown only once diagnostics have produced a value.
+    _live_body_pdr = None
 
     # ── SCS (Scaffolded Cascading Supervision) per-loop state ───────────────
     # Active when `auxiliary_heads.compute_inactive_layers: false`. The trainer
@@ -1463,7 +1710,29 @@ def train_loop(
         # and fed straight back into the model. The dataset is unfiltered; we treat
         # all token content as opaque in every code path. Shapes only in any log.
         _dump_tokens = os.environ.get('WD_DUMP_TOKENS') == '1'
+        # Microbatch PROGRESS log — gated on any probe flag so normal training stays
+        # quiet. Shows N/GA + per-microbatch cadence so long GA (e.g. 366 in fp32) is
+        # not a black box. rank0 only, every _prog_every (default 25) + the last one.
+        _prog = bool(os.environ.get('WD_INSITU_PROBE') or os.environ.get('WD_REDUCE_PROBE')
+                     or os.environ.get('WD_DUMP_TOKENS') or os.environ.get('WD_REPLICATED_DATA'))
+        _prog_every = int(os.environ.get('WD_PROG_EVERY', '25'))
+        _prog_t0 = time.time()
+        # PROBE-FAST (WD_PROBE_FAST=1 or WD_PROBE_MAX_MB=N): cap grad-accum microbatches for
+        # the toggle-matrix probes. The body-ramp lean is a POPULATION property present in every
+        # microbatch (not accumulation-dependent), so cos(.grad,W) over a few microbatches ≈ the
+        # full-GA value. Slashes runtime AND avoids the world=1 optimizer.step OOM (paired with
+        # the pre-step fast capture below). Default cap = 8 when WD_PROBE_FAST set, else full.
+        if os.environ.get('WD_PROBE_MAX_MB'):
+            grad_accum_steps = min(grad_accum_steps, int(os.environ['WD_PROBE_MAX_MB']))
+        elif os.environ.get('WD_PROBE_FAST') == '1':
+            grad_accum_steps = min(grad_accum_steps, 8)
         for micro_step in range(grad_accum_steps):
+            if _prog and ddp_rank == 0 and (micro_step % _prog_every == 0 or micro_step == grad_accum_steps - 1):
+                _el = time.time() - _prog_t0
+                _rate = (_el / max(micro_step, 1))
+                _eta = _rate * (grad_accum_steps - micro_step)
+                logger.print_and_log(f"[PROBE-PROG] microbatch {micro_step+1}/{grad_accum_steps}  "
+                                     f"elapsed={_el:.0f}s  ~{_rate:.1f}s/mb  eta~{_eta:.0f}s")
             x, y = train_loader.next_batch(step=step)
             x, y = x.to(device), y.to(device)
             if _repl_data:
@@ -1625,7 +1894,11 @@ def train_loop(
                 [_head_param(_raw_hm)], ddp
             )
 
-        norm = _clip_grad_norm_mixed_mesh(model, clip_value)
+        if _clip_groups_cfg:
+            norm, _clip_groups = _clip_grad_norm_mixed_mesh(model, clip_value, group_telemetry=True)
+        else:
+            norm = _clip_grad_norm_mixed_mesh(model, clip_value)
+            _clip_groups = None
 
         # Apply per-parameter LR scaling from lr_mods (via side-dict)
         if lr_mod_entries and lr_scale_overrides is not None:
@@ -1941,6 +2214,86 @@ def train_loop(
                     _ls = lr_scale_overrides.get(id(_p), 1.0) if lr_scale_overrides else 1.0
                     _insitu_snap[_n] = (_loc.detach().float().clone(), _lr * _ls, _w)
 
+        # PRE-vs-POST-STEP grad probe (WD_PREPOST_PROBE=1): the DECISIVE test of whether the
+        # "-0.0129 lean" is the RAW CE gradient or the Muon/Newton-Schulz-TRANSFORMED grad.
+        # Muon's step() scatters the NS-orthogonalized update back INTO p.grad (muon_fsdp2:357),
+        # so the in-situ probe (which reads .grad AFTER step) measures the POST-NS grad, not the
+        # raw one. Here we capture cos(.grad,W) BOTH before AND after optimizer.step on the SAME
+        # step, same params, so the only difference is the Muon transform. One-shot.
+        if os.environ.get('WD_PREPOST_PROBE') == '1':
+            import torch.distributed as _fdist
+            from torch.distributed.tensor import DTensor as _FDT
+            import statistics as _fst, json as _fjson
+            _raw_f = model._orig_mod if hasattr(model, '_orig_mod') else model
+            def _f_gsum(_t, _ref):
+                if isinstance(_ref, _FDT) and _fdist.is_available() and _fdist.is_initialized():
+                    _t = _t.clone(); _fdist.all_reduce(_t, group=_ref.device_mesh.get_group())
+                return _t
+            def _f_isbody(_n):
+                return any(_n.endswith(s) for s in ('wo.weight','w2.weight','wq.weight',
+                           'wk.weight','wv.weight','w1.weight','w3.weight'))
+            def _f_cosmap():
+                _o = {}
+                for _n, _p in _raw_f.named_parameters():
+                    if not _f_isbody(_n) or _p.grad is None:
+                        continue
+                    _W = (_p._local_tensor if isinstance(_p, _FDT) else _p).detach().float()
+                    _G = (_p.grad._local_tensor if isinstance(_p.grad, _FDT) else _p.grad).detach().float()
+                    _d = _f_gsum((_W*_G).sum(), _p).item()
+                    _wn = _f_gsum((_W*_W).sum(), _p).clamp_min(0).sqrt().item()
+                    _gn = _f_gsum((_G*_G).sum(), _p).clamp_min(0).sqrt().item()
+                    _o[_n] = (_d/(_wn*_gn)) if (_wn>0 and _gn>0) else 0.0
+                return _o
+            def _f_summ(_d):
+                _v = list(_d.values())
+                return {'median': _fst.median(_v), 'mean': _fst.mean(_v),
+                        'negfrac': sum(1 for c in _v if c<0)/len(_v), 'n': len(_v)} if _v else {}
+            # snapshot W (pre-step) for the post-step cos to use the SAME reference
+            _W_snap = {_n: (_p._local_tensor if isinstance(_p, _FDT) else _p).detach().float().clone()
+                       for _n, _p in _raw_f.named_parameters() if _f_isbody(_n)}
+            _cos_pre = _f_cosmap()              # RAW reduced loss gradient vs W
+            optimizer.step()                    # Muon scatters NS-update into .grad
+            # post-step: cos(.grad_now, W_pre) — .grad is now the Muon-transformed update.
+            # ALSO (Math Agent Probe 1): compute the TANGENT-PROJECTED update U⊥ = U − W⟨U,W⟩/‖W‖²
+            # (global all-reduced coeff) and its cos — MEASUREMENT ONLY, no param mutation. If
+            # cos(U⊥,W)→0 and ‖U⊥‖/‖U‖≈1, the projection fix is validated before any real run.
+            _cos_post = {}; _cos_proj = {}; _normratio = {}
+            for _n, _p in _raw_f.named_parameters():
+                if not _f_isbody(_n) or _p.grad is None or _n not in _W_snap:
+                    continue
+                _W = _W_snap[_n]
+                _G = (_p.grad._local_tensor if isinstance(_p.grad, _FDT) else _p.grad).detach().float()
+                _dot = _f_gsum((_W*_G).sum(), _p).item()
+                _wn = _f_gsum((_W*_W).sum(), _p).clamp_min(0).sqrt().item()
+                _gn = _f_gsum((_G*_G).sum(), _p).clamp_min(0).sqrt().item()
+                _cos_post[_n] = (_dot/(_wn*_gn)) if (_wn>0 and _gn>0) else 0.0
+                # projected update U⊥ = U − c·W,  c = ⟨U,W⟩/‖W‖²  (global)
+                _wsq = _wn*_wn
+                _c = (_dot/_wsq) if _wsq>0 else 0.0
+                _Gp = _G - _c*_W
+                _dp = _f_gsum((_W*_Gp).sum(), _p).item()
+                _gpn = _f_gsum((_Gp*_Gp).sum(), _p).clamp_min(0).sqrt().item()
+                _cos_proj[_n] = (_dp/(_wn*_gpn)) if (_wn>0 and _gpn>0) else 0.0
+                _normratio[_n] = (_gpn/_gn) if _gn>0 else 0.0
+            if ddp_rank == 0:
+                _sp, _so, _spr = _f_summ(_cos_pre), _f_summ(_cos_post), _f_summ(_cos_proj)
+                _nr = list(_normratio.values()); _nrmed = _fst.median(_nr) if _nr else 0.0
+                logger.print_and_log(f"[PREPOST] cos(RAW grad,W)  PRE-step : median={_sp.get('median'):+.5f} negfrac={_sp.get('negfrac',0)*100:.0f}% n={_sp.get('n')}")
+                logger.print_and_log(f"[PREPOST] cos(NS update,W) POST-step: median={_so.get('median'):+.5f} negfrac={_so.get('negfrac',0)*100:.0f}% n={_so.get('n')}")
+                logger.print_and_log(f"[PREPOST] cos(PROJECTED,W) U⊥      : median={_spr.get('median'):+.5f} negfrac={_spr.get('negfrac',0)*100:.0f}%  ‖U⊥‖/‖U‖ median={_nrmed:.5f}")
+                logger.print_and_log("[PREPOST] PROBE 1 PASS if cos(PROJECTED,W)→0 and ‖U⊥‖/‖U‖≈1 (projection removes radial, keeps ~all the update).")
+                _foutp = os.environ.get('WD_PREPOST_OUT', 'wd_prepost.json')
+                with open(_foutp, 'w') as _ff:
+                    _fjson.dump({'step': step, 'mb': grad_accum_steps,
+                                 'pre_summary': _sp, 'post_summary': _so, 'proj_summary': _spr,
+                                 'normratio_median': _nrmed,
+                                 'pre_per_matrix': _cos_pre, 'post_per_matrix': _cos_post,
+                                 'proj_per_matrix': _cos_proj}, _ff, indent=1)
+                logger.print_and_log(f"[PREPOST] wrote {_foutp} — exiting")
+            if ddp:
+                _fdist.barrier()
+            sys.exit(0)
+
         optimizer.step()
 
         if _insitu:
@@ -2174,8 +2527,27 @@ def train_loop(
             sched_tag = ""
             if zloss_enabled or (row_center_enabled and row_center_warmup_on):
                 sched_tag = f" | z_a_eff: {zloss_alpha_eff:.3e} | rc_s: {rc_s_eff:.4f}"
+            # GPM: feed this step's (grad-norm, loss), then read the live tag.
+            gpm_tag = ""
+            if gpm_tracker is not None:
+                gpm_tracker.update(norm, main_loss_val)
+                gpm_tag = gpm_tracker.status_tag()
+            # Probe B clip-group tag: per-group grad norms + clip coef (who is the clip hitting?).
+            # Dashboard-parseable key:value fields, same style as ls/nrm/zloss.
+            clip_tag = ""
+            if _clip_groups is not None:
+                _cg = _clip_groups
+                clip_tag = (f" | gn_body: {_cg['body']:.4f} | gn_head: {_cg['head']:.4f}"
+                            f" | gn_emb: {_cg['emb']:.4f} | gn_other: {_cg['other']:.4f}"
+                            f" | clip_c: {_cg['clip_coef']:.4f}")
+            # Body relative-step pdr (effective-LR for the annealing experiment, Math Brief #6).
+            # Slow-moving; sourced from the periodic diagnostics snapshot, so it repeats between
+            # diag steps. Shows "pending" until the first diagnostics step (every val_step)
+            # produces a value — so the blank early field doesn't read as broken.
+            pdr_tag = (f" | pdr: {_live_body_pdr:.3e}" if _live_body_pdr is not None
+                       else " | pdr: pending")
             logger.print_and_log(
-                f"st: {step:5d} | ls: {main_loss_val:.6f} | ppl: {ppl:.2f} | lr: {lr:.4e} | nrm: {norm:.4f} [{clip_value:.1f}] | dt: {dt:.2f}s | t_tk: {total_tokens_processed:11,d} | tok/s: {tokens_per_sec:.0f} | MFU: {mfu:.0f}%{bal_tag}{drp_tag}{trunc_tag}{scs_tag}{tot_tag}{aux_tag}{z_tag}{rc_tag}{sched_tag}",
+                f"st: {step:5d} | ls: {main_loss_val:.6f} | ppl: {ppl:.2f} | lr: {lr:.4e} | nrm: {norm:.4f} [{clip_value:.1f}] | dt: {dt:.2f}s | t_tk: {total_tokens_processed:11,d} | tok/s: {tokens_per_sec:.0f} | MFU: {mfu:.0f}%{bal_tag}{drp_tag}{trunc_tag}{scs_tag}{tot_tag}{aux_tag}{z_tag}{rc_tag}{gpm_tag}{clip_tag}{pdr_tag}{sched_tag}",
             )
 
             _sched_silent = f"|z_a_eff={zloss_alpha_eff:.6e}|rc_s={rc_s_eff:.6f}" if sched_tag else ""
@@ -2186,7 +2558,11 @@ def train_loop(
 
             # Guardrail 5: transition health guard — grad-norm part (per logged
             # step). WARNING only; never auto-acts. _hg_nrm_run tracks repeats.
-            if health_guard_on:
+            # Suppressed during the warmup window (health_guard_warmup_steps, default
+            # 100): a from-scratch / freshly-resumed run always has high grad-norm
+            # while LR ramps from ~0, so warning every step there is pure noise that
+            # trains you to ignore the line before a REAL spike appears.
+            if health_guard_on and step >= health_guard_warmup_steps:
                 if norm > 3.0:
                     _hg_nrm_run += 1
                 else:
@@ -2399,6 +2775,17 @@ def train_loop(
                     cg_data=cg_diag,
                 )
                 diagnostics.print_summary(snapshot, logger, awd_data=awd_diag, moe_data=moe_diag)
+                # Cache body relative-step pdr = ||dW||/||W|| for the status line (Math Brief #6
+                # annealing experiment). Median over all attn+ffn layers; same value as
+                # diagnostics.jsonl. Held until the next diag step (pdr is slow-moving).
+                try:
+                    _pdrs = [r for l in snapshot.layers for r in
+                             (l.attn.param_delta_ratio, l.ffn.param_delta_ratio) if r is not None]
+                    if _pdrs:
+                        _pdrs.sort()
+                        _live_body_pdr = _pdrs[len(_pdrs) // 2]
+                except Exception:
+                    pass
                 if cg_diag is not None and ddp_rank == 0:
                     _lzc = cg_diag.get('logZ_c')
                     _lzc_tag = f" logZ_c={_lzc:.2f}" if _lzc is not None else ""
@@ -4530,6 +4917,14 @@ if __name__ == "__main__":
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         # torch.set_float32_matmul_precision('high')  # or 'medium' - This isn't helpful for bf16/fp16
+        # PROBE (WD_NO_TF32=1): force TRUE IEEE fp32 matmul (TF32 has only ~10 mantissa bits,
+        # so a "fp32" run with TF32 on is NOT full precision). Needed to truly rule precision
+        # out of the body-ramp lean (Math Agent #5). Unset => normal TF32 behaviour.
+        if os.environ.get('WD_NO_TF32') == '1':
+            torch.backends.cuda.matmul.allow_tf32 = False
+            torch.backends.cudnn.allow_tf32 = False
+            torch.set_float32_matmul_precision('highest')
+            logger.print_and_log("  ] WD_NO_TF32: TF32 DISABLED — true IEEE fp32 matmul")
     
     # Use MASTER_ADDR from environment (same as DDP uses)
     master_addr = os.environ.get('MASTER_ADDR', 'localhost')
@@ -4885,7 +5280,12 @@ if __name__ == "__main__":
         )
 
     # ----------------------- Log row-center head (gauge subtraction) ----------
-    if getattr(settings, 'row_center_head', False) and ddp_rank == 0:
+    # Gate on the NORMALISED enabled flag, not the raw config: row_center_head is now a
+    # dict ({enabled: false}) and a non-empty dict is TRUTHY, so `getattr(...)` alone
+    # printed this banner even when disabled — a lying boot log (esp. dangerous since
+    # row-centering has killed runs). Use the same _row_center_cfg()['enabled'] the
+    # feature itself reads.
+    if _row_center_cfg(settings)['enabled'] and ddp_rank == 0:
         logger.print_and_log(f"Row-Center Head (gauge subtraction):")
         logger.print_and_log(
             f"  ] operation      = W <- W - 1 mu^T (mu = global vocab-row mean), full projection from step 0"
@@ -4943,6 +5343,8 @@ if __name__ == "__main__":
         cautious_weight_decay=getattr(settings, 'cautious_weight_decay', False),
         muonsphere_radius_scale=getattr(settings, 'muonsphere_radius_scale', 2.0),
         muonsphere_power_iters=getattr(settings, 'muonsphere_power_iters', 10),
+        tangent_project=getattr(settings, 'tangent_project', False),
+        tangent_project_preserve_norm=getattr(settings, 'tangent_project_preserve_norm', False),
         dion2_fraction=getattr(settings, 'dion2_fraction', 0.25),
         dion2_ef_decay=getattr(settings, 'dion2_ef_decay', 0.95),
         adam16bit_state_dtype=getattr(settings, 'adam16bit_state_dtype', 'mixed'),
