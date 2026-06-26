@@ -1,0 +1,171 @@
+# kv3 — KeelHaul v3: tangent projection + FFN-only pdr FEEDBACK controller.
+# kv2 used an open-loop lr_mods schedule to anneal the body LR. It worked but plateaued
+# hot (~2.8e-3) because the plant gain K=pdr/mult drifts UP (+13% FFN over 300M tok) while
+# the schedule cut mult — the two nearly cancel, so pdr never descended toward target.
+# kv3 closes the loop: a feedforward controller drives FFN pdr to a reference trajectory
+# (m = r(t)/K_ema), measuring K live so it pulls exactly as hard as needed. Attention is left
+# at m=1.0 (QK-norm already gives wq/wk forward scale-invariance = "tangent projection for
+# free"). One variable changed vs kv2: lr_mods (open-loop) -> ffn_pdr_controller (closed-loop).
+# Full design + validation: docs/KV3_CONTROLLER_DESIGN.md (Code <-> Math, Briefs #7 + Q8).
+run_name: kv3
+
+# Training settings
+ga_schedule:
+  - [0, 150_000]
+  - [4_000, 250_000]
+  - [8_000, 500_000]
+  - [17_000, 1_000_000]
+  - [20_000, 2_000_000]
+  - [24_000, 3_000_000]
+B: 8                          # Batch size per GPU
+T: 2048                       # Context size (sequence length)
+
+max_steps: 200_000            # Maximum number of training steps
+eval_iters: 2                 # Number of iterations for evaluation x ranks
+val_step: 100                 # Validation step frequency (also the controller's cadence)
+save_step: 500                # Checkpoint saving frequency in steps
+
+# Data type settings
+data_type: bf16
+FSDP_param_dtype: bf16
+FSDP_reduce_dtype: bf16
+FSDP_buffer_dtype: bf16
+reshard_after_forward: false
+
+# Resume training settings — kv3 is a FROM-SCRATCH run (clean single-variable test vs kv2).
+resume_training: false
+resume_step: 0
+resume_data_reset: continue
+
+# Gradient clipping
+clip_warmup: 3.0
+clip_standard: 2.0
+track_gpm: true
+track_clip_groups: true
+
+# kv3 investigation: log per-subgroup pdr (wq/wk vs wv/wo, w1/w3 vs w2) to test the QK-norm
+# hypothesis (attn quiet only because wq/wk are scale-invariant?) and whether to eventually
+# control SwiGLU in-proj only vs all-FFN. Opt-in (~doubles transient snapshot VRAM at val cadence).
+track_subgroup_pdr: true
+
+row_center_head:
+  enabled: false
+
+transition_health_guard: true
+health_guard_warmup_steps: 1000
+
+# Tokenizer settings
+tok_kind: llama
+tok_path: ../tokenizers/llama_tokenizer
+special_tokens: ../../notebooks/datasets/tokenized/llama/tokenizer_config.json
+
+# Model architecture (identical to kv2)
+use_keel: true
+keel_alpha: null
+cfg_layers: 75
+cfg_heads: 32
+cfg_kv_heads: 16
+cfg_embd: 2048
+cfg_intermediate: 7560
+multiple_of: 128
+norm_eps: 1.0e-05
+dropout: 0.0
+use_activation_checkpointing: true
+qk_norm_mode: "before_rope"
+tie_word_embeddings: false
+rope_theta: 500000.0
+
+# Compilation settings
+compile_model: true
+compile_mode: default
+
+# Learning rate schedule — UNCHANGED from kv2 (Math: do NOT lower global max_lr preemptively;
+# the controller reveals whether base LR is too high via its floor+alarm).
+lr_schedule_type: "cosine"
+max_lr: 3.5e-04
+min_lr: 3.5e-05
+warmup_steps: 1500
+
+# === FFN-only pdr FEEDBACK CONTROLLER (the kv3 experiment) ============================
+# Replaces kv2's open-loop `lr_mods` body anneal. Controls ONLY the FFN body matrices
+# (feed_forward.w1/w2/w3); attention is left at m=1.0. Feedforward inversion m = r(t)/K_ema
+# (K measured live as pdr/m, log-EMA smoothed); PI trim present but OFF for run 1 (sim showed
+# feedforward-only suffices and is cleaner). Engages after warmup (step 1500); m in [floor,1];
+# asymmetric rate limit (cool fast, reheat slow). Reference = smooth "dn2_merge": ride kv2's
+# productive early plasticity, then blend onto DN2's proven FFN glide by ~575M tok.
+# Validated offline: tools/pdr_controller_sim.py (no freeze/alarm across 15 K-scenarios).
+# MUST NOT be combined with adaptive_wd (AWD moves ||W|| = pdr's denominator).
+# NOTE (WD coupling): lr_scale in the Muon optimizer scales BOTH the update AND the weight-decay
+# term (effective_lr = lr*lr_scale feeds both). So when the controller cools m, the FFN's WD is
+# cooled by the same factor. This is benign here: (a) kv2's open-loop lr_mods had the identical
+# coupling, so it's NOT a new confound vs kv2; (b) WD=0.002 is tiny; (c) both effects LOWER pdr
+# (less update AND less ||W|| shrink -> higher ||W|| -> lower pdr), so they're aligned with the
+# controller's goal. m is therefore an LR-dominant (not pure-LR) angular-step lever. See
+# docs/KV3_CONTROLLER_DESIGN.md.
+ffn_pdr_controller:
+  enabled: true
+  warmup_step: 1500           # m=1.0, loop frozen, until LR-cap; then engage
+  cadence: 100                # informational; actual cadence = val_step (diagnostic steps)
+  m_floor: 0.30               # hard floor (lr_scale=0 would FREEZE the body); + alarm below
+  m_max: 1.0                  # never amplify body LR above base
+  k_ema_alpha: 0.15           # log-space EMA on K = pdr/m
+  pdr_ema_alpha: 0.15         # EMA on observed pdr (for the log-error trim)
+  rate_down: 0.05             # max 5%/update cooling
+  rate_up: 0.02               # max 2%/update reheating (don't chase noise upward)
+  # PI trim — OFF for run 1 (feedforward only). Enable later only if live tracking shows
+  # persistent bias feedforward can't remove.
+  kp: 0.0
+  ki: 0.0
+  kd: 0.0
+  integral_clamp: 0.5
+  # Reference: smooth alpha-blend (smoothstep merge_start -> merge_end) of kv2-early -> DN2-FFN.
+  # dn2_ffn_knots = DN2's ACTUAL recorded FFN-median pdr sampled out to the ~26B-token run horizon
+  # (the run goes well past 1B tok; an earlier 5-knot curve ending at [1000,2.20e-3] flat-lined the
+  # setpoint at 2.20e-3 for ~97% of the run, ~75% above DN2's true late ~1.26e-3 — a fidelity bug
+  # the 850M-horizon sim missed). Past the last knot _interp holds DN2's late plateau (~1.26e-3),
+  # which DN2's own curve flattened to — faithful.
+  reference:
+    merge_start_tok_m: 197     # alpha=0 at LR-cap (ride kv2 early)
+    merge_end_tok_m: 575       # alpha=1 (fully on DN2's FFN glide)
+    kv2_early_knots: [[197, 3.42e-3], [400, 3.10e-3], [600, 2.90e-3]]
+    dn2_ffn_knots:   [[197, 1.66e-3], [393, 2.94e-3], [590, 2.58e-3], [787, 2.28e-3],
+                      [1000, 2.20e-3], [2000, 1.85e-3], [4000, 1.64e-3], [8000, 1.38e-3],
+                      [12000, 1.30e-3], [16000, 1.28e-3], [20000, 1.23e-3], [26000, 1.26e-3]]
+  # Guardrails (advisory; logged on the [ffn-ctrl] line)
+  authority_low_m: 0.5         # m below this before the merge region -> inspect flag
+  alarm_pdr_ratio: 1.1         # m=floor AND pdr>1.1*r for N samples -> base-LR-too-high alarm
+  alarm_consecutive: 3
+# ======================================================================================
+
+# Optimizer settings — UNCHANGED from kv2
+optimizer_type: normuon_fsdp2
+beta1: 0.9
+beta2: 0.95
+weight_decay: 0.002
+muon_momentum: 0.95
+muon_ns_steps: 5
+normuon_beta2: 0.99
+
+# Tangent projection — UNCHANGED from kv2 (radial hygiene; the controller restores the anneal)
+tangent_project: true
+tangent_project_preserve_norm: false
+
+data_root_path: ../../notebooks/datasets/tokenized/llama/
+groups:
+   - [stories,      [[0, 25.0]]]
+   - [ao3,          [[0, 25.0]]]
+   - [books,        [[0, 25.0]]]
+   - [preselect,    [[0, 7.0]]]
+   - [code_python,  [[0, 6.0]]]
+   - [code_c,       [[0, 6.0]]]
+   - [edufineweb_1.5TT, [[0, 6.0]]]
+
+# Logging settings
+gen_log_file: gen_log.txt
+train_log_file: train_log.txt
+val_log_file: val_log.txt
+server_port: 8888
+
+# Checkpoint Paths
+nas_root: /home/josef/brainbox/checkpoints/current/
+local_checkpoint_root: ~/checkpoints/

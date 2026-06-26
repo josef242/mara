@@ -1315,6 +1315,7 @@ def train_loop(
         wd_overrides: dict = None,
         lr_scale_overrides: dict = None,
         awd=None,
+        body_lr_ctrl=None,
         moe_balance_hook=None,
     ):
 
@@ -1417,6 +1418,34 @@ def train_loop(
         id(p) for n, p in (model._orig_mod if hasattr(model, '_orig_mod') else model).named_parameters()
         if _clip_group_of(n) == 'body'
     }
+
+    # FFN-only pdr controller (kv3, docs/KV3_CONTROLLER_DESIGN.md): the body subset it
+    # actuates = the dense feed_forward Muon matrices (w1/w2/w3). Built like
+    # _body_param_ids_for_pdr but FFN-only; strips _orig_mod for torch.compile naming. The
+    # controller object (body_lr_ctrl) is constructed in main() and threaded in; here we
+    # resolve which params its held multiplier is written to. Inert when disabled.
+    _ffn_param_ids_for_ctrl = {
+        id(p) for n, p in (model._orig_mod if hasattr(model, '_orig_mod') else model).named_parameters()
+        if (lambda _n: _n.endswith('.weight') and any(
+            s in _n for s in ('feed_forward.w1', 'feed_forward.w2', 'feed_forward.w3'))
+            )(n.replace('_orig_mod.', ''))
+    }
+    # Controller is DENSE-FFN-only: it ACTUATES feed_forward.w1/w2/w3 but OBSERVES the diagnostics
+    # FFN-aggregate pdr, which under MoE is the EXPERT params — a measure/actuate mismatch (and the
+    # actuated set would be empty). Fail loudly rather than silently steer with no authority.
+    if body_lr_ctrl is not None and body_lr_ctrl.enabled:
+        if getattr(model_cfg, 'moe_enabled', False):
+            raise RuntimeError(
+                "ffn_pdr_controller is dense-FFN-only (actuates feed_forward.w1/w2/w3) but the model "
+                "is MoE — its observed FFN pdr would be expert params it cannot actuate. Disable the "
+                "controller or run a dense-FFN config.")
+        if not _ffn_param_ids_for_ctrl:
+            raise RuntimeError(
+                "ffn_pdr_controller enabled but found 0 dense feed_forward.w1/w2/w3 params to "
+                "actuate — the controller would have no authority. Check the model topology.")
+        if ddp_rank == 0:
+            logger.print_and_log(
+                f"  FFN pdr controller: actuating {len(_ffn_param_ids_for_ctrl)} dense FFN matrices")
 
     # ── SCS (Scaffolded Cascading Supervision) per-loop state ───────────────
     # Active when `auxiliary_heads.compute_inactive_layers: false`. The trainer
@@ -1985,6 +2014,17 @@ def train_loop(
                 for _p in _params:
                     lr_scale_overrides[id(_p)] = _aux_scale
 
+        # FFN pdr controller (kv3): write the controller's HELD FFN multiplier into the
+        # lr_scale side-dict for the FFN body params. Placed AFTER the SCS block so SCS can't
+        # clobber it, and before optimizer.step. The held value is refreshed at diagnostic
+        # cadence by body_lr_ctrl.observe(...) near the [body-pdr] line. Inert when disabled
+        # (current_multiplier() == 1.0). When enabled, the controller OWNS the FFN lr_scale
+        # (it runs after the lr_mods write at 1909, so it wins for FFN params by design).
+        if body_lr_ctrl is not None and body_lr_ctrl.enabled and lr_scale_overrides is not None:
+            _m_ffn = body_lr_ctrl.current_multiplier()
+            for _pid in _ffn_param_ids_for_ctrl:
+                lr_scale_overrides[_pid] = _m_ffn
+
         # AWD: compute gradient norms and update multipliers (every check_interval steps)
         awd_updated = False
         if awd is not None and not is_truncated:
@@ -2422,10 +2462,17 @@ def train_loop(
         #if device_type == "cuda":
         #    torch.cuda.synchronize()
 
+        # Token accounting MUST advance identically on EVERY rank: the FFN pdr controller
+        # (kv3) reads total_tokens_processed as its reference clock (observe -> reference(tok_m)),
+        # and a rank-0-only counter would make the controller's per-rank FFN lr_scale writes
+        # diverge and desync the sharded optimizer. The increment is deterministic and identical
+        # across ranks (config/schedule-derived, no per-rank data), so no collective is needed.
+        # (Previously this lived inside the rank-0 gate — harmless when only rank 0 logged it.)
+        tokens_per_step = (train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size)
+        total_tokens_processed += tokens_per_step
+
         if ddp_rank == 0:
             dt = time.time() - t0
-            tokens_per_step = (train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size)
-            total_tokens_processed += tokens_per_step
             tokens_per_sec = tokens_per_step / dt
 
             mfu = compute_mfu(tokens_per_sec, flops_per_token, ddp_world_size, settings.data_type) * 100
@@ -2805,6 +2852,44 @@ def train_loop(
                                 f"| body_lr_mult={_bmult:.3f}")
                     except Exception:
                         pass
+                # FFN pdr controller (kv3): feed the FFN-median pdr at this diagnostic cadence.
+                # MUST run on ALL ranks with the identical all-reduced param_delta_ratio so
+                # body_lr_ctrl.m stays bit-identical across ranks — the per-step actuator write
+                # applies m on every rank, and any cross-rank drift would desync the optimizer.
+                # (snapshot is built on all ranks; param_delta_ratio is post-all_reduce.) Log r0 only.
+                if body_lr_ctrl is not None and body_lr_ctrl.enabled:
+                    try:
+                        # Drop None AND NaN (x == x is False for NaN) so one bad layer can't make
+                        # the median NaN; the controller additionally rejects non-finite _fmed_c.
+                        _ffn_pdr = [l.ffn.param_delta_ratio for l in snapshot.layers
+                                    if l.ffn.param_delta_ratio is not None
+                                    and l.ffn.param_delta_ratio == l.ffn.param_delta_ratio]
+                        _fmed_c = sorted(_ffn_pdr)[len(_ffn_pdr) // 2] if _ffn_pdr else None
+                        body_lr_ctrl.observe(step, total_tokens_processed / 1e6, _fmed_c)
+                        if ddp_rank == 0:
+                            _ln = body_lr_ctrl.log_line()
+                            if _ln:
+                                logger.print_and_log(_ln)
+                            # Surface guardrails as prominent HEALTH WARNING lines (parallel to the
+                            # geometry guard) so an out-of-authority controller isn't buried inline.
+                            if body_lr_ctrl.alarm:
+                                logger.print_and_log(
+                                    f"  [HEALTH WARNING @ {step}] FFN-ctrl base-LR-too-high: m pinned "
+                                    f"at floor {body_lr_ctrl.m_floor} while pdr_ffn > "
+                                    f"{body_lr_ctrl.alarm_pdr_ratio}*r for {body_lr_ctrl.alarm_consecutive}+ "
+                                    f"samples — lower base body/FFN LR (advisory).")
+                            elif body_lr_ctrl.inspect:
+                                logger.print_and_log(
+                                    f"  [HEALTH WARNING @ {step}] FFN-ctrl m={body_lr_ctrl.m:.3f} < "
+                                    f"{body_lr_ctrl.authority_low_m} before the merge region — inspect (advisory).")
+                    except Exception as _e:
+                        # Do NOT silently swallow: a raising observe() means m is HELD (stale) and
+                        # the controller has stopped controlling. Inputs are all-reduce-identical so
+                        # this raises identically on every rank (no divergence) — log it loudly.
+                        if ddp_rank == 0:
+                            logger.print_and_log(
+                                f"  [ffn-ctrl] observe FAILED @ {step}: {type(_e).__name__}: {_e} — "
+                                f"m HELD at {body_lr_ctrl.m:.3f}, controller STALLED")
                 if cg_diag is not None and ddp_rank == 0:
                     _lzc = cg_diag.get('logZ_c')
                     _lzc_tag = f" logZ_c={_lzc:.2f}" if _lzc is not None else ""
@@ -2853,7 +2938,7 @@ def train_loop(
                     "start_step": row_center_warmup_start,
                     "duration": int(_rc_warmup.get('duration_steps', 0)),
                 }
-            save_model(model, optimizer, model_cfg, step, ddp_rank, ddp_local_rank, train_loader, total_tokens_processed, settings, awd=awd, rc_warmup_state=_rc_ws)
+            save_model(model, optimizer, model_cfg, step, ddp_rank, ddp_local_rank, train_loader, total_tokens_processed, settings, awd=awd, body_lr_ctrl=body_lr_ctrl, rc_warmup_state=_rc_ws)
 
 # -------------------------- Checkpointing and Resuming --------------------------
 # Helper function to get the seeds for all random number generators
@@ -2867,7 +2952,7 @@ def get_rank_rng_state():
     return checkpoint_data
 
 # Save the model, optimizer state, RNG state, trainloader state, etc.
-def save_model(model, optimizer, model_config, step, ddp_rank, ddp_local_rank, train_loader, total_tokens_processed, settings, awd=None, rc_warmup_state=None):
+def save_model(model, optimizer, model_config, step, ddp_rank, ddp_local_rank, train_loader, total_tokens_processed, settings, awd=None, body_lr_ctrl=None, rc_warmup_state=None):
     # DEBUG: Print rank info at the very start
     logger.print_and_log("SAVE_MODEL: Starting checkpoint save...")
     os.makedirs(settings.local_checkpoint_dir, exist_ok=True)               # Ensure the checkpoint directory exists
@@ -3077,6 +3162,12 @@ def save_model(model, optimizer, model_config, step, ddp_rank, ddp_local_rank, t
         torch.save(awd.state_dict(), awd_path)
         logger.print_and_log(f"  ] AWD state saved")
 
+    # Save FFN pdr controller state (rank 0 only — bit-identical across ranks). Mirrors AWD.
+    if body_lr_ctrl is not None and getattr(body_lr_ctrl, 'enabled', False) and ddp_rank == 0:
+        ctrl_path = os.path.join(settings.local_checkpoint_dir, f"bodylr_state_step_{step:06d}.pt")
+        torch.save(body_lr_ctrl.state_dict(), ctrl_path)
+        logger.print_and_log(f"  ] FFN-ctrl state saved")
+
     # Save row-center WARMUP targets (Guardrail 1). The target-gauge schedule
     # anchors to the gauge captured at warmup start (mu0/mbar0); a 200-step warmup
     # spans checkpoints, so on resume we MUST restore these rather than recapture
@@ -3135,7 +3226,7 @@ def trigger_checkpoint_sync(settings, ddp_rank, step=None):
         logger.print_and_log(f"  ] [R{ddp_rank}] WARNING: checkpoint sync failed: {e}", False)
 
 # Resume the state of our model and training environment for all of our processes
-def resume_training(model, optimizer, train_loader, ddp_rank, settings, grad_accum_schedule, awd=None):
+def resume_training(model, optimizer, train_loader, ddp_rank, settings, grad_accum_schedule, awd=None, body_lr_ctrl=None):
     logger.print_and_log(f"Resuming training from {settings.resume_checkpoint_path}:")
 
     torch.cuda.empty_cache()        # Clear out GPU memory to reduce fragmentation
@@ -3430,6 +3521,16 @@ def resume_training(model, optimizer, train_loader, ddp_rank, settings, grad_acc
             logger.print_and_log(f"  ] AWD state restored", r0_only=True)
         else:
             logger.print_and_log(f"  ] AWD state not found — starting fresh", r0_only=True)
+
+    # STEP 3c: RESTORE FFN pdr controller state (if available). Mirrors AWD: all ranks load
+    # the identical state; missing file is non-fatal (controller starts fresh at m=1.0).
+    if body_lr_ctrl is not None and getattr(body_lr_ctrl, 'enabled', False):
+        ctrl_path = os.path.join(pth, f"bodylr_state_step_{shard_step:06d}.pt")
+        if os.path.exists(ctrl_path):
+            body_lr_ctrl.load_state_dict(torch.load(ctrl_path, weights_only=True))
+            logger.print_and_log(f"  ] FFN-ctrl state restored", r0_only=True)
+        else:
+            logger.print_and_log(f"  ] FFN-ctrl state not found — starting fresh", r0_only=True)
 
     # ---------------------------------------------------------------------------
     # Restore row-center WARMUP targets (Guardrail 1). If a checkpoint was saved
@@ -4581,6 +4682,53 @@ class Settings:
             if not self.adaptive_wd.get('enabled', False):
                 self.adaptive_wd = None
 
+        # --- ffn_pdr_controller: FFN-only pdr feedback controller (kv3) ---
+        # Restores the relative-LR anneal via FFN angular-step control. Collapse to None
+        # unless enabled; light validation (full semantics in body_lr_controller.py).
+        # docs/KV3_CONTROLLER_DESIGN.md. MUST NOT coexist with AWD (AWD moves ||W|| = pdr's
+        # denominator) — they're mutually exclusive controllers on the body.
+        if not hasattr(self, 'ffn_pdr_controller'):
+            self.ffn_pdr_controller = None
+        elif isinstance(self.ffn_pdr_controller, dict):
+            if not self.ffn_pdr_controller.get('enabled', False):
+                self.ffn_pdr_controller = None
+            else:
+                _c = self.ffn_pdr_controller
+                _mf = _c.get('m_floor', 0.30)
+                if not isinstance(_mf, (int, float)) or not (0.0 < float(_mf) <= 1.0):
+                    fatal_error(f"ffn_pdr_controller.m_floor must be in (0,1], got {_mf!r}")
+                _mx = float(_c.get('m_max', 1.0))
+                if _mx > 1.0:
+                    fatal_error("ffn_pdr_controller.m_max must be <= 1.0 (no body-LR amplification)")
+                if float(_mf) > _mx:
+                    fatal_error(f"ffn_pdr_controller.m_floor ({_mf}) must be <= m_max ({_mx}) — "
+                                "else the output clamp pins m above m_max.")
+                for _ak in ('k_ema_alpha', 'pdr_ema_alpha'):
+                    _av = float(_c.get(_ak, 0.15))
+                    if not (0.0 < _av <= 1.0):
+                        fatal_error(f"ffn_pdr_controller.{_ak} must be in (0,1], got {_av}")
+                if not (0.0 <= float(_c.get('rate_down', 0.05)) < 1.0):
+                    fatal_error("ffn_pdr_controller.rate_down must be in [0,1)")
+                if float(_c.get('rate_up', 0.02)) < 0.0:
+                    fatal_error("ffn_pdr_controller.rate_up must be >= 0")
+                _ref = _c.get('reference')
+                if _ref is not None and not isinstance(_ref, dict):
+                    fatal_error("ffn_pdr_controller.reference must be a dict")
+                if self.adaptive_wd is not None:
+                    fatal_error("ffn_pdr_controller and adaptive_wd are mutually exclusive "
+                                "(AWD moves ||W||, the denominator of pdr) — enable only one.")
+                # SCS (auxiliary_heads with compute_inactive_layers:false) freezes FFN params via
+                # lr_scale=0 during scaffold; the controller's per-step FFN lr_scale write (which
+                # runs after the SCS block) would un-freeze them. Mutually exclude, like AWD.
+                _ah = getattr(self, 'auxiliary_heads', None)
+                if isinstance(_ah, dict) and _ah.get('enabled', False) \
+                        and not _ah.get('compute_inactive_layers', True):
+                    fatal_error("ffn_pdr_controller and SCS (auxiliary_heads compute_inactive_layers"
+                                ":false) are mutually exclusive — the controller would un-freeze "
+                                "SCS-frozen FFN params.")
+        elif self.ffn_pdr_controller is not None:
+            fatal_error(f"ffn_pdr_controller must be a dict, got {type(self.ffn_pdr_controller).__name__}")
+
         # --- auxiliary_heads: intermediate-depth prediction heads ---
         # Validated lightly here; full parse happens in parse_aux_heads_config
         # at trainer setup time (needs n_layers from model_cfg to range-check).
@@ -5429,6 +5577,19 @@ if __name__ == "__main__":
         if ddp_rank == 0:
             logger.print_and_log(f"Adaptive WD: {len(awd.groups)} groups, check every {awd.check_interval} steps")
 
+    # ----------------------- FFN pdr controller (kv3) -----------------------
+    # Restores the relative-LR anneal tangent projection removed, by controlling FFN body
+    # angular step size (pdr) toward a reference. Inert unless ffn_pdr_controller.enabled.
+    # docs/KV3_CONTROLLER_DESIGN.md. Reads/writes the SAME lr_scale_overrides the optimizer uses.
+    body_lr_ctrl = None
+    if getattr(settings, 'ffn_pdr_controller', None) is not None:
+        from body_lr_controller import BodyLRController
+        body_lr_ctrl = BodyLRController(settings.ffn_pdr_controller)
+        if ddp_rank == 0 and body_lr_ctrl.enabled:
+            logger.print_and_log(
+                f"FFN pdr controller: ENABLED (warmup_step={body_lr_ctrl.warmup_step}, "
+                f"m_floor={body_lr_ctrl.m_floor}, FF-only={not body_lr_ctrl.pid.active})")
+
     # ----------------------- MoE load balancing hook -----------------------
     moe_balance_hook = None
     moe_stats = [None]  # populated each step by balance hook (list for closure mutation)
@@ -5517,7 +5678,7 @@ if __name__ == "__main__":
     # ----------------------- Optionally Resume Training  -----------------------
     total_tokens_processed = 0
     if settings.resume_training:
-        start_step, total_tokens_processed = resume_training(model, optimizer, train_loader, ddp_rank, settings, grad_accum_schedule, awd=awd)
+        start_step, total_tokens_processed = resume_training(model, optimizer, train_loader, ddp_rank, settings, grad_accum_schedule, awd=awd, body_lr_ctrl=body_lr_ctrl)
 
     # ----------------------- Optionally compile the model -----------------------
     if settings.compile_model:
@@ -5530,7 +5691,8 @@ if __name__ == "__main__":
     dist.barrier()  # Ensure all processes are synchronized before starting training
 
     # ----------------------- Create layer diagnostics tracker -----------------------
-    diagnostics = LayerDiagnostics(model, ddp_rank, ddp_world_size, ddp)
+    diagnostics = LayerDiagnostics(model, ddp_rank, ddp_world_size, ddp,
+                                   track_subgroups=bool(getattr(settings, 'track_subgroup_pdr', False)))
     if diagnostics._init_message:
         logger.print_and_log(f"[Diagnostics] {diagnostics._init_message}")
     logger.print_and_log(f"Layer diagnostics enabled - will log to {settings.nas_path}diagnostics.jsonl")
@@ -5568,6 +5730,7 @@ if __name__ == "__main__":
         wd_overrides=wd_overrides,
         lr_scale_overrides=lr_scale_overrides,
         awd=awd,
+        body_lr_ctrl=body_lr_ctrl,
         moe_balance_hook=moe_balance_hook,
     )
 

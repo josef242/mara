@@ -52,6 +52,15 @@ Split the attention/FFN aggregate into:
 Cheap change in diagnostics.py (per-projection grouping in `_get_attention_params`/`_get_ffn_params`
 snapshot keys). Does not affect kv2 (running old code); lands on kv3.
 
+## Known coupling: lr_scale also scales weight decay
+The Muon optimizer's `effective_lr = lr · lr_scale` multiplies **both** the update and the WD term.
+So cooling `m` cools the FFN's WD by the same factor — `m` is an **LR-dominant**, not pure-LR, lever.
+This is benign and not a new confound vs kv2: (a) kv2's open-loop `lr_mods` had the *identical*
+coupling; (b) WD=0.002 is tiny; (c) both effects *lower* pdr (less update **and** less ‖W‖ shrink →
+higher ‖W‖ → lower pdr), so they're aligned with the controller's goal. If a future run wants pure-LR
+control, it would need a separate LR-only override path (not the WD-coupled lr_scale). Flagged by the
+failure-modes critic; documented rather than re-architected for run 1.
+
 ## Guardrails (live checks for kv3)
 - **Multiplier authority**: `m_ffn < 0.5` *before* the merge region → inspect. `m_ffn = m_floor` AND
   `pdr_ffn > 1.1·r(t)` for several samples → base FFN/body LR too high (controller out of authority) →
