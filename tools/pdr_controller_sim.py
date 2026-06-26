@@ -105,15 +105,21 @@ def _interp(curve, x):
 def make_reference(name, dn2, kv2_start_ffn):
     """r(tokM) FFN-pdr setpoint. All hold = kv2_start through warmup (engaged externally)."""
     if name == "dn2_merge":
-        # Ride kv2's hot early FFN, glide to REJOIN DN2's curve ~550M, then follow DN2 down.
-        # Anchored in real data: kv2 FFN ~3.42 @197M, DN2 FFN 2.94@393M -> 2.58@590 -> 2.28@787.
-        knots = [(197, kv2_start_ffn), (300, 3.20e-3), (450, 2.95e-3),
-                 (550, 2.70e-3)]  # merge point ~DN2
+        # SMOOTH alpha-blend (Math Q8 §7): r = (1-a)*r_kv2_early + a*r_DN2, with a(t) a
+        # smoothstep from 0 at LR-cap (197M) to 1 at the merge (~575M). Encodes the belief
+        # "kv2 early plasticity is good; DN2 late consolidation is good" — no piecewise cliff.
+        t0, t1 = 197.0, 575.0
+
+        def kv2_early(t):  # preserve early regime: near-hold w/ gentle decline
+            return _interp([(197, kv2_start_ffn), (400, 3.10e-3), (600, 2.90e-3)], t)
+
+        def alpha(t):
+            u = max(0.0, min(1.0, (t - t0) / (t1 - t0)))
+            return u * u * (3 - 2 * u)  # smoothstep (C1 continuous)
 
         def r(t):
-            if t <= 550:
-                return _interp(knots, t)
-            return _interp(dn2, t)  # follow DN2's actual glide thereafter
+            a = alpha(t)
+            return (1 - a) * kv2_early(t) + a * _interp(dn2, t)
         return r
     if name == "math_glide":
         # Math's example glide (Brief #7 §6): gentle, ends ~2.65e-3 @ 787M.
