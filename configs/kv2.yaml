@@ -32,8 +32,8 @@ FSDP_buffer_dtype: bf16
 reshard_after_forward: false
 
 # Resume training settings
-resume_training: false
-resume_step: 0
+resume_training: true
+resume_step: 1_000
 resume_data_reset: continue         # Modes are: continue (no reset), soft (reset pct window - change in pct), hard (reset all)
 
 # Gradient clipping
@@ -69,7 +69,7 @@ transition_health_guard: true
 # run always has high nrm while LR warms from ~0, so warning every step there is noise that
 # trains you to ignore the line before a REAL spike. Guard is for the steady state, not the
 # ramp. (Default is 100 even if unset; explicit here as an example / for easy tuning.)
-health_guard_warmup_steps: 150
+health_guard_warmup_steps: 1000
 
 # Tokenizer settings
 tok_kind: llama
@@ -102,23 +102,29 @@ max_lr: 3.5e-04
 min_lr: 3.5e-05                   # 1% floor
 warmup_steps: 1500                # Match paper's deep runs
 
-# === BODY-LR ANNEAL (the kv2 experiment — Math Agent Brief #6) =========================
-# Hypothesis: DN2's body-norm RAMP was acting as an implicit relative-LR anneal. As ‖W‖
-# grows in a scale-invariant body, pdr=‖dW‖/‖W‖ decays → the body consolidates late.
-# Tangent projection (kept ON) holds ‖W‖ flat → it ALSO removed that annealing, so KeelHaul
-# v1 ran like a high, NON-decaying body LR: won early (ahead of DN2 to ~450M), lost the
-# marathon (DN2 overtook ~500M, +0.21 nats by 800M). KH pdr climbed to 3.4e-3 while DN2's
-# peaked ~2.7e-3 @400M then decayed to 2.3e-3 @800M.
-# FIX: keep full projection + low WD, add an EXPLICIT delayed body-LR decay that reproduces
-# the anneal the ramp used to give for free. DELAYED (mult=1.0 until ~350M) to preserve KH's
-# real early lead; target ~0.67 by 800M (= DN2/KH pdr ratio 2.30/3.41).
-# Token→step (B=8, this ga_schedule): 350M≈2680, 600M≈4290, 800M≈5060, 1200M≈6580.
-# [all, all, sched] targets all body (attn+ffn) Muon matrices; linear interp between points.
-# Success criterion (NEW): body norms flat AND body pdr decays to ~2.3-2.6e-3 by 800M (watch
-# the live `pdr:` field on the status line). Do NOT raise WD (wrong sign: shrinking ‖W‖
-# RAISES pdr). Do NOT undo projection. See docs/MATH_AGENT_BRIEF_6_projection_removes_annealing.md.
+# === BODY-LR ANNEAL (the kv2 experiment — Math Agent Brief #6 + Q7) ====================
+# Hypothesis: DN2's body-norm RAMP was an implicit relative-LR anneal. As ‖W‖ grows in a
+# scale-invariant body, pdr=‖dW‖/‖W‖ decays → the body consolidates late. Tangent projection
+# (kept ON) holds ‖W‖ flat → it ALSO removed that anneal, so KeelHaul v1 ran like a high,
+# NON-decaying body LR: won early but its pdr climbed to ~3.2-3.4e-3 and stayed there, losing
+# the marathon (DN2 overtook ~500M, +0.21 nats by 800M). For a projected body pdr ≈ the body's
+# ANGULAR LR (ΔW⟂W ⇒ Δθ ≈ ‖dW‖/‖W‖), so sustaining 3.2e-3 late = the body keeps rotating
+# instead of settling.
+# FIX (Math Q7, Option A): hold mult=1.0 through the FULL warmup (step 1500 ≈ 197M tok — KH's
+# early high plasticity is valuable and its absolute pdr is still <DN2's later peak there), then
+# begin a LINEAR decay IMMEDIATELY at LR-cap. Anchor is "cap angular body movement near
+# 2.7-2.8e-3 then anneal", NOT "match DN2's cold early curve". Math's forward projection of this
+# schedule onto KH's pdr: 250M→2.75e-3, 400M→2.74e-3, 600M→2.56e-3, 800M→2.28e-3 — the desired
+# rise→plateau~2.7e-3→decay→2.3e-3 shape. (Earlier "delay to 2680/350M" left the body at max
+# effective LR too long after warmup.) Option C (decay DURING warmup) rejected — it confounds a
+# "lower body max LR" change into the clean "restore the anneal" test.
+# Token→step (B=8): 197M≈1500, 600M≈4290, 800M≈5060. Linear interp; [all,all] = body only.
+# Success criterion: body norms flat AND pdr plateaus ~2.7-2.8e-3 (250-430M) then decays to
+# ~2.3e-3 by 800M (watch the [body-pdr] diagnostics line). Do NOT raise WD (wrong sign: shrinks
+# ‖W‖ → RAISES pdr). Do NOT lower global max_lr in this run (confound; it also hits Adam groups
+# — test separately if Adam-group pdr also spikes at LR-cap). See docs/MATH_AGENT_Q7_anneal_timing.md.
 lr_mods:
-  - [all, all, [[0, 1.0], [2680, 1.0], [4290, 0.75], [5060, 0.67], [6580, 0.55]]]
+  - [all, all, [[0, 1.0], [1500, 1.0], [4290, 0.75], [5060, 0.67], [6580, 0.55]]]
 # ======================================================================================
 
 # Optimizer settings

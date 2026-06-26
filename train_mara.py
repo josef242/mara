@@ -426,13 +426,14 @@ class GPMTracker:
         return self._spearman(self._resid(nr_al), self._resid(dloss))
 
     def status_tag(self):
-        """' | gpm: +0.31/+0.25' (GPM-S/GPM-L) for the status line, or '' if not enough
-        history. No trend arrow: trending is read on the Dashboard (it plots both curves);
-        the status line stays compact. Format is byte-identical to the retrofit injector
-        so historical and live runs parse the same."""
+        """' | gpm: +0.31/+0.25' (GPM-S/GPM-L) for the status line, or ' | gpm: pending' until
+        there is enough history (<5 points). No trend arrow: trending is read on the Dashboard
+        (it plots both curves); the status line stays compact. Format is byte-identical to the
+        retrofit injector so historical and live runs parse the same (the Dashboard's numeric
+        regex simply skips 'pending')."""
         gs, gl = self._gpm(self.ws), self._gpm(self.wl)
         if gs is None and gl is None:
-            return ""
+            return " | gpm: pending"
         def f(v):
             return f"{v:+.2f}" if v is not None else " -- "
         return f" | gpm: {f(gs)}/{f(gl)}"
@@ -1407,11 +1408,15 @@ def train_loop(
     # see docs/PROBE_A_clip_replay_RESULTS.md). Folded into the existing clip pass → ~free.
     _clip_groups_cfg = bool(getattr(settings, 'track_clip_groups', False))
 
-    # Body relative-step pdr = ||dW||/||W|| on the status line — the effective-LR metric for the
-    # tangent-projection annealing experiment (Math Brief #6). Sourced from the periodic
-    # diagnostics snapshot (same number as diagnostics.jsonl, so live == dashboard), held between
-    # diag steps since pdr is slow-moving. Shown only once diagnostics have produced a value.
-    _live_body_pdr = None
+    # Body relative-step pdr = ||dW||/||W|| (effective-LR metric for the tangent-projection
+    # annealing experiment, Math Brief #6). Emitted as its own line on diagnostics/val steps
+    # (snapshot cadence — NOT per step). _body_param_ids_for_pdr lets the pdr line report the
+    # REAL applied body-LR mult (read from lr_scale_overrides for a body param). Body = attn/ffn
+    # Muon matrices, matching _clip_group_of (handles torch.compile's _orig_mod naming).
+    _body_param_ids_for_pdr = {
+        id(p) for n, p in (model._orig_mod if hasattr(model, '_orig_mod') else model).named_parameters()
+        if _clip_group_of(n) == 'body'
+    }
 
     # ── SCS (Scaffolded Cascading Supervision) per-loop state ───────────────
     # Active when `auxiliary_heads.compute_inactive_layers: false`. The trainer
@@ -2540,14 +2545,10 @@ def train_loop(
                 clip_tag = (f" | gn_body: {_cg['body']:.4f} | gn_head: {_cg['head']:.4f}"
                             f" | gn_emb: {_cg['emb']:.4f} | gn_other: {_cg['other']:.4f}"
                             f" | clip_c: {_cg['clip_coef']:.4f}")
-            # Body relative-step pdr (effective-LR for the annealing experiment, Math Brief #6).
-            # Slow-moving; sourced from the periodic diagnostics snapshot, so it repeats between
-            # diag steps. Shows "pending" until the first diagnostics step (every val_step)
-            # produces a value — so the blank early field doesn't read as broken.
-            pdr_tag = (f" | pdr: {_live_body_pdr:.3e}" if _live_body_pdr is not None
-                       else " | pdr: pending")
+            # NOTE: body pdr is NOT on the per-step line — it's a val_step-cadence quantity,
+            # emitted as its own [body-pdr] line in the diagnostics block below.
             logger.print_and_log(
-                f"st: {step:5d} | ls: {main_loss_val:.6f} | ppl: {ppl:.2f} | lr: {lr:.4e} | nrm: {norm:.4f} [{clip_value:.1f}] | dt: {dt:.2f}s | t_tk: {total_tokens_processed:11,d} | tok/s: {tokens_per_sec:.0f} | MFU: {mfu:.0f}%{bal_tag}{drp_tag}{trunc_tag}{scs_tag}{tot_tag}{aux_tag}{z_tag}{rc_tag}{gpm_tag}{clip_tag}{pdr_tag}{sched_tag}",
+                f"st: {step:5d} | ls: {main_loss_val:.6f} | ppl: {ppl:.2f} | lr: {lr:.4e} | nrm: {norm:.4f} [{clip_value:.1f}] | dt: {dt:.2f}s | t_tk: {total_tokens_processed:11,d} | tok/s: {tokens_per_sec:.0f} | MFU: {mfu:.0f}%{bal_tag}{drp_tag}{trunc_tag}{scs_tag}{tot_tag}{aux_tag}{z_tag}{rc_tag}{gpm_tag}{clip_tag}{sched_tag}",
             )
 
             _sched_silent = f"|z_a_eff={zloss_alpha_eff:.6e}|rc_s={rc_s_eff:.6f}" if sched_tag else ""
@@ -2775,17 +2776,35 @@ def train_loop(
                     cg_data=cg_diag,
                 )
                 diagnostics.print_summary(snapshot, logger, awd_data=awd_diag, moe_data=moe_diag)
-                # Cache body relative-step pdr = ||dW||/||W|| for the status line (Math Brief #6
-                # annealing experiment). Median over all attn+ffn layers; same value as
-                # diagnostics.jsonl. Held until the next diag step (pdr is slow-moving).
-                try:
-                    _pdrs = [r for l in snapshot.layers for r in
-                             (l.attn.param_delta_ratio, l.ffn.param_delta_ratio) if r is not None]
-                    if _pdrs:
-                        _pdrs.sort()
-                        _live_body_pdr = _pdrs[len(_pdrs) // 2]
-                except Exception:
-                    pass
+                # Body relative-step pdr = ||dW||/||W|| (Math Brief #6 annealing experiment).
+                # Emitted as its OWN line on diagnostics/val steps — it's a snapshot-cadence
+                # quantity (computed once per val_step), so it does NOT belong on the per-step
+                # status line where it would imply per-step resolution it doesn't have. Shows the
+                # measured median pdr (attn/ffn split) alongside the commanded body-LR mult, so the
+                # anneal is legible: watch pdr bend down after the lr_mult starts dropping (~st 2680).
+                if ddp_rank == 0:
+                    try:
+                        _att = [l.attn.param_delta_ratio for l in snapshot.layers if l.attn.param_delta_ratio is not None]
+                        _ffn = [l.ffn.param_delta_ratio for l in snapshot.layers if l.ffn.param_delta_ratio is not None]
+                        _all = sorted(_att + _ffn)
+                        if _all:
+                            _med = _all[len(_all) // 2]
+                            _amed = sorted(_att)[len(_att) // 2] if _att else float('nan')
+                            _fmed = sorted(_ffn)[len(_ffn) // 2] if _ffn else float('nan')
+                            # Commanded body-LR multiplier this step: read it straight from the
+                            # side-dict the optimizer actually uses (a body param's lr_scale), so
+                            # the displayed mult is the REAL applied value, not a re-derivation.
+                            _bmult = 1.0
+                            if lr_mod_entries and lr_scale_overrides is not None:
+                                for _p, _ in lr_mod_entries:
+                                    if id(_p) in _body_param_ids_for_pdr:
+                                        _bmult = lr_scale_overrides.get(id(_p), 1.0)
+                                        break
+                            logger.print_and_log(
+                                f"  [body-pdr] pdr={_med:.3e} (attn={_amed:.3e} ffn={_fmed:.3e}) "
+                                f"| body_lr_mult={_bmult:.3f}")
+                    except Exception:
+                        pass
                 if cg_diag is not None and ddp_rank == 0:
                     _lzc = cg_diag.get('logZ_c')
                     _lzc_tag = f" logZ_c={_lzc:.2f}" if _lzc is not None else ""
