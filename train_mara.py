@@ -2882,6 +2882,14 @@ def train_loop(
                                 logger.print_and_log(
                                     f"  [HEALTH WARNING @ {step}] FFN-ctrl m={body_lr_ctrl.m:.3f} < "
                                     f"{body_lr_ctrl.authority_low_m} before the merge region — inspect (advisory).")
+                            # Prolonged staleness = the controller has stopped controlling (pdr
+                            # measurement broken / disengaged). Surface it at HEALTH-WARNING severity
+                            # so a silently-frozen m isn't hidden behind an inline STALE suffix.
+                            if body_lr_ctrl._dropped >= 3:
+                                logger.print_and_log(
+                                    f"  [HEALTH WARNING @ {step}] FFN-ctrl STALLED: {body_lr_ctrl._dropped} "
+                                    f"consecutive dropped pdr samples — m HELD at {body_lr_ctrl.m:.3f}, "
+                                    f"controller not actuating. Check FFN pdr measurement.")
                     except Exception as _e:
                         # Do NOT silently swallow: a raising observe() means m is HELD (stale) and
                         # the controller has stopped controlling. Inputs are all-reduce-identical so
@@ -3529,6 +3537,14 @@ def resume_training(model, optimizer, train_loader, ddp_rank, settings, grad_acc
         if os.path.exists(ctrl_path):
             body_lr_ctrl.load_state_dict(torch.load(ctrl_path, weights_only=True))
             logger.print_and_log(f"  ] FFN-ctrl state restored", r0_only=True)
+        elif shard_step > body_lr_ctrl.warmup_step:
+            # Resuming PAST warmup with no controller state = the learned K and annealed m are lost;
+            # the controller restarts at m=1.0 and re-warms the FFN LR back up over several thousand
+            # steps, perturbing the very anneal the run is testing. Surface at HEALTH-WARNING severity.
+            logger.print_and_log(
+                f"  [HEALTH WARNING @ {shard_step}] FFN-ctrl state not found on a post-warmup resume "
+                f"— controller RESET to m=1.0; the FFN angular-LR anneal will transiently REHEAT.",
+                r0_only=True)
         else:
             logger.print_and_log(f"  ] FFN-ctrl state not found — starting fresh", r0_only=True)
 
@@ -4711,9 +4727,24 @@ class Settings:
                     fatal_error("ffn_pdr_controller.rate_down must be in [0,1)")
                 if float(_c.get('rate_up', 0.02)) < 0.0:
                     fatal_error("ffn_pdr_controller.rate_up must be >= 0")
+                _ws = int(_c.get('warmup_step', 1500))
+                _mxs = int(getattr(self, 'max_steps', 0) or 0)
+                if _ws < 0 or (_mxs and _ws >= _mxs):
+                    fatal_error(f"ffn_pdr_controller.warmup_step ({_ws}) must be in [0, max_steps) — "
+                                f"else the controller stays warmup-gated for the whole run.")
+                if int(_c.get('alarm_consecutive', 3)) < 1:
+                    fatal_error("ffn_pdr_controller.alarm_consecutive must be >= 1")
+                if float(_c.get('integral_clamp', 0.5)) < 0.0:
+                    fatal_error("ffn_pdr_controller.integral_clamp must be >= 0")
+                if float(_c.get('alarm_pdr_ratio', 1.1)) <= 0.0:
+                    fatal_error("ffn_pdr_controller.alarm_pdr_ratio must be > 0")
                 _ref = _c.get('reference')
                 if _ref is not None and not isinstance(_ref, dict):
                     fatal_error("ffn_pdr_controller.reference must be a dict")
+                if isinstance(_ref, dict):
+                    if float(_ref.get('merge_start_tok_m', 197)) >= float(_ref.get('merge_end_tok_m', 575)):
+                        fatal_error("ffn_pdr_controller.reference.merge_start_tok_m must be < merge_end_tok_m "
+                                    "(else the smoothstep blend degenerates to a hard step).")
                 if self.adaptive_wd is not None:
                     fatal_error("ffn_pdr_controller and adaptive_wd are mutually exclusive "
                                 "(AWD moves ||W||, the denominator of pdr) — enable only one.")
@@ -5589,6 +5620,15 @@ if __name__ == "__main__":
             logger.print_and_log(
                 f"FFN pdr controller: ENABLED (warmup_step={body_lr_ctrl.warmup_step}, "
                 f"m_floor={body_lr_ctrl.m_floor}, FF-only={not body_lr_ctrl.pid.active})")
+            # The EMA alphas / rate limits are tuned for the diagnostic cadence; observe() actually
+            # fires at settings.val_step. Warn if they differ so a future val_step change can't
+            # silently detune the controller's time constants.
+            _ctrl_cad = int((settings.ffn_pdr_controller or {}).get('cadence', 100))
+            if _ctrl_cad != int(getattr(settings, 'val_step', 100)):
+                logger.print_and_log(
+                    f"  WARNING: ffn_pdr_controller.cadence ({_ctrl_cad}) != val_step "
+                    f"({getattr(settings, 'val_step', 100)}) — observe() fires at val_step; the EMA "
+                    f"alphas/rate-limits were tuned for the cadence value. Align them or retune.")
 
     # ----------------------- MoE load balancing hook -----------------------
     moe_balance_hook = None
