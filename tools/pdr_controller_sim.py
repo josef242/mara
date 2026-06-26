@@ -57,10 +57,16 @@ def load_kv2_Kffn(root):
     pdr = []
     for line in open(os.path.join(root, "kv2/gen_log.txt"), encoding="utf-8", errors="replace"):
         m = re.search(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}).*\[body-pdr\] pdr=[\d.e-]+ "
-                      r"\(attn=[\d.e-]+ ffn=([\d.e-]+)\) \| body_lr_mult=([\d.]+)", line)
-        if m:
-            pdr.append((datetime.datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S"),
-                        float(m.group(2)), float(m.group(3))))
+                      r"\(attn=[\d.e-]+ ffn=([\d.e-]+)\) \| ", line)
+        if not m:
+            continue
+        # Mult: new decomposed format "lr_mult attn=A ffn=B" (use ffn), else old "body_lr_mult=B".
+        mm = re.search(r"lr_mult attn=[\d.]+ ffn=([\d.]+)", line) or \
+            re.search(r"body_lr_mult=([\d.]+)", line)
+        if not mm:
+            continue
+        pdr.append((datetime.datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S"),
+                    float(m.group(2)), float(mm.group(1))))
     vals = []
     for line in open(os.path.join(root, "kv2/val_log.txt"), encoding="utf-8", errors="replace"):
         m = re.search(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) \| st:\s*(\d+) \| tok:\s*(\d+)", line)

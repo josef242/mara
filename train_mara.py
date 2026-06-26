@@ -1430,6 +1430,11 @@ def train_loop(
             s in _n for s in ('feed_forward.w1', 'feed_forward.w2', 'feed_forward.w3'))
             )(n.replace('_orig_mod.', ''))
     }
+    # Attn id-set for the decomposed [body-pdr] readout = body minus ffn (for dense layers this is
+    # exactly attention.wq/wk/wv/wo). Lets the line report attn and ffn lr_mult SEPARATELY now that
+    # they can be on different schedules (kv2 attn-ramp vs ffn-glide; kv3 ffn-controller vs attn=1.0).
+    _attn_param_ids_for_pdr = _body_param_ids_for_pdr - _ffn_param_ids_for_ctrl
+
     # Controller is DENSE-FFN-only: it ACTUATES feed_forward.w1/w2/w3 but OBSERVES the diagnostics
     # FFN-aggregate pdr, which under MoE is the EXPERT params — a measure/actuate mismatch (and the
     # actuated set would be empty). Fail loudly rather than silently steer with no authority.
@@ -2838,18 +2843,22 @@ def train_loop(
                             _med = _all[len(_all) // 2]
                             _amed = sorted(_att)[len(_att) // 2] if _att else float('nan')
                             _fmed = sorted(_ffn)[len(_ffn) // 2] if _ffn else float('nan')
-                            # Commanded body-LR multiplier this step: read it straight from the
-                            # side-dict the optimizer actually uses (a body param's lr_scale), so
-                            # the displayed mult is the REAL applied value, not a re-derivation.
-                            _bmult = 1.0
-                            if lr_mod_entries and lr_scale_overrides is not None:
-                                for _p, _ in lr_mod_entries:
-                                    if id(_p) in _body_param_ids_for_pdr:
-                                        _bmult = lr_scale_overrides.get(id(_p), 1.0)
-                                        break
+                            # Commanded LR multipliers this step, DECOMPOSED attn vs ffn — read
+                            # straight from the side-dict the optimizer actually uses (so it's the
+                            # REAL applied value, whether set by lr_mods OR the kv3 controller).
+                            # attn and ffn can now be on different schedules, so a single body mult
+                            # would be ambiguous. Each group is uniform internally, so one
+                            # representative param per group is exact. Default 1.0 if uncovered.
+                            def _rep_mult(_ids):
+                                if lr_scale_overrides is not None:
+                                    for _pid in _ids:
+                                        return lr_scale_overrides.get(_pid, 1.0)
+                                return 1.0
+                            _amult = _rep_mult(_attn_param_ids_for_pdr)
+                            _fmult = _rep_mult(_ffn_param_ids_for_ctrl)
                             logger.print_and_log(
                                 f"  [body-pdr] pdr={_med:.3e} (attn={_amed:.3e} ffn={_fmed:.3e}) "
-                                f"| body_lr_mult={_bmult:.3f}")
+                                f"| lr_mult attn={_amult:.3f} ffn={_fmult:.3f}")
                     except Exception:
                         pass
                 # FFN pdr controller (kv3): feed the FFN-median pdr at this diagnostic cadence.
