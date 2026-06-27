@@ -122,7 +122,9 @@ def summarize_optimizer_settings(settings, ddp_world_size, grad_accum, logger, m
 
         if getattr(settings, 'tangent_project', False):
             _tpn = getattr(settings, 'tangent_project_preserve_norm', False)
-            log(f"  ] Tangent projection = ON (preserve_norm={_tpn}) — body Muon update projected perpendicular to W")
+            _tps = getattr(settings, 'tangent_project_strength', 1.0)
+            _tps_desc = "scheduled" if isinstance(_tps, list) else f"f={_tps}"
+            log(f"  ] Tangent projection = ON (preserve_norm={_tpn}, strength {_tps_desc}) — body Muon update projected perpendicular to W")
 
         if optimizer_type in MUONSPHERE_VARIANTS:
             radius_scale = getattr(settings, 'muonsphere_radius_scale', 2.0)

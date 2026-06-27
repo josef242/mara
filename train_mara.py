@@ -1409,6 +1409,16 @@ def train_loop(
     # see docs/PROBE_A_clip_replay_RESULTS.md). Folded into the existing clip pass → ~free.
     _clip_groups_cfg = bool(getattr(settings, 'track_clip_groups', False))
 
+    # Tangent-projection STRENGTH f (partial projection): f=1 strips all of the radial Muon-update
+    # component (flat ‖W‖, original behavior); f<1 leaves (1-f) of it, so ‖W‖ grows at (1-f) of its
+    # natural rate; f=0 = no projection. Scalar (constant) or [[step, val], ...] schedule (linear
+    # interp). Written into the Muon body groups' 'tangent_project_strength' each step below; the
+    # f-sweep dial for the "is bounded growth better than flat ‖W‖" experiment. Default 1.0 =
+    # existing configs unchanged.
+    _tp_on = bool(getattr(settings, 'tangent_project', False))
+    _tps_cfg = getattr(settings, 'tangent_project_strength', 1.0)
+    _tps_is_sched = isinstance(_tps_cfg, list)
+
     # Body relative-step pdr = ||dW||/||W|| (effective-LR metric for the tangent-projection
     # annealing experiment, Math Brief #6). Emitted as its own line on diagnostics/val steps
     # (snapshot cadence — NOT per step). _body_param_ids_for_pdr lets the pdr line report the
@@ -1918,7 +1928,18 @@ def train_loop(
                 param_group['lr'] = torch.tensor(scheduled_lr)
 
         lr = scheduled_lr
-        
+
+        # Tangent-projection strength f(step): write the current value into every Muon body group
+        # so the optimizer's projection uses it this step. f is a global scalar (uniform across
+        # ranks and matrices), so this is just a few dict writes — like the per-step LR write above.
+        # Skipped entirely when projection is off; constant config writes a constant (default 1.0
+        # = no behavior change). The group's strength is read in muon_fsdp2's projection block.
+        if _tp_on:
+            _f_now = interpolate_lr_mod(_tps_cfg, step) if _tps_is_sched else float(_tps_cfg)
+            for _pg in optimizer.param_groups:
+                if _pg.get('tangent_project', False):
+                    _pg['tangent_project_strength'] = _f_now
+
         clip_value = settings.clip_warmup if step < settings.warmup_steps else settings.clip_standard
 
         # Head metrics for the z-loss probe: weight_norm + GLOBAL (FSDP-reduced)
@@ -4768,6 +4789,34 @@ class Settings:
                                 "SCS-frozen FFN params.")
         elif self.ffn_pdr_controller is not None:
             fatal_error(f"ffn_pdr_controller must be a dict, got {type(self.ffn_pdr_controller).__name__}")
+
+        # --- tangent_project_strength: partial-projection f (scalar in [0,1] OR schedule) ---
+        # f=1 (default) = full projection (flat ||W||); f<1 lets ||W|| grow at (1-f) of its natural
+        # rate; f=0 = no projection. Scalar (constant), or [[step, val], ...] for a schedule (e.g.
+        # allow growth early, clamp late). The f-sweep dial. Only meaningful when tangent_project on.
+        if not hasattr(self, 'tangent_project_strength'):
+            self.tangent_project_strength = 1.0
+        else:
+            _ts = self.tangent_project_strength
+            if isinstance(_ts, bool):
+                fatal_error("tangent_project_strength must be a number or schedule, not a bool")
+            elif isinstance(_ts, (int, float)):
+                if not (0.0 <= float(_ts) <= 1.0):
+                    fatal_error(f"tangent_project_strength scalar must be in [0,1], got {_ts}")
+            elif isinstance(_ts, list):
+                if not _ts:
+                    fatal_error("tangent_project_strength schedule is empty")
+                _prev = None
+                for _kn in _ts:
+                    if not (isinstance(_kn, list) and len(_kn) == 2):
+                        fatal_error(f"tangent_project_strength schedule entries must be [step, val], got {_kn!r}")
+                    if not (0.0 <= float(_kn[1]) <= 1.0):
+                        fatal_error(f"tangent_project_strength schedule values must be in [0,1], got {_kn[1]}")
+                    if _prev is not None and float(_kn[0]) <= _prev:
+                        fatal_error(f"tangent_project_strength schedule steps must be strictly ascending, got {_kn[0]} after {_prev}")
+                    _prev = float(_kn[0])
+            else:
+                fatal_error(f"tangent_project_strength must be a number or [[step,val],...], got {type(_ts).__name__}")
 
         # --- auxiliary_heads: intermediate-depth prediction heads ---
         # Validated lightly here; full parse happens in parse_aux_heads_config
