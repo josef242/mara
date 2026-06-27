@@ -800,6 +800,32 @@ def parse_wd_rules(wd_config, model):
                     continue
                 param_wds[id(p)] = (p, wd_val)
 
+    # Coverage guard (silent-failure protection). When weight_decay is a RULES list, the base WD is
+    # forced to 0.0, so ANY non-norm param NOT matched by a rule silently gets WD=0 — which is never
+    # intentional (e.g. a lone [all, ...] body rule leaves emb+head at 0). Require full coverage:
+    # every non-norm param must be matched by SOME rule. An explicit [emb, 0.0] counts (it's in
+    # param_wds) — only the SILENT, rule-less zero is rejected. Norms are intentionally WD=0, skipped.
+    uncovered = [n for n, p in model.named_parameters()
+                 if not _is_norm(n) and id(p) not in param_wds]
+    if uncovered:
+        buckets = {}
+        for n in uncovered:
+            if 'tok_embeddings' in n:
+                b = "emb (add a [emb, <wd>] rule)"
+            elif n.startswith('output.') or n.endswith('output.weight'):
+                b = "head (add a [out, <wd>] rule)"
+            elif 'layers.' in n:
+                b = "body (add [all, <wd>] or a layer-range rule)"
+            else:
+                b = "other"
+            buckets[b] = buckets.get(b, 0) + 1
+        summary = "; ".join(f"{b}: {c}" for b, c in buckets.items())
+        fatal_error(
+            f"weight_decay RULES leave {len(uncovered)} non-norm param(s) uncovered, so they would "
+            f"SILENTLY get WD=0 (the rules-mode base WD is 0.0) — never intentional. Cover them -> "
+            f"{summary}. To deliberately zero a group, set it explicitly (e.g. [emb, 0.0]). "
+            f"First uncovered: {uncovered[:4]}")
+
     return list(param_wds.values())
 
 
