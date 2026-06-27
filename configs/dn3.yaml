@@ -1,4 +1,4 @@
-# dn2_clamp — "GROW-THEN-CLAMP" experiment.
+# dn3 — "GROW-THEN-CLAMP" experiment.
 # Warm-start from DN2 (dreadnought_v2) at step 7000 (2.56B tok, body ‖W‖ ~71% of its eventual
 # norm, ffn pdr 1.79e-3 in healthy glide, LR ~full) and ANNEAL IN tangent projection: ramp f 0->1
 # over 7000->12000, so the body keeps growing (decreasingly) to ~82% then LOCKS. Tests whether
@@ -10,13 +10,7 @@
 # f (0->1). Everything else (arch, data, aux-heads schedule, LR) matches DN2's 7000+ behavior, so
 # the comparison is clean. (Design: chat 2026-06-27; see also docs/KV3_CONTROLLER_DESIGN.md.)
 #
-# WARM-START NOTE (operational): this is a FORK — new run_name, resuming dreadnought_v2's step-7000
-# checkpoint. The resume derives ALL shard paths (model/optimizer/rng) from
-# dirname(resume_checkpoint_path) = dreadnought_v2/ (train_mara.py:3357), so it loads DN2's step-7000
-# model + optimizer + rng shards automatically — NO copying needed. New checkpoints save to
-# dn2_clamp/. Just confirm the resume banner on first launch ("Resuming from .../dreadnought_v2/
-# model_step_007000.pt" + a successful optimizer-shard load).
-run_name: dn2_clamp
+run_name: dn3
 
 # ===== identical to DN2's config (arch / data / optimizer / schedules) =====
 ga_schedule:
@@ -44,7 +38,6 @@ reshard_after_forward: true
 resume_training: true
 resume_step: 7_000
 resume_data_reset: continue
-resume_checkpoint_path: /home/josef/brainbox/checkpoints/current/dreadnought_v2/model_step_007000.pt
 
 clip_warmup: 2.0
 clip_standard: 1.0
@@ -117,9 +110,16 @@ tangent_project_preserve_norm: false
 tangent_project_strength: [[7000, 0.0], [12000, 1.0]]
 
 # WD taper: DN2 ran WD=0.02 partly to FIGHT the radial growth. As f->1 removes that radial push,
-# 0.02 becomes unopposed and would SHRINK the body we're trying to preserve. Taper it down to
+# 0.02 becomes unopposed and would SHRINK the BODY we're trying to preserve. Taper the BODY down to
 # 0.002 (kv2's projected-regime value) on the SAME window as f rises.
+# emb and head are NOT tangent-projected, so their WD dynamics are unchanged — keep them pinned at
+# DN2's 0.02 ([emb]/[out] rules). Without those, switching to a rules list zeros the BASE wd, which
+# would silently drop emb/head from 0.02 to 0.0 (a confound; wrong direction for the head). Note
+# '[all, ...]' in WD rules matches layers.* (the body) only, not all-params. Both the Muon-body and
+# the emb/head-Adam paths read wd_overrides under normuon_fsdp2, so all three rules take effect.
 weight_decay:
+  - [emb, 0.02]
+  - [out, 0.02]
   - [all, [[7000, 0.02], [12000, 0.002]]]
 
 # ===== angular-anneal handoff: FFN pdr controller =====
