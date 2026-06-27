@@ -1,0 +1,182 @@
+# dn2_clamp — "GROW-THEN-CLAMP" experiment.
+# Warm-start from DN2 (dreadnought_v2) at step 7000 (2.56B tok, body ‖W‖ ~71% of its eventual
+# norm, ffn pdr 1.79e-3 in healthy glide, LR ~full) and ANNEAL IN tangent projection: ramp f 0->1
+# over 7000->12000, so the body keeps growing (decreasingly) to ~82% then LOCKS. Tests whether
+# DN2's GROWN body, once frozen, keeps performing — i.e. is body-growth's benefit in the STATE
+# (grown weights) or the PROCESS (ongoing growth)?
+#
+# THE CONTROL IS FREE: DN2's own logged f=0 trajectory from step 7000->18200 (in
+# dreadnought_v2/{val,gen,train}_log.txt) IS the baseline. This run differs from it in ONE thing —
+# f (0->1). Everything else (arch, data, aux-heads schedule, LR) matches DN2's 7000+ behavior, so
+# the comparison is clean. (Design: chat 2026-06-27; see also docs/KV3_CONTROLLER_DESIGN.md.)
+#
+# WARM-START NOTE (operational): this is a FORK — new run_name, resuming dreadnought_v2's step-7000
+# checkpoint. The resume derives ALL shard paths (model/optimizer/rng) from
+# dirname(resume_checkpoint_path) = dreadnought_v2/ (train_mara.py:3357), so it loads DN2's step-7000
+# model + optimizer + rng shards automatically — NO copying needed. New checkpoints save to
+# dn2_clamp/. Just confirm the resume banner on first launch ("Resuming from .../dreadnought_v2/
+# model_step_007000.pt" + a successful optimizer-shard load).
+run_name: dn2_clamp
+
+# ===== identical to DN2's config (arch / data / optimizer / schedules) =====
+ga_schedule:
+  - [0, 125_000]
+  - [2_000, 250_000]
+  - [4_000, 500_000]
+  - [7_000, 1_000_000]
+  - [10_500, 2_000_000]
+  - [14_500, 3_000_000]
+  - [17_000, 4_000_000]
+B: 3
+T: 8192
+max_steps: 200_000
+eval_iters: 2
+val_step: 100
+save_step: 250
+
+data_type: bf16
+FSDP_param_dtype: bf16
+FSDP_reduce_dtype: bf16
+FSDP_buffer_dtype: bf16
+reshard_after_forward: true
+
+# Resume: FORK from DN2's step-7000 checkpoint (NOT dn2_clamp's own dir).
+resume_training: true
+resume_step: 7_000
+resume_data_reset: continue
+resume_checkpoint_path: /home/josef/brainbox/checkpoints/current/dreadnought_v2/model_step_007000.pt
+
+clip_warmup: 2.0
+clip_standard: 1.0
+track_gpm: true
+track_clip_groups: true
+
+use_keel: true
+keel_alpha: null
+cfg_layers: 69
+cfg_heads: 40
+cfg_kv_heads: 20
+cfg_embd: 2560
+cfg_intermediate: 7680
+norm_eps: 1.0e-05
+dropout: 0.0
+use_activation_checkpointing: true
+qk_norm_mode: "before_rope"
+tie_word_embeddings: false
+rope_theta: 500_000.0
+moe_enabled: false
+
+compile_model: true
+compile_mode: default
+
+lr_schedule_type: "cosine"
+max_lr: 3.0e-04
+min_lr: 3.0e-05
+warmup_steps: 2000        # (already past; LR continues on DN2's cosine from step 7000 = ~full)
+
+optimizer_type: normuon_fsdp2
+beta1: 0.9
+beta2: 0.95
+muon_momentum: 0.95
+muon_ns_steps: 5
+normuon_beta2: 0.99
+muon_adam_state_dtype: fp32
+
+output_lr_batch_adjust:        # DN2 had this — keep (it's in the control too)
+  base_mult: 0.8
+  exponent: 0.3
+
+# Auxiliary heads: OFF (intentionally). DN2's real run ramped aux heads in at 11k-15k, but we keep
+# this experiment about the ONE variable — body growth/clamp + the pdr handoff — with no aux-head
+# pressure muddying the body's training. CONTROL IMPLICATION: because DN2's logged trajectory HAS
+# aux heads from 11k on, those logs are now only a SECONDARY reference. For the clean comparison,
+# run a MATCHED control: DN2-from-step-7000, aux OFF, tangent_project OFF (f=0) — identical to this
+# config minus the projection/controller. (The whole f-sweep is then aux-off and internally
+# consistent.)
+auxiliary_heads:
+  enabled: false
+
+# row_center / z_loss: OFF — DN2 did NOT have these before step 18000, so at our step-7000
+# injection they were not active. Matching DN2's 7000+ behavior (and the control).
+row_center_head:
+  enabled: false
+z_loss:
+  enabled: false
+
+transition_health_guard: true
+health_guard_warmup_steps: 7100
+
+# ===== THE EXPERIMENT: anneal IN tangent projection (f 0->1) =====
+# f=0 at the injection (DN2's free-growth state continues), ramping to f=1 (full projection, ‖W‖
+# frozen) over 7000->12000 (~5000 steps). Gentle radial-anneal: the body keeps growing at (1-f)
+# of its rate, locking at ~82% of DN2's eventual norm by step 12000. Lengthen the window to keep
+# more growth (locks higher) / shorten to lock a less-formed body. See chat 2026-06-27 for the
+# ramp-length<->frozen-‖W‖ coupling.
+tangent_project: true
+tangent_project_preserve_norm: false
+tangent_project_strength: [[7000, 0.0], [12000, 1.0]]
+
+# WD taper: DN2 ran WD=0.02 partly to FIGHT the radial growth. As f->1 removes that radial push,
+# 0.02 becomes unopposed and would SHRINK the body we're trying to preserve. Taper it down to
+# 0.002 (kv2's projected-regime value) on the SAME window as f rises.
+weight_decay:
+  - [all, [[7000, 0.02], [12000, 0.002]]]
+
+# ===== angular-anneal handoff: FFN pdr controller =====
+# Once the body freezes (f->1), the implicit growth-anneal stops and the body would run HOT at a
+# fixed pdr (the KH-v1 failure). The controller carries the anneal forward by driving FFN pdr to
+# DN2's OWN continued glide — so this arm has the SAME pdr trajectory as DN2 (the control),
+# achieved via frozen-body + LR-trim instead of growing-body. That's the matched-anneal test:
+# only the MECHANISM of the anneal differs. Engages at the injection (warmup_step=7000); FF-only
+# (attn rides its frozen state at m=1.0). Reference = DN2's measured ffn pdr from step 7000 fwd.
+ffn_pdr_controller:
+  enabled: true
+  warmup_step: 7000
+  cadence: 100
+  m_floor: 0.30
+  m_max: 1.0
+  k_ema_alpha: 0.15
+  pdr_ema_alpha: 0.15
+  rate_down: 0.05
+  rate_up: 0.02
+  kp: 0.0           # feedforward-only for run 1 (PI present but off)
+  ki: 0.0
+  kd: 0.0
+  integral_clamp: 0.5
+  reference:
+    # merge_start<merge_end with alpha->1 immediately, so the reference IS dn2_ffn_knots (DN2's
+    # actual measured ffn-median pdr from step 7000 onward — tokens in M). kv2_early unused here.
+    merge_start_tok_m: 0
+    merge_end_tok_m: 1
+    kv2_early_knots: [[0, 1.79e-3]]
+    dn2_ffn_knots:   [[2560, 1.79e-3], [3540, 1.62e-3], [4520, 1.53e-3], [5510, 1.48e-3],
+                      [6980, 1.46e-3], [8950, 1.36e-3], [12880, 1.28e-3], [18290, 1.24e-3],
+                      [25170, 1.19e-3]]
+  authority_low_m: 0.5
+  alarm_pdr_ratio: 1.1
+  alarm_consecutive: 3
+# Subgroup pdr telemetry (wq/wk vs wv/wo, w1/w3 vs w2) — watch how the frozen body's components
+# behave; cheap, opt-in.
+track_subgroup_pdr: true
+
+tok_kind: llama
+tok_path: ../tokenizers/llama_tokenizer
+special_tokens: ../../notebooks/datasets/tokenized/llama/tokenizer_config.json
+
+data_root_path: ../../notebooks/datasets/tokenized/llama/
+groups:
+  - [stories,      [[0, 25.0]]]
+  - [ao3,          [[0, 25.0]]]
+  - [books,        [[0, 25.0]]]
+  - [preselect,    [[0, 7.0]]]
+  - [code_python,  [[0, 6.0]]]
+  - [code_c,       [[0, 6.0]]]
+  - [edufineweb_1.5TT, [[0, 6.0]]]
+
+gen_log_file: gen_log.txt
+train_log_file: train_log.txt
+val_log_file: val_log.txt
+server_port: 8888
+
+nas_root: /home/josef/brainbox/checkpoints/current/
+local_checkpoint_root: ~/checkpoints/
