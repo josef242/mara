@@ -2998,6 +2998,8 @@ def train_loop(
                     _lzc_tag = f" logZ_c={_lzc:.2f}" if _lzc is not None else ""
                     logger.print_and_log(
                         f"  [centered-geom]{_lzc_tag} ||W_c||={cg_diag['Wc_fro']:.2f} "
+                        f"gauge||mu||={cg_diag.get('mu_w_norm', 0.0):.3e} "
+                        f"({100 * cg_diag.get('gauge_frac', 0.0):.1f}% of head) "
                         f"s1_c={cg_diag['s1_c']:.2f} "
                         f"spec_conc_c={cg_diag['spectral_concentration_c']:.4f} "
                         f"eff_rank={cg_diag['effective_rank_c']:.1f} "

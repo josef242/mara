@@ -13,12 +13,16 @@
 # Hardware: rig-31, ~4 GPUs, in parallel with picket-ctrl (4+4 of the 8). Fresh from scratch.
 run_name: picket-hyg
 
+# Flat, modest GA + ~8k steps -- a genuinely fast canary (the gauge accrues per OPTIMIZER step).
+# SUCCESS: this (treatment) arm's [centered-geom] gauge||mu|| / "% of head" stays ~flat near 0 while
+# picket-ctrl climbs; centered metrics (||W_c||, logZ_c, eff_rank) MATCH ctrl (the CE-invariance check).
+# Watch the FIRST ~500 steps for divergence (the Keel Haul v1 from-scratch runaway was a DIFFERENT
+# mechanism -- legacy weight+exp_avg projection -- but this is Lever 1's first from-scratch long run).
 ga_schedule:
   - [0, 65_536]
-  - [4_000, 131_072]
 B: 4
 T: 2048
-max_steps: 15_000
+max_steps: 8_000
 eval_iters: 2
 val_step: 50
 save_step: 500

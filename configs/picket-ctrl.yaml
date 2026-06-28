@@ -12,13 +12,18 @@
 # Hardware: rig-31, ~4 GPUs (3060/3060Ti). ~220M params, fits 8-12GB sharded. Fresh from scratch.
 run_name: picket-ctrl
 
-# Modest GA so steps stay frequent (good diagnostic granularity for watching the head).
+# Flat, modest GA: the head gauge accumulates per OPTIMIZER step, so a small constant batch maximizes
+# opt-steps/wall-hour and avoids a mid-run batch jump. ~8k steps -> ~+29% raw head growth (gauge ~78%
+# of that) -> a clear A/B contrast at this scale (head growth ~+4.6%/kstep, ~dimension-invariant).
+# SUCCESS CRITERION (read on the GAUGE axis, not centered): control's [centered-geom] gauge||mu|| /
+# "% of head" climbs (toward DN2's ~78%) while picket-hyg stays ~flat near 0, AND the CENTERED metrics
+# (||W_c||, logZ_c, eff_rank) MATCH between arms (Lever 1 is gauge-INVARIANT -> matching centered
+# geometry is the SUCCESS check, NOT a null result). Also compare raw head ||W|| (jsonl output.w_norm).
 ga_schedule:
   - [0, 65_536]
-  - [4_000, 131_072]
 B: 4
 T: 2048
-max_steps: 15_000
+max_steps: 8_000
 eval_iters: 2
 val_step: 50          # frequent: we want a fine-grained head-geometry trace
 save_step: 500
