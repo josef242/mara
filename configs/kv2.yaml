@@ -33,7 +33,7 @@ reshard_after_forward: false
 
 # Resume training settings
 resume_training: true
-resume_step: 1_000
+resume_step: 4_000
 resume_data_reset: continue         # Modes are: continue (no reset), soft (reset pct window - change in pct), hard (reset all)
 
 # Gradient clipping
@@ -123,8 +123,19 @@ warmup_steps: 1500                # Match paper's deep runs
 # ~2.3e-3 by 800M (watch the [body-pdr] diagnostics line). Do NOT raise WD (wrong sign: shrinks
 # ‖W‖ → RAISES pdr). Do NOT lower global max_lr in this run (confound; it also hits Adam groups
 # — test separately if Adam-group pdr also spikes at LR-cap). See docs/MATH_AGENT_Q7_anneal_timing.md.
+#lr_mods:
+#  - [all, all, [[0, 1.0], [1500, 1.0], [4290, 0.75], [5060, 0.67], [6580, 0.55]]]
+
 lr_mods:
-  - [all, all, [[0, 1.0], [1500, 1.0], [4290, 0.75], [5060, 0.67], [6580, 0.55]]]
+  # attn: RAMP the over-cooled multiplier back to 1.0 over ~500 steps (no jump), then leave
+  #       attention at full LR — QK-norm self-regularizes it; it never needed cooling.
+  - [all, attn, [[4000, 0.776], [8000, 1.0]]]
+  # ffn: existing glide through the resume point (continuous), then EXTEND past 0.55 to track
+  #      DN2's continued FFN consolidation instead of flat-lining. Floor 0.40 (≈1.5e-3) leaves
+  #      a safety margin vs chasing DN2's exact 1.27e-3 (which would need ~0.34).
+  - [all, ffn,  [[0, 1.0], [1500, 1.0], [4290, 0.75], [5060, 0.67], [6580, 0.55],
+                 [10000, 0.47], [15000, 0.42], [22000, 0.40]]]
+# 
 # ======================================================================================
 
 # Optimizer settings
