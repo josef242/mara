@@ -135,8 +135,12 @@ ffn_pdr_controller:
   cadence: 100
   m_floor: 0.30
   m_max: 1.0
-  k_ema_alpha: 0.15
-  pdr_ema_alpha: 0.15
+  # 0.15 -> 0.25: dn3's batch is ~8-15x bigger than kv2's (100-200M tok/control-sample vs ~13M), so
+  # a 0.15 per-sample EMA is an 8-15x longer TOKEN-space memory than kv2 validated. 0.25 halves the
+  # engage-window double-count (m dip 0.955->0.977, pdr undershoot -4.5%->-2.3%) and is safe because
+  # the bigger batch makes each pdr reading much less noisy. (dn3-critics workflow, 2026-06-27.)
+  k_ema_alpha: 0.25
+  pdr_ema_alpha: 0.25
   rate_down: 0.05
   rate_up: 0.02
   kp: 0.0           # feedforward-only for run 1 (PI present but off)
@@ -144,14 +148,24 @@ ffn_pdr_controller:
   kd: 0.0
   integral_clamp: 0.5
   reference:
-    # merge_start<merge_end with alpha->1 immediately, so the reference IS dn2_ffn_knots (DN2's
-    # actual measured ffn-median pdr from step 7000 onward — tokens in M). kv2_early unused here.
-    merge_start_tok_m: 0
-    merge_end_tok_m: 1
-    kv2_early_knots: [[0, 1.79e-3]]
-    dn2_ffn_knots:   [[2560, 1.79e-3], [3540, 1.62e-3], [4520, 1.53e-3], [5510, 1.48e-3],
-                      [6980, 1.46e-3], [8950, 1.36e-3], [12880, 1.28e-3], [18290, 1.24e-3],
-                      [25170, 1.19e-3]]
+    # Single reference curve, no blend_from (a warm-start fork has no early-plasticity regime to
+    # ride out of). `knots` = token-in-M -> target ffn-median pdr.
+    # Knots <=25170M are DN2's OWN measured ffn-median pdr (verified +/-0.5% vs DN2 diagnostics).
+    # They END at 25170M (DN2 stopped at step ~18000). Past that there is NO DN2 data, so the TAIL
+    # tracks the cosine LR: ref = 1.19e-3 * lr(step)/lr(handoff). On the frozen body pdr = K*m with
+    # K ~ lr, and m_max=1.0 caps the controller to CUTS only, so the max reachable pdr falls ~10x
+    # with the cosine LR. A flat or gentle-glide reference would sit ABOVE that ceiling and peg the
+    # actuator at m=1.0 (silently "off", since the alarm only fires at the m_floor rail) for ~60% of
+    # the run; LR-track is the unique reference that keeps the controller IN AUTHORITY -- commanded m
+    # in its interior (~0.87 if the frozen body runs hotter than DN2's grown body as predicted, else
+    # ~1.0 with full downward authority). Verified 2026-06-27 (dn3-tail-reference-verify: 3 agents,
+    # knots reproduced to +/-0.04%, K-drift +/-15% keeps m in [0.76, 1.02], floor needs >2.9x K-rise).
+    knots: [[2560, 1.79e-3], [3540, 1.62e-3], [4520, 1.53e-3], [5510, 1.48e-3],
+            [6980, 1.46e-3], [8950, 1.36e-3], [12880, 1.28e-3], [18290, 1.24e-3],
+            [25170, 1.19e-3],
+            [33557, 1.185e-3], [73557, 1.154e-3], [133557, 1.086e-3], [193557, 9.929e-4],
+            [273557, 8.416e-4], [353557, 6.726e-4], [473557, 4.227e-4], [613557, 2.024e-4],
+            [753557, 1.207e-4]]
   authority_low_m: 0.5
   alarm_pdr_ratio: 1.1
   alarm_consecutive: 3

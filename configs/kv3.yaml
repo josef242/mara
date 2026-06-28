@@ -118,19 +118,20 @@ ffn_pdr_controller:
   ki: 0.0
   kd: 0.0
   integral_clamp: 0.5
-  # Reference: smooth alpha-blend (smoothstep merge_start -> merge_end) of kv2-early -> DN2-FFN.
-  # dn2_ffn_knots = DN2's ACTUAL recorded FFN-median pdr sampled out to the ~26B-token run horizon
-  # (the run goes well past 1B tok; an earlier 5-knot curve ending at [1000,2.20e-3] flat-lined the
-  # setpoint at 2.20e-3 for ~97% of the run, ~75% above DN2's true late ~1.26e-3 — a fidelity bug
-  # the 850M-horizon sim missed). Past the last knot _interp holds DN2's late plateau (~1.26e-3),
-  # which DN2's own curve flattened to — faithful.
+  # Reference: the mature glide is `knots` = DN2's ACTUAL recorded FFN-median pdr, sampled to the
+  # ~26B-token run horizon (an earlier 5-knot curve ending at [1000,2.20e-3] flat-lined the setpoint
+  # at 2.20e-3 for ~97% of the run, ~75% above DN2's true late ~1.26e-3 — a fidelity bug the 850M sim
+  # missed; past the last knot _interp holds DN2's late ~1.26e-3 plateau, which DN2's own curve
+  # flattened to — faithful). kv3 is from-scratch, so it BLENDS OUT of a high early-plasticity curve
+  # (blend_from, measured from kv2's early run) INTO the glide over 197->575M tok.
   reference:
-    merge_start_tok_m: 197     # alpha=0 at LR-cap (ride kv2 early)
-    merge_end_tok_m: 575       # alpha=1 (fully on DN2's FFN glide)
-    kv2_early_knots: [[197, 3.42e-3], [400, 3.10e-3], [600, 2.90e-3]]
-    dn2_ffn_knots:   [[197, 1.66e-3], [393, 2.94e-3], [590, 2.58e-3], [787, 2.28e-3],
-                      [1000, 2.20e-3], [2000, 1.85e-3], [4000, 1.64e-3], [8000, 1.38e-3],
-                      [12000, 1.30e-3], [16000, 1.28e-3], [20000, 1.23e-3], [26000, 1.26e-3]]
+    knots: [[197, 1.66e-3], [393, 2.94e-3], [590, 2.58e-3], [787, 2.28e-3],
+            [1000, 2.20e-3], [2000, 1.85e-3], [4000, 1.64e-3], [8000, 1.38e-3],
+            [12000, 1.30e-3], [16000, 1.28e-3], [20000, 1.23e-3], [26000, 1.26e-3]]
+    blend_from:                          # ride this early-plasticity curve, crossfade into `knots`
+      knots: [[197, 3.42e-3], [400, 3.10e-3], [600, 2.90e-3]]   # measured from kv2's early run
+      start_tok_m: 197                   # alpha=0 here (fully on blend_from)
+      end_tok_m: 575                     # alpha=1 here (fully on `knots`)
   # Guardrails (advisory; logged on the [ffn-ctrl] line)
   authority_low_m: 0.5         # m below this before the merge region -> inspect flag
   alarm_pdr_ratio: 1.1         # m=floor AND pdr>1.1*r for N samples -> base-LR-too-high alarm

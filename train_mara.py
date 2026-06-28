@@ -4798,9 +4798,13 @@ class Settings:
                 if _ref is not None and not isinstance(_ref, dict):
                     fatal_error("ffn_pdr_controller.reference must be a dict")
                 if isinstance(_ref, dict):
-                    if float(_ref.get('merge_start_tok_m', 197)) >= float(_ref.get('merge_end_tok_m', 575)):
-                        fatal_error("ffn_pdr_controller.reference.merge_start_tok_m must be < merge_end_tok_m "
-                                    "(else the smoothstep blend degenerates to a hard step).")
+                    if not _ref.get('knots'):
+                        fatal_error("ffn_pdr_controller.reference.knots is required (the reference pdr curve).")
+                    _bf = _ref.get('blend_from')
+                    if _bf is not None:
+                        if float(_bf.get('start_tok_m', 0)) >= float(_bf.get('end_tok_m', 1)):
+                            fatal_error("ffn_pdr_controller.reference.blend_from.start_tok_m must be < "
+                                        "end_tok_m (else the smoothstep blend degenerates to a hard step).")
                 if self.adaptive_wd is not None:
                     fatal_error("ffn_pdr_controller and adaptive_wd are mutually exclusive "
                                 "(AWD moves ||W||, the denominator of pdr) — enable only one.")
