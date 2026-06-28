@@ -1,9 +1,28 @@
 # dn4 head-hygiene — implementation spec
 
-Status: **APPROVED by Math** (Q10 follow-up), with the two required edits folded in (marked ⚑): the
-**validation correction** (CE is gauge-invariant — it must MATCH, not drift) and the **param-ID startup
-assertion**. Also passed an internal 3-agent code-review pass (marked ✎). This pins the *implementation*
-of the top lever and stages the rest.
+Status: **IMPLEMENTED + VALIDATED** (both levers). Math-APPROVED design; passed an internal 3-agent
+code-review (✎) AND a blind 4-agent review (one HIGH precision defect found + fixed; no blockers). Both
+levers SHIP OFF / inert by default. The design below matches the shipped code.
+
+**Implementation & validation:**
+- **Lever 1 — head gauge projection** (`head_gauge_projection: {enabled, init_row_center}`):
+  `common_fsdp2/muon_fsdp2.py` (`_project_head_update_gauge_` + the Adam-path hook) + `train_mara.py`
+  (config, guards, param-ID startup assertion, init, banner, telemetry). Validated: fp32 unit test
+  (theorem; gauge accumulation prevented), config (dn3 inert + guards fire), **live 2-GPU FSDP**.
+  **MERGED to main.**
+- **Lever 2 — deadband centered z-loss** (`z_loss: {target: centered, tau, alpha, backend}`):
+  `common_fsdp2/model_v2.py` (`_centered_zloss_deadband` + forward branch) + `train_mara.py` (target/tau
+  validation incl. an untied-head guard, config setter, banner). Validated: math unit test
+  (gauge-invariance; zero common-mode gradient `6.25e-7`; deadband), **live 2-GPU FSDP** (`zloss ==
+  (logZ_c−τ)²` exact). **Blind-review fix:** the centered target logit is now formed DIRECTLY in fp32
+  (`h·(W_target−μ)`), dodging a bf16 cancellation at the O(400) gauge scale that corrupted the deadband
+  near τ — real-vs-reference tightened from `1.8e-4` to `1.2e-7`.
+
+Deferred polish (non-blocking): clean centered diag labels + surface `h_mu` telemetry; an automated
+multi-rank bf16/SR test (the live smoke covers it); τ/α tuning post-dn3.
+
+The two earlier Math edits are folded in (⚑): the validation correction (CE is gauge-invariant — must
+MATCH, not drift) and the param-ID startup assertion.
 
 Goal, per Math:
 

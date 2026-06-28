@@ -1706,7 +1706,7 @@ def train_loop(
     # under its OWN gate -- NOT the legacy row_center_head path (no exp_avg surgery).
     # Pairs with the in-optimizer applied-update projection to keep the head gauge-free
     # from step 0. Skipped on resume past step 1 (the stored head is already centered).
-    if head_gauge_init_rc and start_step == 1:
+    if head_gauge_init_rc and start_step == 1 and not getattr(settings, 'resume_training', False):
         _hg0 = _row_center_head_step(model, optimizer, want_exp_avg=False)
         if _hg0 is not None and ddp_rank == 0:
             logger.print_and_log(
@@ -4967,6 +4967,12 @@ class Settings:
                     if not isinstance(_ztau, (int, float)) or isinstance(_ztau, bool):
                         fatal_error("z_loss.target: centered requires a numeric z_loss.tau "
                                     "(the deadband ceiling on logZ_c; e.g. 120-128).")
+                    if getattr(self, 'tie_word_embeddings', True):
+                        fatal_error(
+                            "z_loss.target: centered requires an UNTIED head: it shapes logZ_c via "
+                            "mu(output.weight), and on a tied head output.weight IS the input "
+                            "embedding, so the centered ceiling would also regularize the embeddings. "
+                            "Set tie_word_embeddings: false or use target: raw.")
                 warmup = zl.get('warmup')
                 if warmup is not None:
                     if not isinstance(warmup, dict):
@@ -5622,9 +5628,18 @@ if __name__ == "__main__":
         _zl_grad = '~0.999 cos / ~0.05 norm-rel' if _zl_backend == 'fp32_accum' \
             else '~0.990 cos / ~0.12 norm-rel'
         logger.print_and_log(f"Z-Loss (log-partition regularization):")
-        logger.print_and_log(
-            f"  ] objective      = CE + alpha * mean(logZ^2) on the live LM readout head"
-        )
+        if _zl.get('target', 'raw') == 'centered':
+            _zl_tau = float(_zl.get('tau', 0.0))
+            logger.print_and_log(
+                f"  ] objective      = CE + alpha * mean(relu(logZ_c - tau)^2)   [CENTERED deadband, dn4 Lever 2]"
+            )
+            logger.print_and_log(
+                f"  ] centered/tau   = logZ_c = logZ - h.mu (gauge-invariant; zero common-mode gradient); deadband ceiling tau = {_zl_tau:.2f}"
+            )
+        else:
+            logger.print_and_log(
+                f"  ] objective      = CE + alpha * mean(logZ^2) on the live LM readout head   [RAW]"
+            )
         logger.print_and_log(f"  ] alpha (target) = {_zl_alpha:.3e}")
         logger.print_and_log(
             f"  ] backend        = {_zl_backend}  (option-D reconstruction; grad {_zl_grad} vs fp32 truth)"
@@ -5642,6 +5657,26 @@ if __name__ == "__main__":
             logger.print_and_log(f"  ] alpha warmup   = disabled (full alpha applied immediately)")
         logger.print_and_log(
             f"  ] headline ls/ppl stay PURE CE; zloss/logZ/logZ_rms/logZ_p95/z_a + head metrics (hd_*) logged separately"
+        )
+
+    # ----------------------- Log head gauge projection (dn4 Lever 1) ----------
+    _hg = _head_gauge_cfg(settings)
+    if _hg['enabled'] and ddp_rank == 0:
+        logger.print_and_log(f"Head Gauge Projection (dn4 head-hygiene, applied-update):")
+        logger.print_and_log(
+            f"  ] operation      = U <- U - 1 mu(U)^T on the LM head's Adam update each step (mu = global vocab-row mean)"
+        )
+        logger.print_and_log(
+            f"  ] removes the CE-invisible common-mode gauge from the APPLIED update (NOT exp_avg, NOT post-step weight surgery)"
+        )
+        logger.print_and_log(
+            f"  ] fp32 row-mean + stochastic-rounding bf16 write-back; gauge-invariant -> CE/softmax UNCHANGED, gauge cannot accumulate"
+        )
+        logger.print_and_log(
+            f"  ] init_row_center = {_hg['init_row_center']} (one-time weight-only gauge clean at step 1)"
+        )
+        logger.print_and_log(
+            f"  ] telemetry      = [head-gauge] ||Ubar|| per val step (post ~0 confirms the write-back); + centered geom (logZ_c, ||W_c||)"
         )
 
     # ----------------------- Log row-center head (gauge subtraction) ----------
@@ -5740,7 +5775,9 @@ if __name__ == "__main__":
             raise RuntimeError(f"head_gauge_projection requires a Muon-family optimizer; got "
                                f"{type(optimizer).__name__} (no head_gauge_ids hook).")
         optimizer.head_gauge_ids = {id(_head_w)}
-        optimizer._head_gauge_verify = True   # log ||Ubar|| after each projection (one head param)
+        # _head_gauge_verify stays OFF (default) on the hot path: the per-step projection
+        # logs ||Ubar|| (the gauge it removed); the post-write ~0 check (an extra all-reduce)
+        # was confirmed by the unit test + smoke and isn't recomputed every step in production.
         _matched = [(gi, p) for gi, g in enumerate(optimizer.param_groups)
                     for p in g['params'] if id(p) in optimizer.head_gauge_ids]
         if len(_matched) != 1:

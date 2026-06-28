@@ -1,4 +1,11 @@
-# Centered z-loss — implementation plan (pending Rook greenlight)
+# Centered z-loss — implementation plan
+
+> **STATUS (2026-06-28): BUILT** as the **deadband** variant for dn4 Lever 2 — `z_loss.target:
+> centered` with `tau` → `mean(relu(logZ_c − tau)²)` (a ceiling, not constant pressure, per the
+> Math-approved `DN4_HEAD_HYGIENE_SPEC.md`). Objective A (gradient through μ(W), zero common-mode
+> gradient) as designed below. One refinement over this plan: the centered target logit is formed
+> DIRECTLY in fp32 (`h·(W_target − μ)`) rather than `logZ − h·μ`, avoiding the §3 bf16 cancellation
+> entirely (blind review). Ships OFF; τ/α tuning deferred to post-dn3. The original plan text follows.
 
 **Motivation (from the row-center probe, Nexus #139→#141):** dn2's logZ ≈ 502 decomposes into `h·μ` ≈ 394 (a **CE-invisible common-mode gauge**, 78%) + `logZ_c` ≈ 108 (genuine centered margin, 22%). The current z-loss penalizes **raw** logZ, so ~78% of its gradient budget pushes a free gauge the model can't see in CE. **Centered z-loss** penalizes `logZ_c` instead, aiming 100% of the pressure at the part CE actually responds to.
 
