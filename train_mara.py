@@ -318,6 +318,21 @@ def _row_center_cfg(settings):
     return {'enabled': False, 'warmup': None}
 
 
+def _head_gauge_cfg(settings):
+    """Normalize the head_gauge_projection config (dn4 head-hygiene) to
+    {enabled: bool, init_row_center: bool}. Accepts flat bool
+    (`head_gauge_projection: true`) or nested dict. Off by default. This is the
+    APPLIED-UPDATE gauge projection (in-optimizer), NOT the legacy row_center_head
+    (post-step weight + exp_avg surgery) -- the two are mutually exclusive."""
+    hg = getattr(settings, 'head_gauge_projection', None)
+    if isinstance(hg, bool):
+        return {'enabled': hg, 'init_row_center': hg}
+    if isinstance(hg, dict):
+        return {'enabled': bool(hg.get('enabled', False)),
+                'init_row_center': bool(hg.get('init_row_center', False))}
+    return {'enabled': False, 'init_row_center': False}
+
+
 class GPMTracker:
     """Gradient Productivity Metric — live, on the status line.
 
@@ -1366,6 +1381,11 @@ def train_loop(
     _rc_warmup = _rc_cfg['warmup'] or {}
     row_center_warmup_on = bool(_rc_warmup.get('enabled', False))
     row_center_warmup_start = int(_rc_warmup.get('start_step', 0)) if row_center_warmup_on else None
+    # head_gauge_projection gate (dn4): in-optimizer applied-update gauge projection.
+    # Independent of row_center_head (which is the legacy, mutually-exclusive path).
+    _hg_cfg = _head_gauge_cfg(settings)
+    head_gauge_enabled = _hg_cfg['enabled']
+    head_gauge_init_rc = _hg_cfg['init_row_center']
     # Warmup target gauges (mu0/mbar0), captured once at warmup start and
     # checkpoint-persisted (Guardrail 1). Restored from checkpoint if mid-warmup.
     # Held as fp32 tensors; None until captured. _rc_captured guards single capture.
@@ -1681,6 +1701,17 @@ def train_loop(
             f"{_rc_warmup.get('shape', 'cosine')}) — hard pre-forward projection "
             f"SUPPRESSED; schedule is the sole path to centered."
         )
+
+    # dn4 head-hygiene: one-time WEIGHT-ONLY row-center at init (gauge-clean start),
+    # under its OWN gate -- NOT the legacy row_center_head path (no exp_avg surgery).
+    # Pairs with the in-optimizer applied-update projection to keep the head gauge-free
+    # from step 0. Skipped on resume past step 1 (the stored head is already centered).
+    if head_gauge_init_rc and start_step == 1:
+        _hg0 = _row_center_head_step(model, optimizer, want_exp_avg=False)
+        if _hg0 is not None and ddp_rank == 0:
+            logger.print_and_log(
+                f"[head-gauge] init row-center: ||mu(W)|| "
+                f"{_hg0['mu_w_pre']:.4g} -> {_hg0['mu_w_post']:.2e}")
 
     # Do a baseline validation before training
     if start_step == 1:
@@ -2965,6 +2996,20 @@ def train_loop(
                         f"small_sig(p1/p5/p10)={cg_diag['small_sigma_p1']:.3f}/"
                         f"{cg_diag['small_sigma_p5']:.3f}/{cg_diag['small_sigma_p10']:.3f}"
                     )
+
+                # dn4 head-hygiene: surface the per-step head gauge magnitude removed
+                # from the head's Adam update (||Ubar|| pre; post ~0 confirms the SR
+                # write-back landed). Folded into the centered_geom record + logged.
+                if head_gauge_enabled:
+                    _ub_pre = getattr(optimizer, '_last_head_ubar_pre', None)
+                    _ub_post = getattr(optimizer, '_last_head_ubar_post', None)
+                    if cg_diag is not None:
+                        cg_diag['head_ubar_pre'] = _ub_pre
+                        cg_diag['head_ubar_post'] = _ub_post
+                    if ddp_rank == 0 and _ub_pre is not None:
+                        _pt = f" -> {_ub_post:.2e}" if _ub_post is not None else ""
+                        logger.print_and_log(
+                            f"  [head-gauge] ||Ubar||(removed from head update)={_ub_pre:.3e}{_pt}")
 
             # Log MoE expert utilization (only on rank 0, only when MoE is active)
             if moe_stats[0] and ddp_rank == 0:
@@ -5035,6 +5080,26 @@ class Settings:
                         f"warmup start), or set allow_row_center_with_z_loss: true."
                     )
 
+        # --- head_gauge_projection (dn4 head-hygiene): in-optimizer projection of the
+        # CE-invisible common-mode gauge out of the LM head's APPLIED Adam update each
+        # step. See docs/DN4_HEAD_HYGIENE_SPEC.md. ---
+        if _head_gauge_cfg(self)['enabled']:
+            if self.tie_word_embeddings:
+                fatal_error(
+                    "head_gauge_projection requires an UNTIED output head: projecting the "
+                    "head update's row-mean on a tied head also moves the input embeddings "
+                    "(not function-preserving). Set tie_word_embeddings: false.")
+            if getattr(self, 'muon_adam_state_dtype', 'fp32') != 'fp32':
+                fatal_error(
+                    "head_gauge_projection needs muon_adam_state_dtype: fp32 — any other value "
+                    "selects the FUSED 16-bit Adam path, which applies update+WD internally so "
+                    "the applied update U is never exposed to the projection (silent no-op).")
+            if rc_enabled:
+                fatal_error(
+                    "head_gauge_projection and row_center_head are MUTUALLY EXCLUSIVE (competing "
+                    "head-gauge implementations; the legacy row_center_head also projects exp_avg "
+                    "and does post-step weight surgery). Enable exactly one.")
+
         # --- GDN hybrid attention ---
         if not hasattr(self, 'gdn_enabled'):
             self.gdn_enabled = False
@@ -5644,6 +5709,41 @@ if __name__ == "__main__":
     lr_scale_overrides = {}     # id(param) -> float  (lr_mods)
     optimizer.wd_overrides = wd_overrides
     optimizer.lr_scale_overrides = lr_scale_overrides  # only used by Muon; AdamC ignores this
+
+    # dn4 head-hygiene: register the LM head for in-optimizer applied-update gauge
+    # projection. Built from the POST-FSDP-wrap param so id() matches the object the
+    # optimizer iterates. Assert EXACTLY ONE match in the non-fused Adam path: 0 ⇒ a
+    # silent no-op (id captured pre-wrap / wrong param), >1 ⇒ a wiring bug.
+    if _head_gauge_cfg(settings)['enabled']:
+        _raw = model._orig_mod if hasattr(model, '_orig_mod') else model
+        _head_w = _head_param(_raw)
+        if _head_w is None:
+            raise RuntimeError("head_gauge_projection enabled but the model has no output head.")
+        if getattr(getattr(_raw, 'output', None), 'bias', None) is not None:
+            raise RuntimeError("head_gauge_projection assumes a BIAS-FREE head (the bias mean is "
+                               "its own gauge and would need separate handling).")
+        if not hasattr(optimizer, 'head_gauge_ids'):
+            raise RuntimeError(f"head_gauge_projection requires a Muon-family optimizer; got "
+                               f"{type(optimizer).__name__} (no head_gauge_ids hook).")
+        optimizer.head_gauge_ids = {id(_head_w)}
+        optimizer._head_gauge_verify = True   # log ||Ubar|| after each projection (one head param)
+        _matched = [(gi, p) for gi, g in enumerate(optimizer.param_groups)
+                    for p in g['params'] if id(p) in optimizer.head_gauge_ids]
+        if len(_matched) != 1:
+            raise RuntimeError(f"head_gauge_projection: expected EXACTLY 1 optimizer param to match "
+                               f"the head, got {len(_matched)} (0 ⇒ silent no-op, id() likely captured "
+                               f"before FSDP wrap; >1 ⇒ wiring bug).")
+        _gi, _hp = _matched[0]
+        if _hp.dim() != 2:
+            raise RuntimeError(f"head_gauge_projection: matched head param is {_hp.dim()}-D, expected 2-D [V,D].")
+        if optimizer.param_groups[_gi].get('use_muon', False):
+            raise RuntimeError("head_gauge_projection: matched head is in a Muon group, expected the Adam path.")
+        if getattr(optimizer, '_use_16bit_adam', False):
+            raise RuntimeError("head_gauge_projection: optimizer is in 16-bit Adam mode; U is not exposed.")
+        if ddp_rank == 0:
+            logger.print_and_log(f"[head-gauge] registered LM head {tuple(_hp.shape)} for applied-update "
+                                 f"gauge projection (Adam path group {_gi}; init_row_center="
+                                 f"{_head_gauge_cfg(settings)['init_row_center']}).")
 
     # ----------------------- Parse LR modifiers -----------------------
     lr_mod_entries = None
