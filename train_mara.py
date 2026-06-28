@@ -2939,6 +2939,14 @@ def train_loop(
                                 f"| lr_mult attn={_amult:.3f} ffn={_fmult:.3f}")
                     except Exception:
                         pass
+                    # Tangent-projection strength f at this val step. f is written into the Muon
+                    # body groups every step (~line 1994); surface it here so the ramp is legible --
+                    # ||W|| only visibly flattens as f->1 (much later), so this is the DIRECT readout.
+                    if _tp_on:
+                        _f_log = interpolate_lr_mod(_tps_cfg, step) if _tps_is_sched else float(_tps_cfg)
+                        logger.print_and_log(
+                            f"  [tangent] f={_f_log:.4f}  (radial growth removed {100*_f_log:.1f}%; "
+                            f"||W|| grows at {100*(1.0 - _f_log):.1f}% of natural rate)")
                 # FFN pdr controller (kv3): feed the FFN-median pdr at this diagnostic cadence.
                 # MUST run on ALL ranks with the identical all-reduced param_delta_ratio so
                 # body_lr_ctrl.m stays bit-identical across ranks — the per-step actuator write
@@ -5677,6 +5685,23 @@ if __name__ == "__main__":
         )
         logger.print_and_log(
             f"  ] telemetry      = [head-gauge] ||Ubar|| per val step (post ~0 confirms the write-back); + centered geom (logZ_c, ||W_c||)"
+        )
+
+    # ----------------------- Log tangent projection (Muon body radial-growth control) ----------
+    if getattr(settings, 'tangent_project', False) and ddp_rank == 0:
+        _tps = getattr(settings, 'tangent_project_strength', 1.0)
+        logger.print_and_log(f"Tangent Projection (Muon body radial-growth control):")
+        logger.print_and_log(
+            f"  ] operation      = strip f of the radial (||W) component of each Muon body update "
+            f"-> ||W|| grows at (1-f) of its natural rate  (f=1 flat/frozen, f=0 off)"
+        )
+        if isinstance(_tps, list):
+            logger.print_and_log(f"  ] strength f     = SCHEDULE {_tps}  (linear interp by step)")
+        else:
+            logger.print_and_log(f"  ] strength f     = {float(_tps):.3f} (constant)")
+        logger.print_and_log(
+            f"  ] preserve_norm  = {bool(getattr(settings, 'tangent_project_preserve_norm', False))}"
+            f"  ; live f printed on the [tangent] line every val step"
         )
 
     # ----------------------- Log row-center head (gauge subtraction) ----------
