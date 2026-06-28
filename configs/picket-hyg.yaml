@@ -1,0 +1,102 @@
+# picket-hyg — head-hygiene CANARY, TREATMENT arm (head hygiene ON).
+#
+# Byte-identical to picket-ctrl EXCEPT for the head_gauge_projection block below (Lever 1 ON) and the
+# run_name/port. Same model, data, schedules, seed-path -> the ONLY variable vs the control is the
+# head applied-update gauge projection. Lever 2 (centered z-loss) is OFF in BOTH arms, so this A/B
+# isolates Lever 1 specifically: does projecting the gauge out of the head's Adam update each step,
+# from step 0, KEEP the head gauge-clean (||mu(W)|| flat, logZ_c healthy, raw head ||W|| tame) where
+# the control's head balloons? This is the "after".
+#
+# Watch on this arm: [head-gauge] ||Ubar|| (gauge removed each val step) + [centered-geom]
+# logZ_c/||W_c||/eff_rank_c. Compare raw head ||W|| (dashboard) vs picket-ctrl.
+#
+# Hardware: rig-31, ~4 GPUs, in parallel with picket-ctrl (4+4 of the 8). Fresh from scratch.
+run_name: picket-hyg
+
+ga_schedule:
+  - [0, 65_536]
+  - [4_000, 131_072]
+B: 4
+T: 2048
+max_steps: 15_000
+eval_iters: 2
+val_step: 50
+save_step: 500
+
+data_type: bf16
+FSDP_param_dtype: bf16
+FSDP_reduce_dtype: bf16
+FSDP_buffer_dtype: bf16
+reshard_after_forward: false
+
+resume_training: false
+
+clip_warmup: 1.0
+clip_standard: 1.0
+track_gpm: true
+track_clip_groups: true
+
+use_keel: true
+keel_alpha: null
+cfg_layers: 24
+cfg_heads: 12
+cfg_kv_heads: 6
+cfg_embd: 768
+cfg_intermediate: 2048
+multiple_of: 128
+norm_eps: 1.0e-05
+dropout: 0.0
+use_activation_checkpointing: true
+qk_norm_mode: "before_rope"
+tie_word_embeddings: false
+rope_theta: 500_000.0
+moe_enabled: false
+
+compile_model: true
+compile_mode: default
+
+lr_schedule_type: "cosine"
+max_lr: 3.5e-04
+min_lr: 3.5e-05
+warmup_steps: 1000
+
+optimizer_type: normuon_fsdp2
+beta1: 0.9
+beta2: 0.95
+weight_decay: 0.02
+muon_momentum: 0.95
+muon_ns_steps: 5
+normuon_beta2: 0.99
+muon_adam_state_dtype: fp32   # required: head_gauge_projection needs the non-fused (fp32) Adam path
+
+output_lr_batch_adjust:
+  base_mult: 0.8
+  exponent: 0.3
+
+# ===== THE ONE DIFFERENCE vs picket-ctrl: Lever 1 ON from step 0 =====
+head_gauge_projection:
+  enabled: true
+  init_row_center: true       # one-time weight-only gauge clean at step 1 (fresh-start clean head)
+# z_loss: OFF in BOTH arms (Lever 2 staged; this A/B isolates Lever 1)
+row_center_head:
+  enabled: false              # legacy path; mutually exclusive with head_gauge
+
+transition_health_guard: true
+health_guard_warmup_steps: 150
+
+tok_kind: llama
+tok_path: ../tokenizers/llama_tokenizer
+special_tokens: ../../notebooks/datasets/tokenized/llama/tokenizer_config.json
+data_root_path: ../../notebooks/datasets/tokenized/llama/
+groups:
+  - [stories, [[0, 34.0]]]
+  - [ao3,     [[0, 33.0]]]
+  - [books,   [[0, 33.0]]]
+
+gen_log_file: gen_log.txt
+train_log_file: train_log.txt
+val_log_file: val_log.txt
+server_port: 8902
+
+nas_root: /home/josef/brainbox/checkpoints/current/
+local_checkpoint_root: ~/checkpoints/
