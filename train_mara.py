@@ -4956,6 +4956,17 @@ class Settings:
                     fatal_error(
                         f"z_loss.backend must be 'bf16' or 'fp32_accum', got {bk!r}"
                     )
+                # dn4 Lever 2: penalized quantity. 'raw' (default) = mean(logZ**2);
+                # 'centered' = mean(relu(logZ_c - tau)**2), the gauge-invariant deadband
+                # ceiling (DN4_HEAD_HYGIENE_SPEC, Math-approved). tau required when centered.
+                _ztgt = zl.get('target', 'raw')
+                if _ztgt not in ('raw', 'centered'):
+                    fatal_error(f"z_loss.target must be 'raw' or 'centered', got {_ztgt!r}")
+                if _ztgt == 'centered':
+                    _ztau = zl.get('tau', None)
+                    if not isinstance(_ztau, (int, float)) or isinstance(_ztau, bool):
+                        fatal_error("z_loss.target: centered requires a numeric z_loss.tau "
+                                    "(the deadband ceiling on logZ_c; e.g. 120-128).")
                 warmup = zl.get('warmup')
                 if warmup is not None:
                     if not isinstance(warmup, dict):
@@ -5476,6 +5487,9 @@ if __name__ == "__main__":
         _raw_for_zloss._zloss_fp32_accum = (
             settings.z_loss.get('backend', 'fp32_accum') == 'fp32_accum'
         )
+        # dn4 Lever 2: penalized quantity (raw mean(logZ**2) | centered deadband).
+        _raw_for_zloss._zloss_target = settings.z_loss.get('target', 'raw')
+        _raw_for_zloss._zloss_tau = float(settings.z_loss.get('tau', 0.0))
 
     # ----------------------- Print model summary -----------------------
     flops_per_token = 0
