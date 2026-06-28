@@ -81,19 +81,13 @@ output_lr_batch_adjust:         # DN2's head-LR pacing (NOT a brake — keep)
   base_mult: 0.8
   exponent: 0.3
 
-# Auxiliary heads: KEEP DN2's schedule. Math: orthogonal to head-norm control (they did NOT tame the
-# head), so dn4 keeps them for their representation/readout effect, leaving dn4 == DN2 except for the
-# head hygiene. (Raw z-loss on the aux taps is unaffected by the main-head levers.)
+# Auxiliary heads: OFF. They were tried (DN2) to relieve the main head's readout load / head growth
+# and did NOT tame it -- DN2's head ACCELERATED inside the aux-head-active window (Q10). dn4 is the
+# clean head-hygiene test, so we drop the failed-at-head-control mechanism rather than confound the
+# run with another head-related intervention. (Trade-off: forgoes any representational benefit of
+# distributing readout pressure across depth; acceptable for an isolation experiment.)
 auxiliary_heads:
-  enabled: true
-  share_lm_head: false
-  heads:
-    - layer: 50
-      weight: [[11000, 0.0], [11700, 0.01], [13250, 0.0277], [15000, 0.03]]
-    - layer: 55
-      weight: [[11000, 0.0], [11700, 0.02], [13250, 0.0554], [15000, 0.06]]
-    - layer: 60
-      weight: [[11000, 0.0], [11700, 0.04], [13250, 0.1109], [15000, 0.12]]
+  enabled: false
 
 # ===== dn4 head hygiene =====
 # Lever 1: head applied-update gauge projection, ON from step 0 (the preventive intervention).
