@@ -216,6 +216,31 @@ def do_validation(model, val_loader, device, eval_iters,
         torch.cuda.synchronize()
 
 # -------------------------- Learning Rate Schedule --------------------------
+def _lr_schedule_fingerprint(settings):
+    """Identity of the LR schedule, for the self-anchoring controller's resume guard. The 'auto'
+    LR-track reference r=K_anchor*lr(t)/lr_anchor relies on the SAME schedule for plant and reference;
+    if any of these change across a resume after the anchor is latched, the lr cancellation is invalid
+    and the controller would fight the new curve. Compared in resume_training()."""
+    _sched = str(getattr(settings, 'lr_schedule_type', 'restarts'))
+    fp = [
+        _sched,
+        round(float(getattr(settings, 'max_lr', 0.0)), 12),
+        round(float(getattr(settings, 'min_lr', 0.0)), 12),
+        int(getattr(settings, 'max_steps', 0) or 0),
+        int(getattr(settings, 'warmup_steps', 0) or 0),
+        tuple(getattr(settings, 'restart_steps', ()) or ()),
+        round(float(getattr(settings, 'restart_gamma', 1.0) or 1.0), 12),
+    ]
+    # 'plateau' (get_lr_with_dual_plateau) is shaped by 6 extra settings; capture them too, else a
+    # changed plateau param would slip past the resume guard and the auto controller would fight the
+    # new curve. (cosine/restarts ignore these — harmless to include as defaults.)
+    if _sched == 'plateau':
+        fp += [round(float(getattr(settings, _k, 0.0) or 0.0), 12) for _k in (
+            'first_plat_lr', 'decay_to_first_plat_pct', 'first_plat_len_pct',
+            'decay_to_second_pct', 'second_plat_lr', 'second_plat_len_pct')]
+    return tuple(fp)
+
+
 def get_lr(it: int, settings):
     """
     Unified LR getter that routes to the appropriate schedule based on settings.
@@ -1480,16 +1505,28 @@ def train_loop(
     # _body_param_ids_for_pdr but FFN-only; strips _orig_mod for torch.compile naming. The
     # controller object (body_lr_ctrl) is constructed in main() and threaded in; here we
     # resolve which params its held multiplier is written to. Inert when disabled.
-    _ffn_param_ids_for_ctrl = {
-        id(p) for n, p in (model._orig_mod if hasattr(model, '_orig_mod') else model).named_parameters()
+    # id -> NAME bridge: the resume-stable key for the shadow controller's per-matrix shadow norm S.
+    # The name is the _orig_mod-stripped param name — exactly the key load_state_dict restores S under,
+    # so S survives a process restart (id() does not). The trainer rebuilds this map every run.
+    _ffn_id_to_name = {
+        id(p): n.replace('_orig_mod.', '')
+        for n, p in (model._orig_mod if hasattr(model, '_orig_mod') else model).named_parameters()
         if (lambda _n: _n.endswith('.weight') and any(
             s in _n for s in ('feed_forward.w1', 'feed_forward.w2', 'feed_forward.w3'))
             )(n.replace('_orig_mod.', ''))
     }
+    _ffn_param_ids_for_ctrl = set(_ffn_id_to_name.keys())
     # Attn id-set for the decomposed [body-pdr] readout = body minus ffn (for dense layers this is
     # exactly attention.wq/wk/wv/wo). Lets the line report attn and ffn lr_mult SEPARATELY now that
     # they can be on different schedules (kv2 attn-ramp vs ffn-glide; kv3 ffn-controller vs attn=1.0).
     _attn_param_ids_for_pdr = _body_param_ids_for_pdr - _ffn_param_ids_for_ctrl
+    # acts_on_attn: the controller broadcasts its (FFN-computed) m to the attention matrices too, so the
+    # attn pdr rides the same free-growth glide as the FFN (recovers the picket-hyg attn<->ffn lock-step
+    # that projecting-but-not-compensating attn breaks). The m is applied to this UNION; the radial-budget
+    # WD λ is NOT (it stays FFN-only at _ffn_param_ids_for_ctrl) so attn keeps its flat base WD.
+    _acts_on_attn = bool(getattr(body_lr_ctrl, 'acts_on_attn', False)) if body_lr_ctrl is not None else False
+    _pdr_m_ids = (_ffn_param_ids_for_ctrl | _attn_param_ids_for_pdr) if _acts_on_attn \
+        else _ffn_param_ids_for_ctrl
 
     # Controller is DENSE-FFN-only: it ACTUATES feed_forward.w1/w2/w3 but OBSERVES the diagnostics
     # FFN-aggregate pdr, which under MoE is the EXPERT params — a measure/actuate mismatch (and the
@@ -1504,9 +1541,35 @@ def train_loop(
             raise RuntimeError(
                 "ffn_pdr_controller enabled but found 0 dense feed_forward.w1/w2/w3 params to "
                 "actuate — the controller would have no authority. Check the model topology.")
+        # Shadow modes need an FSDP/DTensor body: the single-device Muon path (SingelDeviceWork) has
+        # no tangent-projection block, so radial_stats is never produced and the controller would have
+        # no telemetry to steer on. Fail loudly rather than silently no-op.
+        if getattr(body_lr_ctrl, 'ref_mode', '') in ('auto_shadow_growth', 'auto_shadow_partial'):
+            from torch.distributed.tensor import DTensor as _DTcheck
+            _raw_m = model._orig_mod if hasattr(model, '_orig_mod') else model
+            _bad = [n for n, p in _raw_m.named_parameters()
+                    if id(p) in _ffn_param_ids_for_ctrl and not isinstance(p, _DTcheck)]
+            if _bad:
+                raise RuntimeError(
+                    f"ffn_pdr_controller shadow mode requires an FSDP/DTensor body, but {len(_bad)} FFN "
+                    "matrices are plain tensors — the single-device Muon path has no tangent-projection "
+                    "block, so no radial telemetry is produced. Run under FSDP2 (world_size>1).")
         if ddp_rank == 0:
+            _attn_n = len(_pdr_m_ids) - len(_ffn_param_ids_for_ctrl)
             logger.print_and_log(
-                f"  FFN pdr controller: actuating {len(_ffn_param_ids_for_ctrl)} dense FFN matrices")
+                f"  FFN pdr controller: actuating {len(_ffn_param_ids_for_ctrl)} dense FFN matrices"
+                + (f" + {_attn_n} attn matrices (acts_on_attn: same m, FFN-only WD)" if _acts_on_attn else ""))
+
+    # Shadow-norm controller (auto_shadow_growth/partial): per-step radial accumulators that observe()
+    # consumes at diagnostic cadence. _shadow_dR holds Σ ΔR_free per matrix NAME; _shadow_eta holds Σ η
+    # (the window's WD-shrink driver for S); _shadow_R / _shadow_gamma hold the latest ‖W‖ / γ per matrix.
+    _shadow_ctrl_on = (body_lr_ctrl is not None and body_lr_ctrl.enabled
+                       and getattr(body_lr_ctrl, 'ref_mode', '')
+                       in ('auto_shadow_growth', 'auto_shadow_partial'))
+    _shadow_dR: dict = {}        # name -> Σ ΔR_free since last observe
+    _shadow_R: dict = {}         # name -> latest ‖W‖
+    _shadow_gamma: dict = {}     # name -> latest γ
+    _shadow_eta = {'sum': 0.0}   # Σ scheduled_lr since last observe (dict for scope-safe mutation)
 
     # ── SCS (Scaffolded Cascading Supervision) per-loop state ───────────────
     # Active when `auxiliary_heads.compute_inactive_layers: false`. The trainer
@@ -2105,7 +2168,7 @@ def train_loop(
         # (it runs after the lr_mods write at 1909, so it wins for FFN params by design).
         if body_lr_ctrl is not None and body_lr_ctrl.enabled and lr_scale_overrides is not None:
             _m_ffn = body_lr_ctrl.current_multiplier()
-            for _pid in _ffn_param_ids_for_ctrl:
+            for _pid in _pdr_m_ids:                       # FFN, + attn when acts_on_attn (same m)
                 lr_scale_overrides[_pid] = _m_ffn
 
         # AWD: compute gradient norms and update multipliers (every check_interval steps)
@@ -2126,6 +2189,16 @@ def train_loop(
             awd.apply_multipliers()
             if awd_updated and ddp_rank == 0:
                 logger.print_and_log(f"  {awd.format_log_line(step)}")
+
+        # Shadow-norm controller: write the radial-budget body WD λ into wd_overrides for the FFN
+        # body matrices. AFTER the WD-rules + AWD writers so the controller OWNS body-FFN WD (the
+        # radial-budget law replaces the hand WD taper). None until the first shadow observe -> skip
+        # (the config's base WD stands until the controller is live). Held value, like the m write.
+        if _shadow_ctrl_on and wd_overrides is not None:
+            _lam_ffn = body_lr_ctrl.current_wd()
+            if _lam_ffn is not None:
+                for _pid in _ffn_param_ids_for_ctrl:
+                    wd_overrides[_pid] = _lam_ffn
 
         # Debug: log current lr_mod and wd values per rule target
         if (lr_mod_entries or wd_entries) and ddp_rank == 0:
@@ -2423,6 +2496,22 @@ def train_loop(
             sys.exit(0)
 
         optimizer.step()
+
+        # Shadow-norm controller: accumulate the per-step radial budget EVERY step, before the
+        # optimizer overwrites radial_stats next step (spec B2). ΔR_free = η·γ·‖W‖ per matrix, with
+        # η = the non-controller body LR (scheduled_lr; m excluded). radial_stats is id-keyed and
+        # GLOBAL (all-reduced), so this is bit-identical across ranks. FFN body matrices only.
+        if _shadow_ctrl_on:
+            _rs = getattr(optimizer, 'radial_stats', None)
+            if _rs:
+                _shadow_eta['sum'] += scheduled_lr
+                for _pid, (_wn, _g) in _rs.items():
+                    _nm = _ffn_id_to_name.get(_pid)
+                    if _nm is None:
+                        continue
+                    _shadow_R[_nm] = _wn
+                    _shadow_gamma[_nm] = _g
+                    _shadow_dR[_nm] = _shadow_dR.get(_nm, 0.0) + scheduled_lr * _g * _wn
 
         if _insitu:
             import torch.distributed as _dist
@@ -2953,6 +3042,12 @@ def train_loop(
                 # applies m on every rank, and any cross-rank drift would desync the optimizer.
                 # (snapshot is built on all ranks; param_delta_ratio is post-all_reduce.) Log r0 only.
                 if body_lr_ctrl is not None and body_lr_ctrl.enabled:
+                    # Current tangent-projection f (all ranks, deterministic). The 'auto' controller
+                    # latches its self-anchored reference only once f>=1 (the true freeze point); 0.0
+                    # when projection is off. scheduled_lr (the live cosine body LR) feeds the LR-track
+                    # reference r=K_anchor*lr/lr_anchor. Both are ignored in 'knots' mode.
+                    _f_now_ctrl = ((interpolate_lr_mod(_tps_cfg, step) if _tps_is_sched else float(_tps_cfg))
+                                   if _tp_on else 0.0)
                     try:
                         # Drop None AND NaN (x == x is False for NaN) so one bad layer can't make
                         # the median NaN; the controller additionally rejects non-finite _fmed_c.
@@ -2960,8 +3055,36 @@ def train_loop(
                                     if l.ffn.param_delta_ratio is not None
                                     and l.ffn.param_delta_ratio == l.ffn.param_delta_ratio]
                         _fmed_c = sorted(_ffn_pdr)[len(_ffn_pdr) // 2] if _ffn_pdr else None
-                        body_lr_ctrl.observe(step, total_tokens_processed / 1e6, _fmed_c)
+                        _radial = ({_nm: (_shadow_R[_nm], _shadow_dR.get(_nm, 0.0),
+                                          _shadow_gamma.get(_nm, 0.0)) for _nm in _shadow_R}
+                                   if _shadow_ctrl_on else None)
+                        _eta_acc = _shadow_eta['sum'] if _shadow_ctrl_on else None
+                        if _shadow_ctrl_on:
+                            # Reset the ΔR_free window BEFORE observe (the snapshot above already
+                            # captured it) so a raising observe() can't leave a dirty window that
+                            # double-counts into S next time. Latest R/γ are kept (overwritten/step).
+                            _shadow_dR.clear()
+                            _shadow_eta['sum'] = 0.0
+                        body_lr_ctrl.observe(step, total_tokens_processed / 1e6, _fmed_c,
+                                             scheduled_lr=scheduled_lr, f_now=_f_now_ctrl,
+                                             radial=_radial, eta_accum=_eta_acc)
+                        # Stamp the LR-schedule fingerprint WITH the anchor (all ranks, deterministic): it
+                        # must describe the schedule the anchor was actually captured against — NOT the
+                        # startup schedule, since a pre-anchor resume could have changed it. The resume
+                        # guard compares against this. Runs on every rank so the checkpointed value matches.
+                        if getattr(body_lr_ctrl, '_just_latched', False):
+                            body_lr_ctrl.lr_fingerprint = _lr_schedule_fingerprint(settings)
                         if ddp_rank == 0:
+                            # auto-mode: announce the anchor latch + any (loose) sanity warning, once.
+                            if getattr(body_lr_ctrl, '_just_latched', False):
+                                logger.print_and_log(
+                                    f"  [ffn-ctrl] AUTO anchor LATCHED @ {step}: "
+                                    f"K_anchor={body_lr_ctrl.K_anchor:.3e} lr_anchor={body_lr_ctrl.lr_anchor:.3e} "
+                                    f"(geomean of {body_lr_ctrl.anchor_samples} post-freeze samples) — "
+                                    f"reference now r=K_anchor*lr/lr_anchor")
+                                if body_lr_ctrl.anchor_warn:
+                                    logger.print_and_log(
+                                        f"  [HEALTH WARNING @ {step}] FFN-ctrl auto-anchor: {body_lr_ctrl.anchor_warn}")
                             _ln = body_lr_ctrl.log_line()
                             if _ln:
                                 logger.print_and_log(_ln)
@@ -2973,6 +3096,14 @@ def train_loop(
                                     f"at floor {body_lr_ctrl.m_floor} while pdr_ffn > "
                                     f"{body_lr_ctrl.alarm_pdr_ratio}*r for {body_lr_ctrl.alarm_consecutive}+ "
                                     f"samples — lower base body/FFN LR (advisory).")
+                            elif body_lr_ctrl.upper_alarm:
+                                logger.print_and_log(
+                                    f"  [HEALTH WARNING @ {step}] FFN-ctrl NO UPWARD AUTHORITY: m pegged at "
+                                    f"m_max={body_lr_ctrl.m_max} while the unclamped demand wants more "
+                                    f"(m_raw={body_lr_ctrl._m_ff_raw:.2f}) — body is BELOW target (cooler than "
+                                    f"reference). Amplification is deliberately forbidden, so this is "
+                                    f"INFORMATIONAL: anchor/reference too high, base LR too low, or the body "
+                                    f"cooling faster than asked. Worrying only if the run also underfits.")
                             elif body_lr_ctrl.inspect:
                                 logger.print_and_log(
                                     f"  [HEALTH WARNING @ {step}] FFN-ctrl m={body_lr_ctrl.m:.3f} < "
@@ -2985,6 +3116,19 @@ def train_loop(
                                     f"  [HEALTH WARNING @ {step}] FFN-ctrl STALLED: {body_lr_ctrl._dropped} "
                                     f"consecutive dropped pdr samples — m HELD at {body_lr_ctrl.m:.3f}, "
                                     f"controller not actuating. Check FFN pdr measurement.")
+                            # auto mode never latched, well past the freeze point = body running UNCONTROLLED
+                            # with no closed loop. Surface loudly (the inline 'AUTO pre-anchor' line is easy
+                            # to miss). Validation already requires f->1, so this catches the residual causes
+                            # (pdr never measured, anchor_step set beyond where f actually reaches 1, etc.).
+                            if (getattr(body_lr_ctrl, 'ref_mode', '') == 'auto' and not body_lr_ctrl.anchor_set
+                                    and step > body_lr_ctrl.anchor_step
+                                    + max(3000, body_lr_ctrl.anchor_samples * int(getattr(settings, 'val_step', 100)) * 5)):
+                                logger.print_and_log(
+                                    f"  [HEALTH WARNING @ {step}] FFN-ctrl AUTO has NOT anchored "
+                                    f"{step - body_lr_ctrl.anchor_step} steps past anchor_step="
+                                    f"{body_lr_ctrl.anchor_step} — m HELD at 1.0, body UNCONTROLLED. Check that "
+                                    f"tangent_project_strength reaches 1.0 and FFN pdr is being measured "
+                                    f"(collected {len(body_lr_ctrl._anchor_buf)}/{body_lr_ctrl.anchor_samples}).")
                     except Exception as _e:
                         # Do NOT silently swallow: a raising observe() means m is HELD (stale) and
                         # the controller has stopped controlling. Inputs are all-reduce-identical so
@@ -2993,6 +3137,12 @@ def train_loop(
                             logger.print_and_log(
                                 f"  [ffn-ctrl] observe FAILED @ {step}: {type(_e).__name__}: {_e} — "
                                 f"m HELD at {body_lr_ctrl.m:.3f}, controller STALLED")
+                    # Auto-anchor sanity FATAL: the captured anchor is implausible vs the (loose) bands.
+                    # All ranks see identical all-reduced inputs, so this fires identically — and it is
+                    # OUTSIDE the try so fatal_error (which exits) is not swallowed by the except above.
+                    if getattr(body_lr_ctrl, 'anchor_fatal', None):
+                        fatal_error(f"ffn_pdr_controller auto-anchor capture is implausible: "
+                                    f"{body_lr_ctrl.anchor_fatal}")
                 if cg_diag is not None and ddp_rank == 0:
                     _lzc = cg_diag.get('logZ_c')
                     _lzc_tag = f" logZ_c={_lzc:.2f}" if _lzc is not None else ""
@@ -3641,17 +3791,112 @@ def resume_training(model, optimizer, train_loader, ddp_rank, settings, grad_acc
         else:
             logger.print_and_log(f"  ] AWD state not found — starting fresh", r0_only=True)
 
-    # STEP 3c: RESTORE FFN pdr controller state (if available). Mirrors AWD: all ranks load
-    # the identical state; missing file is non-fatal (controller starts fresh at m=1.0).
+    # STEP 3c: RESTORE FFN pdr controller state (if available). Mirrors AWD: all ranks load the
+    # identical state. Missing file is non-fatal in knots mode (controller restarts at m=1.0), but in
+    # 'auto' mode a missing file on a POST-ANCHOR resume is FATAL (the self-anchored reference is lost).
     if body_lr_ctrl is not None and getattr(body_lr_ctrl, 'enabled', False):
         ctrl_path = os.path.join(pth, f"bodylr_state_step_{shard_step:06d}.pt")
+        _ref_mode = getattr(body_lr_ctrl, 'ref_mode', 'knots')
+        _ctrl_auto = _ref_mode == 'auto'
+        _ctrl_shadow = _ref_mode in ('auto_shadow_growth', 'auto_shadow_partial')
+        # no-handoff modes (partial, OR growth with freeze_handoff:false) never latch a frozen tail;
+        # the shadow S integral carries the ENTIRE history, so a missing S after f>0 is fatal — vs the
+        # growth+handoff case, whose distinct hazard is re-capturing r_freeze on an already-frozen body.
+        _no_handoff = (_ref_mode == 'auto_shadow_partial') or \
+            (_ref_mode == 'auto_shadow_growth' and not bool(getattr(body_lr_ctrl, 'freeze_handoff', True)))
+        # f at the resume step — shadow resume guards key off the PROJECTION schedule (engagement is
+        # f-gated), not warmup_step. Reconstructed from the same source the train loop uses.
+        _tps_cfg_r = getattr(settings, 'tangent_project_strength', 1.0)
+        _f_resume = ((interpolate_lr_mod(_tps_cfg_r, shard_step) if isinstance(_tps_cfg_r, list)
+                      else float(_tps_cfg_r)) if bool(getattr(settings, 'tangent_project', False)) else 0.0)
         if os.path.exists(ctrl_path):
             body_lr_ctrl.load_state_dict(torch.load(ctrl_path, weights_only=True))
+            # LR-schedule guard: the auto anchor (r=K_anchor*lr/lr_anchor) AND the shadow frozen tail
+            # (r=r_freeze*lr/lr_freeze) both ride lr(t) LITERALLY. If the schedule changed since the
+            # latch, the cancellation is invalid and the controller fights the new curve. Fatal.
+            if (_ctrl_auto and body_lr_ctrl.anchor_set) or (_ctrl_shadow and body_lr_ctrl.frozen):
+                _cur_fp = _lr_schedule_fingerprint(settings)
+                _anc_fp = body_lr_ctrl.lr_fingerprint
+                if _anc_fp is None:
+                    # Latched but no fingerprint recorded (hand-edited / pre-feature checkpoint): can't
+                    # verify the schedule is unchanged. Warn loudly rather than silently skip the guard.
+                    logger.print_and_log(
+                        f"  [HEALTH WARNING @ {shard_step}] FFN-ctrl resume: reference is LATCHED but NO LR "
+                        f"fingerprint was recorded — cannot verify the LR schedule is unchanged. If any LR "
+                        f"setting changed, the LR-track reference is invalid and the controller may fight "
+                        f"the new curve.", r0_only=True)
+                elif tuple(_anc_fp) != _cur_fp:
+                    fatal_error(
+                        f"FFN-ctrl ({_ref_mode}): the LR schedule changed across resume (latched under "
+                        f"{tuple(_anc_fp)}, now {_cur_fp}) — the LR-track reference cancellation is "
+                        f"invalid and the controller would fight the new curve. Restore the original LR "
+                        f"settings.")
+            # freeze_handoff guard: the flag is CONFIG-authoritative (not restored from the checkpoint),
+            # but it gates the post-f=1 LAW. Flipping it across a resume silently switches that law —
+            # true->false abandons the latched LR-track tail for continuous R/S (a kink at the seam);
+            # false->true RE-CAPTURES r_freeze at the resume step (rebasing the experiment, the exact
+            # hazard the missing-state fatals forbid). Once the controller has ENGAGED (shadow_active /
+            # frozen / f>0), a mismatch is fatal; pre-engagement (f=0, no history) it's a benign warn.
+            if _ctrl_shadow:
+                _ck_fho = getattr(body_lr_ctrl, '_ckpt_freeze_handoff', None)
+                _engaged = (getattr(body_lr_ctrl, 'shadow_active', False)
+                            or getattr(body_lr_ctrl, 'frozen', False) or _f_resume > 0.0)
+                if _ck_fho is not None and bool(_ck_fho) != bool(body_lr_ctrl.freeze_handoff):
+                    if _engaged:
+                        fatal_error(
+                            f"FFN-ctrl ({_ref_mode}): freeze_handoff changed across resume "
+                            f"(checkpointed {bool(_ck_fho)}, config now {bool(body_lr_ctrl.freeze_handoff)}) "
+                            f"while the controller is ENGAGED (f={_f_resume:.3f}). This silently switches the "
+                            f"post-f=1 control law (LR-track tail <-> continuous R/S) — true->false kinks the "
+                            f"seam, false->true re-captures r_freeze at the resume step and rebases the run. "
+                            f"Restore the original freeze_handoff value.")
+                    else:
+                        logger.print_and_log(
+                            f"  [HEALTH WARNING @ {shard_step}] FFN-ctrl resume: freeze_handoff differs from "
+                            f"the checkpoint ({bool(_ck_fho)} -> {bool(body_lr_ctrl.freeze_handoff)}) but the "
+                            f"controller has not engaged yet (f=0) — allowed (no history to rebase).",
+                            r0_only=True)
+                elif _ck_fho is None and _engaged:
+                    logger.print_and_log(
+                        f"  [HEALTH WARNING @ {shard_step}] FFN-ctrl resume: checkpoint predates the "
+                        f"freeze_handoff field — cannot verify it is unchanged. If it was flipped, the "
+                        f"post-f=1 law switches silently.", r0_only=True)
             logger.print_and_log(f"  ] FFN-ctrl state restored", r0_only=True)
+        elif _ctrl_auto and shard_step >= (body_lr_ctrl.anchor_step
+                + body_lr_ctrl.anchor_samples * int(getattr(settings, 'val_step', 100))):
+            # PAST the earliest possible anchor-latch point with the anchor state MISSING: we cannot tell
+            # whether the anchor was already latched, and re-capturing on a (now possibly frozen) body would
+            # silently rebase the experiment. Fatal, not a silent re-capture (Math Q11). Before this point
+            # the run could not have collected enough samples to latch, so a missing file there falls through
+            # to the generic post-warmup warn below and simply re-anchors fresh.
+            fatal_error(
+                f"FFN-ctrl auto-mode resume @ {shard_step} is past the earliest anchor-latch point "
+                f"(anchor_step {body_lr_ctrl.anchor_step} + {body_lr_ctrl.anchor_samples} samples) but the "
+                f"controller state file is MISSING ({os.path.basename(ctrl_path)}). Cannot determine whether "
+                f"the anchor was latched; refusing to risk a silent re-capture on a possibly-frozen body. "
+                f"Restore the bodylr_state_*.pt checkpoint.")
+        elif _ctrl_shadow and _ref_mode == 'auto_shadow_growth' and not _no_handoff and _f_resume >= 1.0 - 1e-6:
+            # POST-FREEZE with shadow state MISSING (handoff ON): re-entering the ramp would re-capture
+            # r_freeze on an already-frozen body, rebasing the run. Fatal, not a silent re-capture (spec §8).
+            fatal_error(
+                f"FFN-ctrl auto_shadow_growth resume @ {shard_step} is POST-FREEZE (f={_f_resume:.3f}) but "
+                f"the controller state is MISSING ({os.path.basename(ctrl_path)}) — refusing to silently "
+                f"re-capture r_freeze on an already-frozen body (would rebase the run). Restore the "
+                f"bodylr_state_*.pt checkpoint.")
+        elif _ctrl_shadow and _no_handoff and _f_resume > 0.0:
+            # No-handoff (partial, or growth+freeze_handoff:false): never freezes; S carries the ENTIRE
+            # accumulated history. A fresh S would zero the integral -> m snaps to 1.0, erasing all
+            # controller history. Fatal (spec §8).
+            fatal_error(
+                f"FFN-ctrl {_ref_mode} (no-handoff) resume @ {shard_step} has f={_f_resume:.3f}>0 but the "
+                f"controller state is MISSING ({os.path.basename(ctrl_path)}) — a fresh S would zero the "
+                f"accumulated shadow integral (m -> 1.0, erasing all controller history). Restore the "
+                f"bodylr_state_*.pt checkpoint.")
         elif shard_step > body_lr_ctrl.warmup_step:
             # Resuming PAST warmup with no controller state = the learned K and annealed m are lost;
             # the controller restarts at m=1.0 and re-warms the FFN LR back up over several thousand
             # steps, perturbing the very anneal the run is testing. Surface at HEALTH-WARNING severity.
+            # (Auto pre-anchor lands here too: benign — it simply re-anchors later.)
             logger.print_and_log(
                 f"  [HEALTH WARNING @ {shard_step}] FFN-ctrl state not found on a post-warmup resume "
                 f"— controller RESET to m=1.0; the FFN angular-LR anneal will transiently REHEAT.",
@@ -4849,12 +5094,180 @@ class Settings:
                     fatal_error("ffn_pdr_controller.integral_clamp must be >= 0")
                 if float(_c.get('alarm_pdr_ratio', 1.1)) <= 0.0:
                     fatal_error("ffn_pdr_controller.alarm_pdr_ratio must be > 0")
+                if float(_c.get('upper_alarm_margin', 0.05)) < 0.0:
+                    fatal_error("ffn_pdr_controller.upper_alarm_margin must be >= 0")
                 _ref = _c.get('reference')
                 if _ref is not None and not isinstance(_ref, dict):
                     fatal_error("ffn_pdr_controller.reference must be a dict")
                 if isinstance(_ref, dict):
-                    if not _ref.get('knots'):
-                        fatal_error("ffn_pdr_controller.reference.knots is required (the reference pdr curve).")
+                    _mode = _ref.get('mode', 'knots')
+                    _shadow_modes = ('auto_shadow_growth', 'auto_shadow_partial')
+                    if _mode not in ('knots', 'auto') + _shadow_modes:
+                        fatal_error("ffn_pdr_controller.reference.mode must be one of 'knots', 'auto', "
+                                    f"'auto_shadow_growth', 'auto_shadow_partial', got {_mode!r}")
+                    if _mode == 'knots':
+                        if not _ref.get('knots'):
+                            fatal_error("ffn_pdr_controller.reference.knots is required for mode 'knots' "
+                                        "(the reference pdr curve).")
+                    elif _mode == 'auto':
+                        # 'auto': self-anchored LR-track. No knots; needs the freeze point (anchor_step)
+                        # and tangent projection (it anchors the body's own pdr once f->1).
+                        _as = _ref.get('anchor_step')
+                        if _as is None:
+                            fatal_error("ffn_pdr_controller.reference.anchor_step is required for mode 'auto' "
+                                        "(an int, or 'auto' to derive it from the tangent_project_strength freeze point).")
+                        if isinstance(_as, str) and _as.strip().lower() == 'auto':
+                            # Footgun-killer: derive the freeze step from the f-schedule instead of hand-coupling it
+                            # (and risking a silent mismatch if the schedule is retimed). = the EARLIEST step where f
+                            # reaches its terminal value (so redundant trailing knots like [[..,1.0],[later,1.0]] still
+                            # resolve to the true freeze, not the last knot). Resolved IN-PLACE so the controller and
+                            # every check below see a plain int. Assumes a monotone-up f-schedule (the grow-then-clamp
+                            # shape); the terminal-f==1.0 guard below still gates whether auto is meaningful at all.
+                            _tps_sched = getattr(self, 'tangent_project_strength', None)
+                            if not (isinstance(_tps_sched, list) and _tps_sched and
+                                    all(isinstance(k, (list, tuple)) and len(k) == 2 for k in _tps_sched)):
+                                fatal_error("ffn_pdr_controller.reference.anchor_step: 'auto' needs a "
+                                            "tangent_project_strength SCHEDULE [[step,val],...] to derive the freeze "
+                                            "step from (got a scalar or malformed schedule). Use an explicit int instead.")
+                            _term = float(_tps_sched[-1][1])
+                            _as = next((int(k[0]) for k in _tps_sched if float(k[1]) >= _term - 1e-9),
+                                       int(_tps_sched[-1][0]))
+                            _ref['anchor_step'] = _as   # write the resolved int back into the live config
+                            print(f"[ffn-ctrl] anchor_step: auto -> resolved to {_as} "
+                                  f"(tangent_project_strength reaches its terminal f={_term:g} there).")
+                        if int(_as) <= _ws:
+                            fatal_error(f"ffn_pdr_controller.reference.anchor_step ({_as}) must be > "
+                                        f"warmup_step ({_ws}) — engage before the freeze point.")
+                        if _mxs and int(_as) >= _mxs:
+                            fatal_error(f"ffn_pdr_controller.reference.anchor_step ({_as}) must be < "
+                                        f"max_steps ({_mxs}).")
+                        if int(_ref.get('anchor_samples', 8)) < 1:
+                            fatal_error("ffn_pdr_controller.reference.anchor_samples must be >= 1.")
+                        if not getattr(self, 'tangent_project', False):
+                            fatal_error("ffn_pdr_controller.reference.mode 'auto' requires tangent_project: true "
+                                        "(it self-anchors the reference at the body-freeze point f->1).")
+                        # auto must be able to FREEZE: the controller only anchors once f reaches 1.0. If the
+                        # tangent_project_strength schedule terminates below 1.0, f never freezes, m is held
+                        # at 1 forever, and the controller never latches (silent uncontrolled run). Require
+                        # the terminal f to be ~1.0. (Malformed schedules fall through to the dedicated
+                        # tangent_project_strength validation below.)
+                        _tps = getattr(self, 'tangent_project_strength', 1.0)
+                        _tps_term = None
+                        if isinstance(_tps, (int, float)) and not isinstance(_tps, bool):
+                            _tps_term = float(_tps)
+                        elif isinstance(_tps, list) and _tps and isinstance(_tps[-1], (list, tuple)) \
+                                and len(_tps[-1]) == 2:
+                            try:
+                                _tps_term = float(_tps[-1][1])
+                            except (TypeError, ValueError):
+                                _tps_term = None
+                        if _tps_term is not None and _tps_term < 1.0 - 1e-6:
+                            fatal_error(
+                                f"ffn_pdr_controller.reference.mode 'auto' needs the body to FREEZE, but "
+                                f"tangent_project_strength terminates at f={_tps_term} (<1.0) — f never reaches "
+                                f"1.0, so the controller would hold m=1 forever and never anchor. End the "
+                                f"tangent_project_strength schedule at 1.0.")
+                        # auto's reference r=K_anchor*lr(t)/lr_anchor rides lr LITERALLY, so it assumes a
+                        # MONOTONE-decaying LR. A 'restarts' schedule re-warms lr at each restart_step; any
+                        # restart at/after the freeze would spike r, peg m at m_max, and disable the
+                        # controller for that whole window. Forbid post-freeze restarts under auto.
+                        if str(getattr(self, 'lr_schedule_type', 'restarts')) == 'restarts':
+                            _rs = [int(s) for s in (getattr(self, 'restart_steps', ()) or ())]
+                            _bad = [s for s in _rs if s >= int(_as)]
+                            if _bad:
+                                fatal_error(
+                                    f"ffn_pdr_controller.reference.mode 'auto' assumes a monotone-decaying LR, "
+                                    f"but lr_schedule_type='restarts' re-warms at restart_steps {_bad} >= "
+                                    f"anchor_step ({_as}) — each post-freeze restart would spike the LR-track "
+                                    f"reference, peg m at m_max, and disable the controller. Use "
+                                    f"lr_schedule_type: cosine (or move all restarts before anchor_step).")
+                    elif _mode in _shadow_modes:
+                        # shadow-norm modes (Math Q12): m=median(R/S); body WD=radial-budget law. No knots,
+                        # no anchor — the reference is constructed online. Needs tangent projection
+                        # (radial_stats is produced ONLY by its block) and an FSDP/DTensor body (the
+                        # single-device Muon path has no tangent block — gated at controller-wire time).
+                        if not getattr(self, 'tangent_project', False):
+                            fatal_error(f"ffn_pdr_controller.reference.mode '{_mode}' requires "
+                                        "tangent_project: true (it reads the per-step radial telemetry the "
+                                        "tangent-projection block produces).")
+                        _rho = float(_c.get('rho', 0.20))
+                        if not (0.0 < _rho <= 1.0):
+                            fatal_error(f"ffn_pdr_controller.rho must be in (0,1], got {_rho}")
+                        _lmax = float(_c.get('lambda_max', 0.02)); _lmin = float(_c.get('lambda_min', 0.002))
+                        if not (0.0 <= _lmin <= _lmax):
+                            fatal_error(f"ffn_pdr_controller.lambda_min ({_lmin}) must be in "
+                                        f"[0, lambda_max ({_lmax})].")
+                        _mmf = float(_c.get('m_min_full', 0.20))
+                        if not (0.0 < _mmf <= _mx):
+                            fatal_error(f"ffn_pdr_controller.m_min_full ({_mmf}) must be in (0, m_max ({_mx})].")
+                        _gg = float(_c.get('glide_gain', 1.0))
+                        if not (0.0 < _gg <= 5.0):
+                            fatal_error(f"ffn_pdr_controller.glide_gain ({_gg}) must be in (0, 5] "
+                                        "(1.0 = pure R/S; >1 steepens the cut; Math's preferred band [1.0,1.3]).")
+                        _fho = _c.get('freeze_handoff', True)
+                        if not isinstance(_fho, bool):
+                            fatal_error(f"ffn_pdr_controller.freeze_handoff must be a boolean (true/false), "
+                                        f"got {_fho!r}")
+                        _aoa = _c.get('acts_on_attn', False)
+                        if not isinstance(_aoa, bool):
+                            fatal_error(f"ffn_pdr_controller.acts_on_attn must be a boolean (true/false), "
+                                        f"got {_aoa!r}")
+                        if _mode == 'auto_shadow_partial' and _fho is False:
+                            print("[ffn-ctrl] note: freeze_handoff:false is a no-op for auto_shadow_partial "
+                                  "(partial mode never hands off regardless). It only matters for "
+                                  "auto_shadow_growth.")
+                        for _stale in ('anchor_step', 'anchor_samples', 'anchor_warn_band',
+                                       'anchor_fatal_band', 'anchor_abs_warn', 'knots'):
+                            if _stale in _ref:
+                                fatal_error(f"ffn_pdr_controller.reference.{_stale} does not apply to mode "
+                                            f"'{_mode}' (the reference is constructed online from R/S, not "
+                                            "anchored/fitted). Remove it.")
+                        if 'warmup_step' in _c:
+                            fatal_error("ffn_pdr_controller.warmup_step does not apply to shadow modes "
+                                        "(engagement is f-gated, not step-gated). Remove it.")
+                        if 'm_floor' in _c:
+                            fatal_error("ffn_pdr_controller.m_floor is inert in shadow modes — the f-aware "
+                                        "floor m_min(f)=1-f*(1-m_min_full) replaces it. Use m_min_full.")
+                        # FOOTGUN BANNER: a body WD *schedule* that targets the FFN matrices is SILENTLY
+                        # overridden by the controller's radial-budget λ (the controller owns FFN body WD).
+                        # A flat base WD is fine (it stands for attn + the brief pre-engagement FFN window);
+                        # a SCHEDULE on 'all' or a layer-range [start,end,sched] is the trap — warn loudly.
+                        _wd_rules = getattr(self, 'weight_decay', None)
+                        if isinstance(_wd_rules, list):
+                            for _r in _wd_rules:
+                                if not isinstance(_r, (list, tuple)) or len(_r) < 2:
+                                    continue
+                                _hits_ffn = (len(_r) == 2 and _r[0] == 'all') or \
+                                            (len(_r) == 3 and not isinstance(_r[0], str))
+                                if _hits_ffn and isinstance(_r[-1], list):  # value is a SCHEDULE, not a scalar
+                                    print(
+                                        "\n  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n"
+                                        "  !! WARNING: a body weight_decay SCHEDULE is set, but the shadow\n"
+                                        f"  !!          controller ('{_mode}') OWNS the FFN body WD via the\n"
+                                        "  !!          radial-budget law. This schedule is SILENTLY OVERRIDDEN\n"
+                                        "  !!          for feed_forward.w1/w2/w3 — it affects ONLY attention /\n"
+                                        "  !!          non-FFN body. To tune FFN WD use the controller knobs\n"
+                                        "  !!          (rho, lambda_max, lambda_min), NOT a WD schedule.\n"
+                                        f"  !!          offending rule: {list(_r)[:2]}...\n"
+                                        "  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
+                                    break
+                        # terminal-f policy (Math): growth REQUIRES f->1 (grow-then-clamp); partial ALLOWS f<1.
+                        _tps = getattr(self, 'tangent_project_strength', 1.0)
+                        _term = None
+                        if isinstance(_tps, (int, float)) and not isinstance(_tps, bool):
+                            _term = float(_tps)
+                        elif isinstance(_tps, list) and _tps and isinstance(_tps[-1], (list, tuple)) \
+                                and len(_tps[-1]) == 2:
+                            try:
+                                _term = float(_tps[-1][1])
+                            except (TypeError, ValueError):
+                                _term = None
+                        if _mode == 'auto_shadow_growth' and _term is not None and _term < 1.0 - 1e-6:
+                            fatal_error(
+                                "ffn_pdr_controller.reference.mode 'auto_shadow_growth' is the grow-then-clamp "
+                                f"recipe and REQUIRES the body to fully freeze, but tangent_project_strength "
+                                f"terminates at f={_term} (<1.0). For an intentional partial-projection run, "
+                                "use reference.mode: auto_shadow_partial.")
                     _bf = _ref.get('blend_from')
                     if _bf is not None:
                         if float(_bf.get('start_tok_m', 0)) >= float(_bf.get('end_tok_m', 1)):
@@ -5882,19 +6295,56 @@ if __name__ == "__main__":
     if getattr(settings, 'ffn_pdr_controller', None) is not None:
         from body_lr_controller import BodyLRController
         body_lr_ctrl = BodyLRController(settings.ffn_pdr_controller)
+        # LR-schedule fingerprint: the 'auto' LR-track reference rides this exact schedule (both r and
+        # the plant ∝ lr, so the lr motion cancels in the control error). Captured here, checkpointed,
+        # and re-checked on resume — a changed schedule after anchoring would break the cancellation and
+        # the controller would fight the new curve. (Knots mode: stored but inert.)
+        body_lr_ctrl.lr_fingerprint = _lr_schedule_fingerprint(settings)
         if ddp_rank == 0 and body_lr_ctrl.enabled:
-            logger.print_and_log(
-                f"FFN pdr controller: ENABLED (warmup_step={body_lr_ctrl.warmup_step}, "
-                f"m_floor={body_lr_ctrl.m_floor}, FF-only={not body_lr_ctrl.pid.active})")
-            # The EMA alphas / rate limits are tuned for the diagnostic cadence; observe() actually
-            # fires at settings.val_step. Warn if they differ so a future val_step change can't
-            # silently detune the controller's time constants.
-            _ctrl_cad = int((settings.ffn_pdr_controller or {}).get('cadence', 100))
-            if _ctrl_cad != int(getattr(settings, 'val_step', 100)):
+            if getattr(body_lr_ctrl, 'force_m', None) is not None:
                 logger.print_and_log(
-                    f"  WARNING: ffn_pdr_controller.cadence ({_ctrl_cad}) != val_step "
-                    f"({getattr(settings, 'val_step', 100)}) — observe() fires at val_step; the EMA "
-                    f"alphas/rate-limits were tuned for the cadence value. Align them or retune.")
+                    f"  ## DEBUG force_m={body_lr_ctrl.force_m} -- FFN m is PINNED, controller feedback "
+                    f"BYPASSED. OPEN-LOOP ACTUATOR PROBE ONLY; do NOT use for a real run. ##")
+            if body_lr_ctrl.ref_mode == 'auto':
+                logger.print_and_log(
+                    f"FFN pdr controller: ENABLED — AUTO self-anchored LR-track "
+                    f"(warmup_step={body_lr_ctrl.warmup_step}, anchor_step={body_lr_ctrl.anchor_step}, "
+                    f"anchor_samples={body_lr_ctrl.anchor_samples}, m_floor={body_lr_ctrl.m_floor}, "
+                    f"m_max={body_lr_ctrl.m_max}, FF-only={not body_lr_ctrl.pid.active}); reference is "
+                    f"discovered at the freeze point — no hand-fit knots.")
+            elif body_lr_ctrl.ref_mode in ('auto_shadow_growth', 'auto_shadow_partial'):
+                if body_lr_ctrl.ref_mode == 'auto_shadow_partial':
+                    _ho = "NO-HANDOFF (partial: R/S law throughout, body never fully freezes)"
+                elif body_lr_ctrl.freeze_handoff:
+                    _ho = "f=1 -> LR-track handoff"
+                else:
+                    _ho = "NO-HANDOFF (R/S continues past f=1 -> continuous anneal, no kink)"
+                _scope = ("FFN+attn (acts_on_attn: same m to attn, FFN-only WD)"
+                          if body_lr_ctrl.acts_on_attn else "FF-only")
+                logger.print_and_log(
+                    f"FFN pdr controller: ENABLED — SHADOW-NORM [{body_lr_ctrl.ref_mode}]: "
+                    f"m = median(R/S)^g (glide_gain g={body_lr_ctrl.glide_gain}) constructed online "
+                    f"(no anchor/knots/warmup); body WD = radial-budget "
+                    f"lambda=clamp({body_lr_ctrl.lam_min},{body_lr_ctrl.lam_max}, "
+                    f"rho={body_lr_ctrl.rho}*(1-f)*gamma_EMA); f-aware floor m_min_full={body_lr_ctrl.m_min_full}, "
+                    f"m_max={body_lr_ctrl.m_max}, {_ho}, {_scope}.")
+            else:
+                logger.print_and_log(
+                    f"FFN pdr controller: ENABLED — knots reference "
+                    f"(warmup_step={body_lr_ctrl.warmup_step}, "
+                    f"m_floor={body_lr_ctrl.m_floor}, FF-only={not body_lr_ctrl.pid.active})")
+            # observe() fires at val_step, so val_step IS the controller's cadence (there is no separate
+            # `cadence` field). The EMA alphas + rate limits are per-observe-sample, tuned for val_step ~100;
+            # warn if val_step is far off (a large val_step stretches the EMA time-constant -> sluggish control).
+            _vs = int(getattr(settings, 'val_step', 100))
+            if not (25 <= _vs <= 250):
+                logger.print_and_log(
+                    f"  WARNING: val_step ({_vs}) is far from the ~100 the FFN-ctrl EMA alphas/rate-limits "
+                    f"were tuned for — observe() runs at val_step, so this re-times the controller. Retune "
+                    f"k_ema_alpha/pdr_ema_alpha/rate_* or move val_step toward ~100.")
+            if 'cadence' in (settings.ffn_pdr_controller or {}):
+                logger.print_and_log(
+                    "  note: ffn_pdr_controller.cadence is deprecated and IGNORED — observe() runs at val_step.")
 
     # ----------------------- MoE load balancing hook -----------------------
     moe_balance_hook = None

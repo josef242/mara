@@ -1,18 +1,22 @@
-# dn4 — "PREVENTIVE HEAD HYGIENE". DN2's recipe, FRESH FROM SCRATCH, with the dn4 head levers ON
-# from step 0 instead of bolted on as late retrofits.
+# dn4 — "DN3 BEHAVIOR, WITHOUT THE HEAD EXPLOSION". FRESH FROM SCRATCH: LATE grow-then-clamp body +
+# the shadow-norm pdr controller (no-handoff, acts-on-attn) + preventive head-gauge hygiene from step 0.
 #
-# The dn4 thesis (Q10 / DN4_HEAD_HYGIENE_SPEC, Math-approved): DN2's head grew +221% (≈78% a
-# CE-invisible common-mode gauge), and BOTH of its late fixes FAILED as retrofits at step 18000
-# (z-loss needed a 330x alpha cut then was dropped; row-center destabilized). The open question is
-# whether the SAME hygiene, applied PREVENTIVELY from step 0, simply keeps the head near its healthy
-# birth geometry. dn4 is that test: identical to DN2 in arch/data/schedules/aux-heads, but a fresh
-# run with Lever 1 (head gauge projection) on throughout, row-center/raw-z-loss OFF, and Lever 2
-# (deadband centered z-loss) built-but-staged-off.
+# HEAD THESIS (Q10 / DN4_HEAD_HYGIENE_SPEC, Math-approved): DN2's head grew +221% (~78% a CE-invisible
+# common-mode gauge), and BOTH late fixes FAILED as retrofits at step 18000 (z-loss needed a 330x alpha
+# cut then was dropped; row-center destabilized). dn4 tests whether the SAME hygiene applied PREVENTIVELY
+# from step 0 keeps the head near its healthy birth geometry: Lever 1 (head gauge projection) on
+# throughout, row-center/raw-z-loss OFF, Lever 2 (deadband centered z-loss) built-but-staged-off.
 #
-# Validate cheaply FIRST with the picket-ctrl/picket-hyg canary (rig-31, parallel to dn3) before
-# committing a big rig to this marathon. BODY RECIPE: dn4 keeps DN2's GROWING body (no tangent
-# projection) to isolate the HEAD variable (dn3 is separately settling body control). If the team
-# adopts tangent projection as the default body recipe post-dn3, layer it in here.
+# BODY THESIS (updated 2026-07-01, from the skiff-overlay proof): continued body growth is a POWERFUL
+# REGULARIZER that HELPS learning through the first quarter+ — so let the body grow freely, then clamp it
+# LATE and GENTLY (the body is NOT the runaway; the HEAD is). Recipe = grow freely 0-12k (~9B tokens),
+# anneal f 0->1 over 12k-24k (~9B->~49B tokens), FROZEN 24k+, under the shadow-norm controller:
+# m = median(R/S)^g (no anchor/knots/warmup), NO-HANDOFF continuous anneal past f=1 (no LR-track kink),
+# acts_on_attn (same m to attn -> preserves the attn<->ffn pdr lock-step), modest glide g=1.25,
+# radial-budget body WD. Skiff-overlay (rig-31) reproduced the picket-hyg overlay for BOTH attn+ffn at
+# healthy loss — the definitive proof this controls body+head growth without damaging learning.
+#
+# Validate cheaply FIRST with the skiff canaries before committing a big rig to this 200k-step marathon.
 run_name: dn4
 
 # ===== identical to DN2 (arch / data / optimizer / schedules) =====
@@ -24,8 +28,8 @@ ga_schedule:
   - [10_500, 2_000_000]
   - [14_500, 3_000_000]
   - [17_000, 4_000_000]
-B: 3
-T: 8192
+B: 12
+T: 2048
 max_steps: 200_000
 eval_iters: 2
 val_step: 100
@@ -71,15 +75,54 @@ warmup_steps: 2000
 optimizer_type: normuon_fsdp2
 beta1: 0.9
 beta2: 0.95
-weight_decay: 0.02              # DN2's value. NO aggressive head-WD (the v1-incoherence DO-NOT).
+# body WD: the shadow controller OWNS the FFN body WD via the radial-budget law (lambda = clamp(0.002,
+# 0.02, rho(1-f)*gamma_EMA)) -> high while radial growth is alive, auto-tapering to 0.002 as f->1. No hand
+# taper. The flat [all, 0.002] base stands for attn (acts_on_attn scales attn's LR but NOT its WD) and the
+# brief pre-engagement window. emb/head pinned 0.02 (NOT tangent-projected; NO aggressive head-WD DO-NOT).
+weight_decay:
+  - [emb, 0.02]
+  - [out, 0.02]
+  - [all, 0.002]
 muon_momentum: 0.95
 muon_ns_steps: 5
 normuon_beta2: 0.99
 muon_adam_state_dtype: fp32     # required by head_gauge_projection (non-fused Adam path)
 
-output_lr_batch_adjust:         # DN2's head-LR pacing (NOT a brake — keep)
-  base_mult: 0.8
-  exponent: 0.3
+# output_lr_batch_adjust: REMOVED. It was a head-LR brake (base_mult 0.8x) PLUS a batch-driven head-LR
+# reduction (active here — the GA ramps 32x) — both crude proxies for curbing head growth by slowing the
+# head. With head_gauge_projection (Lever 1) now the real, function-preserving head-growth control, this
+# whole head-LR manipulation is an outmoded crutch. Removed -> the head trains at FULL LR and hygiene does
+# the controlling. (Validated free + harmless by the picket A/B: gauge held ~0 at token-for-token loss.)
+
+# ===== body recipe: LATE grow-then-clamp (body growth helps early -> grow freely, then clamp late) =====
+# Grow freely 0-12k (~9B tokens; bank the regularization benefit), anneal f 0->1 over 12k-24k (~9B->~49B
+# tokens; grow decreasingly, then lock), FROZEN 24k-200k. Terminal f=1.0 required for growth mode.
+tangent_project: true
+tangent_project_preserve_norm: false
+tangent_project_strength: [[0, 0.0], [12_000, 0.0], [24_000, 1.0]]
+
+# Shadow-norm FFN pdr controller: m = median(R/S)^g constructed online (no anchor/knots/warmup) — R is the
+# actual ||W||, S the counterfactual free-growth norm. Idles m=1 while f=0, engages at first f>0 (step 12k).
+# NO-HANDOFF: past f=1 it keeps commanding m=median(R/S) (continuous anneal, no LR-track kink). acts_on_attn
+# broadcasts the SAME m to attn (wq/wk/wv/wo) so attn rides the free-growth glide too (keeps the attn<->ffn
+# lock-step); attn keeps its flat base WD (radial-budget lambda is FFN-only). Modest glide (a little goes a
+# long way over the 176k-step frozen tail). Requires an FSDP/DTensor body + tangent projection (both set).
+ffn_pdr_controller:
+  enabled: true
+  m_min_full: 0.30           # f-aware floor base m_min(f)=1-f*(1-m_min_full); 0.30 (not 0.20) so the long
+                             # no-handoff tail doesn't peg the body LR too low as S keeps outgrowing R
+  m_max: 1.0                 # cuts-only (never amplify; fatal-guarded)
+  rho: 0.20                  # WD radial-budget fraction (WD trims <=20% of remaining radial growth)
+  lambda_max: 0.02           # WD ceiling (high while radial growth is alive)
+  lambda_min: 0.002          # WD floor (residual once the body is clamped)
+  k_ema_alpha: 0.25
+  rate_down: 0.05
+  rate_up: 0.02
+  glide_gain: 1.25           # modest cut (a little goes a long way; steeper would peg m at the floor early)
+  freeze_handoff: false       # NO-HANDOFF: R/S continues past f=1 -> continuous anneal, no kink
+  acts_on_attn: true          # same m to attn (wq/wk/wv/wo); attn keeps flat WD
+  reference:
+    mode: auto_shadow_growth
 
 # Auxiliary heads: OFF. They were tried (DN2) to relieve the main head's readout load / head growth
 # and did NOT tame it -- DN2's head ACCELERATED inside the aux-head-active window (Q10). dn4 is the
@@ -117,13 +160,13 @@ tok_path: ../tokenizers/llama_tokenizer
 special_tokens: ../../notebooks/datasets/tokenized/llama/tokenizer_config.json
 data_root_path: ../../notebooks/datasets/tokenized/llama/
 groups:
-  - [stories,      [[0, 25.0]]]
-  - [ao3,          [[0, 25.0]]]
-  - [books,        [[0, 25.0]]]
-  - [preselect,    [[0, 7.0]]]
+  - [stories,      [[0, 28.0]]]
+  - [ao3,          [[0, 12.0]]]
+  - [books,        [[0, 28.0]]]
+  - [preselect,    [[0, 11.0]]]
   - [code_python,  [[0, 6.0]]]
   - [code_c,       [[0, 6.0]]]
-  - [edufineweb_1.5TT, [[0, 6.0]]]
+  - [edufineweb_1.5TT, [[0, 9.0]]]
 
 gen_log_file: gen_log.txt
 train_log_file: train_log.txt

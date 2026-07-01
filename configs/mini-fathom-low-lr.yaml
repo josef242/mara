@@ -37,7 +37,7 @@ resume_data_reset: continue         # Modes are: continue (no reset), soft (rese
 # Gradient clipping
 clip_warmup: 1.0
 clip_standard: 1.0                # for bf16 1.0 is recommended instead of the old 0.3-0.7
-track_gpm: true
+track_gpm: true                   # Enable Gradient Productivity Metric tracking
 
 # Tokenizer settings
 tok_kind: llama

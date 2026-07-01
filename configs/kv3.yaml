@@ -105,7 +105,6 @@ warmup_steps: 1500
 ffn_pdr_controller:
   enabled: true
   warmup_step: 1500           # m=1.0, loop frozen, until LR-cap; then engage
-  cadence: 100                # informational; actual cadence = val_step (diagnostic steps)
   m_floor: 0.30               # hard floor (lr_scale=0 would FREEZE the body); + alarm below
   m_max: 1.0                  # never amplify body LR above base
   k_ema_alpha: 0.15           # log-space EMA on K = pdr/m
