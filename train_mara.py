@@ -2751,28 +2751,23 @@ def train_loop(
             sched_tag = ""
             if zloss_enabled or (row_center_enabled and row_center_warmup_on):
                 sched_tag = f" | z_a_eff: {zloss_alpha_eff:.3e} | rc_s: {rc_s_eff:.4f}"
-            # GPM: feed this step's (grad-norm, loss), then read the live tag.
-            gpm_tag = ""
+            # GPM: feed the tracker every step (keeps its rolling windows populated), but it's no
+            # longer shown on the status line — the value goes to the train_log below for the
+            # Dashboard's gpm chart. The per-group clip fields (gn_body/gn_head/gn_emb/gn_other/
+            # clip_c) were retired from the line entirely (still computed under track_clip_groups).
+            gpm_train_tag = ""
             if gpm_tracker is not None:
                 gpm_tracker.update(norm, main_loss_val)
-                gpm_tag = gpm_tracker.status_tag()
-            # Probe B clip-group tag: per-group grad norms + clip coef (who is the clip hitting?).
-            # Dashboard-parseable key:value fields, same style as ls/nrm/zloss.
-            clip_tag = ""
-            if _clip_groups is not None:
-                _cg = _clip_groups
-                clip_tag = (f" | gn_body: {_cg['body']:.4f} | gn_head: {_cg['head']:.4f}"
-                            f" | gn_emb: {_cg['emb']:.4f} | gn_other: {_cg['other']:.4f}"
-                            f" | clip_c: {_cg['clip_coef']:.4f}")
+                gpm_train_tag = gpm_tracker.status_tag()   # ' | gpm: +0.31/+0.25' or ' | gpm: pending'
             # NOTE: body pdr is NOT on the per-step line — it's a val_step-cadence quantity,
             # emitted as its own [body-pdr] line in the diagnostics block below.
             logger.print_and_log(
-                f"st: {step:5d} | ls: {main_loss_val:.6f} | ppl: {ppl:.2f} | lr: {lr:.4e} | nrm: {norm:.4f} [{clip_value:.1f}] | dt: {dt:.2f}s | t_tk: {total_tokens_processed:11,d} | tok/s: {tokens_per_sec:.0f} | MFU: {mfu:.0f}%{bal_tag}{drp_tag}{trunc_tag}{scs_tag}{tot_tag}{aux_tag}{z_tag}{rc_tag}{gpm_tag}{clip_tag}{sched_tag}",
+                f"st: {step:5d} | ls: {main_loss_val:.6f} | ppl: {ppl:.2f} | lr: {lr:.4e} | nrm: {norm:.4f} [{clip_value:.1f}] | dt: {dt:.2f}s | t_tk: {total_tokens_processed:11,d} | tok/s: {tokens_per_sec:.0f} | MFU: {mfu:.0f}%{bal_tag}{drp_tag}{trunc_tag}{scs_tag}{tot_tag}{aux_tag}{z_tag}{rc_tag}{sched_tag}",
             )
 
             _sched_silent = f"|z_a_eff={zloss_alpha_eff:.6e}|rc_s={rc_s_eff:.6f}" if sched_tag else ""
             logger.print_and_log(
-                f"{step:5d}|{main_loss_val:.6f}|{ppl:.2f}|{lr:.4e}|{norm:.4f}|{dt:.2f}|{total_tokens_processed:11d}|{tokens_per_sec:.0f}{tot_silent}{aux_silent}{z_silent}{rc_silent}{_sched_silent}",
+                f"{step:5d}|{main_loss_val:.6f}|{ppl:.2f}|{lr:.4e}|{norm:.4f}|{dt:.2f}|{total_tokens_processed:11d}|{tokens_per_sec:.0f}{tot_silent}{aux_silent}{z_silent}{rc_silent}{_sched_silent}{gpm_train_tag}",
                 True, settings.train_log_file, silent=True
             )
 
@@ -2986,6 +2981,13 @@ def train_loop(
             if diagnostics is not None:
                 awd_diag = awd.get_diagnostics_data() if awd is not None else None
                 moe_diag = moe_stats[0] if moe_stats[0] else None
+                # dn4 head-hygiene ||Ubar|| pre/post must join the centered-geom record
+                # BEFORE log_diagnostics() writes the jsonl line — folding it after the
+                # write (as the [head-gauge] print block below once did) left the values
+                # gen_log-only, invisible to every diagnostics.jsonl consumer.
+                if head_gauge_enabled and cg_diag is not None:
+                    cg_diag['head_ubar_pre'] = getattr(optimizer, '_last_head_ubar_pre', None)
+                    cg_diag['head_ubar_post'] = getattr(optimizer, '_last_head_ubar_post', None)
                 snapshot = diagnostics.log_diagnostics(
                     step, settings.nas_path, total_tokens_processed,
                     awd_data=awd_diag, moe_data=moe_diag,
@@ -3159,13 +3161,11 @@ def train_loop(
 
                 # dn4 head-hygiene: surface the per-step head gauge magnitude removed
                 # from the head's Adam update (||Ubar|| pre; post ~0 confirms the SR
-                # write-back landed). Folded into the centered_geom record + logged.
+                # write-back landed). Already folded into centered_geom above (before
+                # the jsonl write); this is just the gen_log surface.
                 if head_gauge_enabled:
                     _ub_pre = getattr(optimizer, '_last_head_ubar_pre', None)
                     _ub_post = getattr(optimizer, '_last_head_ubar_post', None)
-                    if cg_diag is not None:
-                        cg_diag['head_ubar_pre'] = _ub_pre
-                        cg_diag['head_ubar_post'] = _ub_post
                     if ddp_rank == 0 and _ub_pre is not None:
                         _pt = f" -> {_ub_post:.2e}" if _ub_post is not None else ""
                         logger.print_and_log(
