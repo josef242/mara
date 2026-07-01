@@ -42,20 +42,29 @@ FSDP_buffer_dtype: bf16
 reshard_after_forward: true
 
 # FRESH FROM SCRATCH (the whole point — preventive, not a retrofit on a grown head).
-resume_training: false
+resume_training: true
+resume_step: 1_750
+resume_data_reset: continue
 
 clip_warmup: 2.0
-clip_standard: 1.0
+clip_standard: 1.5
 track_gpm: true
 track_clip_groups: true
 
 use_keel: true
 keel_alpha: null
-cfg_layers: 69
-cfg_heads: 40
-cfg_kv_heads: 20
-cfg_embd: 2560
-cfg_intermediate: 7680
+# cfg_layers: 80
+# cfg_heads: 40
+# cfg_kv_heads: 20
+# cfg_embd: 2560
+# cfg_intermediate: 5120
+
+cfg_layers: 101
+cfg_heads: 32
+cfg_kv_heads: 16
+cfg_embd: 2048
+cfg_intermediate: 5120
+
 norm_eps: 1.0e-05
 dropout: 0.0
 use_activation_checkpointing: true
@@ -160,6 +169,7 @@ tok_path: ../tokenizers/llama_tokenizer
 special_tokens: ../../notebooks/datasets/tokenized/llama/tokenizer_config.json
 data_root_path: ../../notebooks/datasets/tokenized/llama/
 groups:
+  #  - [stories,      [[0, 100.0]]]
   - [stories,      [[0, 28.0]]]
   - [ao3,          [[0, 12.0]]]
   - [books,        [[0, 28.0]]]
