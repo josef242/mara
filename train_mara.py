@@ -5670,6 +5670,38 @@ class Settings:
                     "these flags MUST match the run being resumed (no automatic mismatch guard "
                     "yet); flipping them mid-run silently changes attention semantics.")
 
+        # --- swa (branch doc-mask, festival feature 2): hybrid sliding-window attention.
+        # Local layers attend a causal window of `window` tokens (composes with the doc
+        # mask); every `global_interleave`-th layer stays global. OFF by default. ---
+        _sw = getattr(self, 'swa', None) or {}
+        if _sw is True:
+            _sw = {'enabled': True}
+        if not isinstance(_sw, dict):
+            fatal_error("swa must be a dict {enabled, window, global_interleave} or true")
+        _sw_known = {'enabled', 'window', 'global_interleave'}
+        _sw_typos = set(_sw) - _sw_known
+        if _sw_typos:
+            fatal_error(f"swa: unknown key(s) {sorted(_sw_typos)} — known: {sorted(_sw_known)}")
+        self.swa_enabled = bool(_sw.get('enabled', False))
+        self.swa_window = int(_sw.get('window', 512))
+        self.swa_global_interleave = int(_sw.get('global_interleave', 4))
+        if self.swa_enabled:
+            if self.gdn_enabled:
+                fatal_error("swa is not supported with gdn_enabled (hybrid patterns collide)")
+            if getattr(self, 'attn_res_enabled', False):
+                fatal_error("swa with attn_res_enabled is untested — validate separately")
+            if not bool(getattr(self, 'compile_model', False)):
+                fatal_error("swa requires compile_model: true (uncompiled flex_attention "
+                            "materializes full score matrices)")
+            if self.swa_window <= 0:
+                fatal_error(f"swa.window must be > 0, got {self.swa_window}")
+            if self.swa_global_interleave < 1:
+                fatal_error(f"swa.global_interleave must be >= 1, got {self.swa_global_interleave}")
+            if self.swa_window >= int(getattr(self, 'T', 0) or 0):
+                logger.print_and_log(
+                    f"  ] [swa] NOTE: window ({self.swa_window}) >= T ({self.T}) — local "
+                    f"layers degenerate to full causal; the feature is a no-op at this T.")
+
     def handle_arguments(self, args: argparse.Namespace):
         """Update settings based on command line arguments."""
         if args.run_name:
@@ -6014,12 +6046,23 @@ if __name__ == "__main__":
         doc_attn_mask=settings.doc_attn_mask_enabled,
         doc_pos_reset=settings.doc_pos_reset,
         bos_token_id=settings.doc_bos_token_id,
+        # Sliding-window attention (branch doc-mask, festival feature 2)
+        swa_enabled=settings.swa_enabled,
+        swa_window=settings.swa_window,
+        swa_global_interleave=settings.swa_global_interleave,
     )
     if settings.doc_attn_mask_enabled or settings.doc_pos_reset:
         logger.print_and_log(
             f"  ] [doc-mask] attention mask: {'ON (causal AND same-doc, FlexAttention)' if settings.doc_attn_mask_enabled else 'off'}"
             f" | RoPE reset at BOS: {'ON' if settings.doc_pos_reset else 'off'}"
             f" | BOS id: {settings.doc_bos_token_id}")
+    if settings.swa_enabled:
+        _n_glob = sum(1 for i in range(settings.cfg_layers)
+                      if i % settings.swa_global_interleave == settings.swa_global_interleave - 1)
+        logger.print_and_log(
+            f"  ] [swa] hybrid sliding-window: W={settings.swa_window}, "
+            f"{settings.cfg_layers - _n_glob} local / {_n_glob} global layers "
+            f"(every {settings.swa_global_interleave}th global)")
 
     # ----------------------- Save Settings Config File -----------------------
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
