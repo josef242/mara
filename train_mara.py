@@ -4592,9 +4592,10 @@ def create_and_shard_model(model_cfg, dp_mesh, ep_mesh, edp_mesh, device, settin
         logger.print_and_log(f"  ] Moved {n_moved} buffers to {device}")
 
     # Initialize weights with synchronized RNG across all ranks
-    logger.print_and_log(f"  ] Initializing weights (synchronized seed=42)")
-    torch.manual_seed(42)
-    torch.cuda.manual_seed(42)
+    _seed = int(getattr(settings, 'seed', 42))
+    logger.print_and_log(f"  ] Initializing weights (synchronized seed={_seed})")
+    torch.manual_seed(_seed)
+    torch.cuda.manual_seed(_seed)
     if hasattr(model, 'init_weights'):
         model.init_weights()
     else:
@@ -5853,9 +5854,15 @@ if __name__ == "__main__":
     logger.print_and_log(f"Run Name: {settings.run_name}")
     logger.print_and_log(f"======================================================")
 
-    torch.manual_seed(42)
+    # seed: config knob (default 42 — the historical constant). Changes INIT only:
+    # the data loader is RNG-free (core-review verified), so data order is seed-invariant.
+    # A seed-pair therefore measures the init-variance noise floor for paired A/B arms.
+    _seed = int(getattr(settings, 'seed', 42))
+    torch.manual_seed(_seed)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(42)
+        torch.cuda.manual_seed_all(_seed)
+    if _seed != 42:
+        logger.print_and_log(f"  ] NOTE: non-default seed={_seed} (noise-floor / seed-ablation run)")
 
     # ----------------------- Create the data loaders -----------------------
     # Build data schedule from groups (if any group has per-step waypoints).
