@@ -1,0 +1,78 @@
+# _freqs_check_micro — throwaway diagnostic: boot the REAL trainer flow for a few steps
+# to read the [freqs-check] banner (RoPE buffer integrity after meta-init). Not an experiment.
+run_name: freqs-check-micro
+
+ga_schedule:
+  - [0, 16_384]
+B: 4
+T: 512
+max_steps: 3
+eval_iters: 1
+val_step: 100000
+save_step: 100000
+
+data_type: bf16
+FSDP_param_dtype: bf16
+FSDP_reduce_dtype: bf16
+FSDP_buffer_dtype: bf16
+reshard_after_forward: true
+
+resume_training: false
+
+clip_warmup: 1.0
+clip_standard: 1.0
+track_gpm: false
+track_clip_groups: false
+
+use_keel: true
+keel_alpha: null
+cfg_layers: 6
+cfg_heads: 4
+cfg_kv_heads: 2
+cfg_embd: 256
+cfg_intermediate: 512
+multiple_of: 128
+norm_eps: 1.0e-05
+dropout: 0.0
+use_activation_checkpointing: true
+qk_norm_mode: "before_rope"
+tie_word_embeddings: false
+rope_theta: 500_000.0
+moe_enabled: false
+
+compile_model: false
+compile_mode: default
+
+lr_schedule_type: "cosine"
+max_lr: 3.0e-04
+min_lr: 3.0e-05
+warmup_steps: 2
+
+optimizer_type: normuon_fsdp2
+beta1: 0.9
+beta2: 0.95
+muon_momentum: 0.95
+muon_ns_steps: 5
+normuon_beta2: 0.99
+
+weight_decay: 0.01
+
+row_center_head:
+  enabled: false
+
+transition_health_guard: false
+
+tok_kind: llama
+tok_path: ../tokenizers/llama_tokenizer
+special_tokens: ../../notebooks/datasets/tokenized/llama/tokenizer_config.json
+data_root_path: ../../notebooks/datasets/tokenized/llama/
+groups:
+  - [stories, [[0, 100.0]]]
+
+gen_log_file: gen_log.txt
+train_log_file: train_log.txt
+val_log_file: val_log.txt
+server_port: 8940
+
+nas_root: /tmp/freqs_check/
+local_checkpoint_root: /tmp/freqs_check_local/

@@ -33,13 +33,18 @@ from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
 )
 
-# Use absolute path to ensure we get common_fsdp2, not common
-common_path = '../common_fsdp2'
+# Use absolute path to ensure we get common_fsdp2, not common.
+# doc-mask branch: pair with the common_fsdp2-docmask WORKTREE so the branch pair
+# (mara_fsdp2-docmask + common_fsdp2-docmask) is self-consistent regardless of what
+# the main trees have checked out. Falls back to ../common_fsdp2 off-branch.
+common_path = '../common_fsdp2-docmask'
+if not os.path.isdir(common_path):
+    common_path = '../common_fsdp2'
 if common_path not in sys.path:
     sys.path.insert(0, common_path)  # insert at the beginning to prioritize
 
 from tokenizer_abstraction import get_tokenizer
-from model_v2 import Transformer, ModelArgs
+from model_v2 import Transformer, ModelArgs, precompute_freqs_cis
 from configure_optimizers import configure_optimizers, summarize_optimizer_settings, MUON_FAMILY, DION_FAMILY, FSDP2_MUON_FAMILY, VALID_OPTIMIZER_TYPES
 import logger
 from dataloader import PercentageDataLoader, DataMixSchedule
@@ -5941,6 +5946,23 @@ if __name__ == "__main__":
 
     # ----------------------- Create and shard model -----------------------
     model = create_and_shard_model(model_cfg, mesh, ep_mesh, edp_mesh, device, settings, logger)
+    # [freqs-check] RoPE buffer integrity after the meta->fully_shard->to_empty->init_weights
+    # flow: to_empty() clobbers value-carrying buffers and init_weights never refilled them
+    # (found during the doc-mask review; see doc_pos_reset). Verify against a fresh table.
+    _rc, _rs = precompute_freqs_cis(
+        model_cfg.dim // model_cfg.n_heads, model_cfg.max_seq_len,
+        getattr(model_cfg, 'rope_theta', 500000.0))
+    _bc = model.freqs_cos.detach().cpu().float()
+    _bs = model.freqs_sin.detach().cpu().float()
+    # tolerance wide enough for a bf16-cast of CORRECT values; corruption (zeros /
+    # stale block contents) is orders of magnitude outside it
+    _cos_ok = torch.allclose(_bc, _rc, atol=1e-2)
+    _sin_ok = torch.allclose(_bs, _rs, atol=1e-2)
+    logger.print_and_log(
+        f"  ] [freqs-check] cos ok: {_cos_ok} | sin ok: {_sin_ok} | dtype {model.freqs_cos.dtype} "
+        f"| cos absmax {_bc.abs().max():.4f} (ref {_rc.abs().max():.4f}) "
+        f"| sin absmax {_bs.abs().max():.4f} | sin==ref_COS: {torch.allclose(_bs, _rc, atol=1e-2)} "
+        f"| row1[:4] {_bc[1, :4].tolist()} ref {_rc[1, :4].tolist()}")
 
     # Z-loss is a trainer/loss-path concern, not a ModelArgs/architecture knob,
     # so set the backend flag on the raw module post-build (before per-submodule

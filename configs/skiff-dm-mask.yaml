@@ -1,0 +1,100 @@
+# skiff-dm-ctrl — doc-mask A/B/C, ARM B (MASK-ONLY): doc masking on, positions continuous.
+#
+# The doc-mask experiment (branch doc-mask): the packed stream separates documents with BOS
+# (id 32000) and attention flows across boundaries today. Three PAIRED arms (seed 42 fixed at
+# launch -> identical init + identical data order; arms differ ONLY in the doc_attn_mask block):
+#   A ctrl: doc_attn_mask off, reset_positions off   (today's behavior)
+#   B mask: doc_attn_mask ON,  reset_positions off   (attribution arm, staged round 2)
+#   C full: doc_attn_mask ON,  reset_positions ON    (full treatment)
+# Round 1 = A + C side-by-side (4 GPUs each on rig-31); B runs round 2 for attribution.
+# Recipe = skiff arch/data/optimizer with the controller/tangent machinery STRIPPED (plain free
+# growth) — fewest moving parts for a clean attention-semantics read. Narrative 3-group mix
+# (stories/ao3/books) is BOS-dense, which maximizes the effect the experiment measures.
+run_name: skiff-dm-mask
+
+ga_schedule:
+  - [0, 65_536]
+B: 4
+T: 2048
+max_steps: 12_000
+eval_iters: 2
+val_step: 50
+save_step: 500
+
+data_type: bf16
+FSDP_param_dtype: bf16
+FSDP_reduce_dtype: bf16
+FSDP_buffer_dtype: bf16
+reshard_after_forward: false
+
+resume_training: false
+
+clip_warmup: 1.0
+clip_standard: 1.0
+track_gpm: true
+track_clip_groups: true
+track_subgroup_pdr: true
+
+use_keel: true
+keel_alpha: null
+cfg_layers: 24
+cfg_heads: 12
+cfg_kv_heads: 6
+cfg_embd: 768
+cfg_intermediate: 2048
+multiple_of: 128
+norm_eps: 1.0e-05
+dropout: 0.0
+use_activation_checkpointing: true
+qk_norm_mode: "before_rope"
+tie_word_embeddings: false
+rope_theta: 500_000.0
+moe_enabled: false
+
+compile_model: true
+compile_mode: default
+
+lr_schedule_type: "cosine"
+max_lr: 3.5e-04
+min_lr: 3.5e-05
+warmup_steps: 1000
+
+optimizer_type: normuon_fsdp2
+beta1: 0.9
+beta2: 0.95
+muon_momentum: 0.95
+muon_ns_steps: 5
+normuon_beta2: 0.99
+
+weight_decay:
+  - [emb, 0.02]
+  - [out, 0.02]
+  - [all, 0.002]
+
+row_center_head:
+  enabled: false
+
+# ===== THE TREATMENT (this arm: mask ON, positions continuous — attribution arm) =====
+doc_attn_mask:
+  enabled: true
+  reset_positions: false
+
+transition_health_guard: true
+health_guard_warmup_steps: 150
+
+tok_kind: llama
+tok_path: ../tokenizers/llama_tokenizer
+special_tokens: ../../notebooks/datasets/tokenized/llama/tokenizer_config.json
+data_root_path: ../../notebooks/datasets/tokenized/llama/
+groups:
+  - [stories, [[0, 34.0]]]
+  - [ao3,     [[0, 33.0]]]
+  - [books,   [[0, 33.0]]]
+
+gen_log_file: gen_log.txt
+train_log_file: train_log.txt
+val_log_file: val_log.txt
+server_port: 8917
+
+nas_root: /home/josef/brainbox/checkpoints/current/
+local_checkpoint_root: ~/checkpoints/
