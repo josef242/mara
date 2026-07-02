@@ -1857,6 +1857,7 @@ def train_loop(
         # resume-safe, no checkpoint state. Accumulators stay zero when z-loss
         # is disabled, so logging gates cleanly on zloss_enabled.
         zloss_accum = torch.zeros((), device=device)
+        mtp_accum = torch.zeros((), device=device)
         logZ_accum = torch.zeros((), device=device)
         logZ_p95_last = 0.0          # last micro-step's logZ 95th pctile (snapshot)
         zloss_alpha_eff = get_zloss_alpha(step, settings)
@@ -2044,6 +2045,17 @@ def train_loop(
                         _p95 = getattr(raw_for_z, '_last_logz_p95', None)
                         if _p95 is not None:
                             logZ_p95_last = _p95.detach().float().item()
+
+                # MTP: fold lambda * mtp_loss into the objective (z-loss pattern —
+                # added BEFORE the trunc/grad-accum scaling below so it gets the
+                # identical normalisation; headline ls: reads main_loss_accum and
+                # stays pure t+1 CE). The raw value is accumulated for logging.
+                if settings.mtp_enabled:
+                    raw_for_mtp = fwd_model._orig_mod if hasattr(fwd_model, '_orig_mod') else fwd_model
+                    _mtp_sel = getattr(raw_for_mtp, '_last_mtp_loss', None)
+                    if _mtp_sel is not None:
+                        total_loss = total_loss + settings.mtp_loss_weight * _mtp_sel
+                        mtp_accum += _mtp_sel.detach().float() / grad_accum_steps
 
                 # Apply the same truncation weighting + grad-accum normalisation
                 # to both. backward() runs on total_loss so the optimiser sees
@@ -2736,6 +2748,12 @@ def train_loop(
             # consistently.
             z_tag = ""
             z_silent = ""
+            mtp_tag = ""
+            mtp_silent = ""
+            if settings.mtp_enabled:
+                _mtp_val = mtp_accum.item()
+                mtp_tag = f" | mtp: {_mtp_val:.4f}"
+                mtp_silent = f"|mtp={_mtp_val:.6f}"
             if zloss_enabled:
                 zloss_val = zloss_accum.item()
                 logZ_val = logZ_accum.item()
@@ -2802,12 +2820,12 @@ def train_loop(
             # NOTE: body pdr is NOT on the per-step line — it's a val_step-cadence quantity,
             # emitted as its own [body-pdr] line in the diagnostics block below.
             logger.print_and_log(
-                f"st: {step:5d} | ls: {main_loss_val:.6f} | ppl: {ppl:.2f} | lr: {lr:.4e} | nrm: {norm:.4f} [{clip_value:.1f}] | dt: {dt:.2f}s | t_tk: {total_tokens_processed:11,d} | tok/s: {tokens_per_sec:.0f} | MFU: {mfu:.0f}%{bal_tag}{drp_tag}{trunc_tag}{scs_tag}{tot_tag}{aux_tag}{z_tag}{rc_tag}{sched_tag}",
+                f"st: {step:5d} | ls: {main_loss_val:.6f} | ppl: {ppl:.2f} | lr: {lr:.4e} | nrm: {norm:.4f} [{clip_value:.1f}] | dt: {dt:.2f}s | t_tk: {total_tokens_processed:11,d} | tok/s: {tokens_per_sec:.0f} | MFU: {mfu:.0f}%{bal_tag}{drp_tag}{trunc_tag}{scs_tag}{tot_tag}{aux_tag}{z_tag}{mtp_tag}{rc_tag}{sched_tag}",
             )
 
             _sched_silent = f"|z_a_eff={zloss_alpha_eff:.6e}|rc_s={rc_s_eff:.6f}" if sched_tag else ""
             logger.print_and_log(
-                f"{step:5d}|{main_loss_val:.6f}|{ppl:.2f}|{lr:.4e}|{norm:.4f}|{dt:.2f}|{total_tokens_processed:11d}|{tokens_per_sec:.0f}{tot_silent}{aux_silent}{z_silent}{rc_silent}{_sched_silent}{gpm_train_tag}",
+                f"{step:5d}|{main_loss_val:.6f}|{ppl:.2f}|{lr:.4e}|{norm:.4f}|{dt:.2f}|{total_tokens_processed:11d}|{tokens_per_sec:.0f}{tot_silent}{aux_silent}{z_silent}{mtp_silent}{rc_silent}{_sched_silent}{gpm_train_tag}",
                 True, settings.train_log_file, silent=True
             )
 
@@ -4566,6 +4584,11 @@ def create_and_shard_model(model_cfg, dp_mesh, ep_mesh, edp_mesh, device, settin
     if getattr(model, 'aux_heads', None) is not None and len(model.aux_heads) > 0:
         for aux_head in model.aux_heads.values():
             fully_shard(aux_head, mesh=dp_mesh, mp_policy=mp_policy, reshard_after_forward=reshard_after_forward, offload_policy=offload_policy)
+    # MTP module: its own FSDP unit (aux-head pattern) — fires once per training
+    # forward after the trunk, so an independent unshard/reshard cycle keeps it
+    # off the trunk's all-gather schedule.
+    if getattr(model, 'mtp', None) is not None:
+        fully_shard(model.mtp, mesh=dp_mesh, mp_policy=mp_policy, reshard_after_forward=reshard_after_forward, offload_policy=offload_policy)
     fully_shard(model, mesh=dp_mesh, mp_policy=mp_policy, reshard_after_forward=False, offload_policy=offload_policy)
 
     # Materialize: CPU offload requires params on CPU; FSDP handles H2D transfers
@@ -5720,6 +5743,36 @@ class Settings:
                     "truncation can run an all-local layer prefix (the global layers land in "
                     "the truncated tail), silently removing long-range attention entirely.")
 
+        # --- mtp (branch doc-mask, festival feature 3): DeepSeek-style sequential
+        # multi-token prediction (t+2) through one extra block + shared norm/head.
+        # Auxiliary objective, z-loss pattern: headline ls:/val stay pure t+1 CE. ---
+        _mt = getattr(self, 'mtp', None) or {}
+        if _mt is True:
+            _mt = {'enabled': True}
+        if not isinstance(_mt, dict):
+            fatal_error("mtp must be a dict {enabled, loss_weight} or true")
+        _mt_known = {'enabled', 'loss_weight'}
+        _mt_typos = set(_mt) - _mt_known
+        if _mt_typos:
+            fatal_error(f"mtp: unknown key(s) {sorted(_mt_typos)} — known: {sorted(_mt_known)}")
+        self.mtp_enabled = bool(_mt.get('enabled', False))
+        self.mtp_loss_weight = float(_mt.get('loss_weight', 0.3))
+        if self.mtp_enabled:
+            if self.gdn_enabled:
+                fatal_error("mtp is not supported with gdn_enabled (the MTP block would land "
+                            "on the GDN interleave pattern)")
+            _ah = getattr(self, 'auxiliary_heads', None) or {}
+            if isinstance(_ah, dict) and _ah.get('enabled', False):
+                fatal_error("mtp with auxiliary_heads is untested (two auxiliary readout "
+                            "objectives; isolate before combining)")
+            if self.mtp_loss_weight <= 0.0:
+                fatal_error(f"mtp.loss_weight must be > 0 (got {self.mtp_loss_weight}); "
+                            f"to disable mtp set enabled: false")
+            if bool(getattr(self, 'resume_training', False)):
+                logger.print_and_log(
+                    "  ] [mtp] WARNING: resuming with mtp enabled — the checkpoint must "
+                    "contain the mtp module params (mtp cannot be flipped across a resume).")
+
     def handle_arguments(self, args: argparse.Namespace):
         """Update settings based on command line arguments."""
         if args.run_name:
@@ -6068,6 +6121,8 @@ if __name__ == "__main__":
         swa_enabled=settings.swa_enabled,
         swa_window=settings.swa_window,
         swa_global_interleave=settings.swa_global_interleave,
+        # Multi-token prediction (branch doc-mask, festival feature 3)
+        mtp_enabled=settings.mtp_enabled,
     )
     if settings.doc_attn_mask_enabled or settings.doc_pos_reset:
         logger.print_and_log(
@@ -6081,6 +6136,10 @@ if __name__ == "__main__":
             f"  ] [swa] hybrid sliding-window: W={settings.swa_window}, "
             f"{settings.cfg_layers - _n_glob} local / {_n_glob} global layers "
             f"(every {settings.swa_global_interleave}th global)")
+    if settings.mtp_enabled:
+        logger.print_and_log(
+            f"  ] [mtp] DeepSeek-style sequential t+2 module: 1 extra block + shared "
+            f"norm/head, lambda={settings.mtp_loss_weight} (headline ls:/val stay pure t+1 CE)")
 
     # ----------------------- Save Settings Config File -----------------------
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")

@@ -1,0 +1,109 @@
+# skiff-dm-mtp — festival round 3 (finale): DeepSeek-style MTP stacked on dm + swa winners.
+# PAIRED CONTROL = the already-run skiff-dm-swa arm (seed 42, identical init + data; differs ONLY in mtp).
+#
+# Serial-greedy design: this arm = skiff-dm-full (the adopted doc-mask + pos-reset treatment,
+# BOS id 1) PLUS the swa block below. Its PAIRED CONTROL is the already-run skiff-dm-full arm
+# (same seed 42 -> identical init + identical data order; the two differ ONLY in swa).
+# Verdict: swa-vs-full val CE at matched steps, judged against the skiff-dm-ctrl-s43 noise
+# floor; adoption gate = no-harm + throughput (the dm calculus).
+# Hybrid shape: W=512, every 4th layer global (3:1 local:global, the GDN-ratio convention).
+run_name: skiff-dm-mtp
+
+ga_schedule:
+  - [0, 65_536]
+B: 4
+T: 2048
+max_steps: 12_000
+eval_iters: 2
+val_step: 50
+save_step: 500
+
+data_type: bf16
+FSDP_param_dtype: bf16
+FSDP_reduce_dtype: bf16
+FSDP_buffer_dtype: bf16
+reshard_after_forward: false
+
+resume_training: false
+
+clip_warmup: 1.0
+clip_standard: 1.0
+track_gpm: true
+track_clip_groups: true
+track_subgroup_pdr: true
+
+use_keel: true
+keel_alpha: null
+cfg_layers: 24
+cfg_heads: 12
+cfg_kv_heads: 6
+cfg_embd: 768
+cfg_intermediate: 2048
+multiple_of: 128
+norm_eps: 1.0e-05
+dropout: 0.0
+use_activation_checkpointing: true
+qk_norm_mode: "before_rope"
+tie_word_embeddings: false
+rope_theta: 500_000.0
+moe_enabled: false
+
+compile_model: true
+compile_mode: default
+
+lr_schedule_type: "cosine"
+max_lr: 3.5e-04
+min_lr: 3.5e-05
+warmup_steps: 1000
+
+optimizer_type: normuon_fsdp2
+beta1: 0.9
+beta2: 0.95
+muon_momentum: 0.95
+muon_ns_steps: 5
+normuon_beta2: 0.99
+
+weight_decay:
+  - [emb, 0.02]
+  - [out, 0.02]
+  - [all, 0.002]
+
+row_center_head:
+  enabled: false
+
+# ===== THE TREATMENT (this arm: mask ON + position reset — full treatment) =====
+doc_attn_mask:
+  bos_token_id: 1          # tokenizer-native BOS separates docs in the llama stream (verified in shards; <|bos|>=32000 never occurs)
+  enabled: true
+  reset_positions: true
+
+# ===== FEATURE 2: hybrid sliding-window attention (stacked on the dm winner) =====
+swa:
+  enabled: true
+  window: 512
+  global_interleave: 4      # 3:1 local:global, the GDN-ratio convention
+
+# ===== FEATURE 3: DeepSeek-style multi-token prediction (stacked on dm + swa winners) =====
+mtp:
+  enabled: true
+  loss_weight: 0.3          # DSv3-style lambda; headline ls:/val stay pure t+1 CE
+
+transition_health_guard: true
+health_guard_warmup_steps: 150
+
+tok_kind: llama
+tok_path: ../tokenizers/llama_tokenizer
+special_tokens: ../../notebooks/datasets/tokenized/llama/tokenizer_config.json
+data_root_path: ../../notebooks/datasets/tokenized/llama/
+groups:
+  - [stories, [[0, 34.0]]]
+  - [ao3,     [[0, 33.0]]]
+  - [books,   [[0, 33.0]]]
+
+gen_log_file: gen_log.txt
+train_log_file: train_log.txt
+val_log_file: val_log.txt
+server_port: 8923
+
+nas_root: /home/josef/brainbox/checkpoints/current/
+local_checkpoint_root: ~/checkpoints/
