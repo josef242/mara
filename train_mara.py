@@ -1795,6 +1795,13 @@ def train_loop(
             scs_deepest_tap=_scs_dt0,
         )
 
+    # [doc-mask] in-stream separator check state (fatal by ~step 20 on a wrong bos id —
+    # the silent-no-op failure mode; skipped entirely when the feature is off or resuming
+    # past the check window).
+    _dm_stream_check = (settings.doc_attn_mask_enabled or settings.doc_pos_reset) and start_step <= 20
+    _dm_bos_seen = 0
+    _dm_windows_seen = 0
+
     for step in range(start_step, settings.max_steps):
         t0 = time.time()
         last_step = (step == settings.max_steps - 1)
@@ -1909,6 +1916,24 @@ def train_loop(
                                      f"elapsed={_el:.0f}s  ~{_rate:.1f}s/mb  eta~{_eta:.0f}s")
             x, y = train_loader.next_batch(step=step)
             x, y = x.to(device), y.to(device)
+            # [doc-mask] stream sanity: the mask/pos-reset keyed on a WRONG bos id is a silent
+            # complete no-op (the exact failure the review caught — the data separator is the
+            # tokenizer-native id 1, not <|bos|>=32000). Count separators over the first ~20
+            # steps and fatal if the configured id never appears in the stream.
+            if _dm_stream_check and step <= 20:
+                _dm_bos_seen += int((x == settings.doc_bos_token_id).sum())
+                _dm_windows_seen += x.shape[0]
+                if step == 20 and micro_step == grad_accum_steps - 1:
+                    if _dm_bos_seen == 0:
+                        fatal_error(
+                            f"doc_attn_mask: bos_token_id={settings.doc_bos_token_id} NEVER appeared "
+                            f"in {_dm_windows_seen} windows — the mask/position-reset is a silent "
+                            f"no-op. The llama stream separates documents with id 1.")
+                    logger.print_and_log(
+                        f"  ] [doc-mask] stream check OK: {_dm_bos_seen} separators in "
+                        f"{_dm_windows_seen} windows (~{_dm_bos_seen / max(_dm_windows_seen, 1):.2f} "
+                        f"docs-started/window at T={settings.T})")
+                    _dm_stream_check = False
             if _repl_data:
                 # broadcast rank0's batch to all ranks (token-id int tensors)
                 dist.broadcast(x, src=0)
@@ -5570,9 +5595,26 @@ class Settings:
             _dm = {'enabled': True}
         if not isinstance(_dm, dict):
             fatal_error("doc_attn_mask must be a dict {enabled, reset_positions, bos_token_id} or true")
+        _dm_known = {'enabled', 'reset_positions', 'bos_token_id', 'allow_reset_without_mask'}
+        _dm_typos = set(_dm) - _dm_known
+        if _dm_typos:
+            # silent-ignore would default the feature OFF — the worst direction for a typo
+            fatal_error(f"doc_attn_mask: unknown key(s) {sorted(_dm_typos)} — known: {sorted(_dm_known)}")
         self.doc_attn_mask_enabled = bool(_dm.get('enabled', False))
         self.doc_pos_reset = bool(_dm.get('reset_positions', False))
-        self.doc_bos_token_id = int(_dm.get('bos_token_id', 32000))
+        # NOTE: the stream's actual document separator is the tokenizer-native BOS id 1
+        # (verified against the llama .npy shards 2026-07-02) — NOT the <|bos|>=32000
+        # special token, which never occurs in pretokenized data. A wrong id makes both
+        # features a silent no-op; the trainer also stream-checks this in-loop (fatal by
+        # ~step 20 if the configured id never appears).
+        self.doc_bos_token_id = int(_dm.get('bos_token_id', 1))
+        if self.doc_pos_reset and not self.doc_attn_mask_enabled \
+                and not bool(_dm.get('allow_reset_without_mask', False)):
+            fatal_error(
+                "doc_attn_mask: reset_positions without enabled trains CROSS-document attention "
+                "over aliased, non-monotonic RoPE positions — a geometry matching neither the "
+                "baseline nor the masked treatment. Set enabled: true, or opt in explicitly with "
+                "allow_reset_without_mask: true if this ablation is truly intended.")
         if self.doc_attn_mask_enabled or self.doc_pos_reset:
             if self.gdn_enabled:
                 fatal_error(
@@ -5589,6 +5631,16 @@ class Settings:
                     "doc_attn_mask with attn_res_enabled is untested (block-residual retrieval "
                     "mixes representations across the window between attention calls). Validate "
                     "separately before combining.")
+            if self.doc_attn_mask_enabled and not bool(getattr(self, 'compile_model', False)):
+                fatal_error(
+                    "doc_attn_mask requires compile_model: true — uncompiled flex_attention falls "
+                    "back to a score-materializing math path (multi-GB transients per layer, OOM "
+                    "at production shapes). Compile, or disable the mask while bisecting.")
+            if bool(getattr(self, 'resume_training', False)):
+                logger.print_and_log(
+                    "  ] [doc-mask] WARNING: resuming with doc_attn_mask/reset_positions set — "
+                    "these flags MUST match the run being resumed (no automatic mismatch guard "
+                    "yet); flipping them mid-run silently changes attention semantics.")
 
     def handle_arguments(self, args: argparse.Namespace):
         """Update settings based on command line arguments."""

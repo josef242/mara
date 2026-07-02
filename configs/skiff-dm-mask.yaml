@@ -76,6 +76,7 @@ row_center_head:
 
 # ===== THE TREATMENT (this arm: mask ON, positions continuous — attribution arm) =====
 doc_attn_mask:
+  bos_token_id: 1          # tokenizer-native BOS separates docs in the llama stream (verified in shards; <|bos|>=32000 never occurs)
   enabled: true
   reset_positions: false
 
