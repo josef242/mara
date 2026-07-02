@@ -5556,6 +5556,35 @@ class Settings:
         if not hasattr(self, 'gdn_mode'):
             self.gdn_mode = 'chunk'
 
+        # --- doc_attn_mask (branch doc-mask): confine attention to (causal AND
+        # same-document) within packed windows via a FlexAttention BlockMask;
+        # optionally restart RoPE positions at each BOS. Both OFF by default —
+        # flags-off behavior is byte-identical to main. ---
+        _dm = getattr(self, 'doc_attn_mask', None) or {}
+        if _dm is True:
+            _dm = {'enabled': True}
+        if not isinstance(_dm, dict):
+            fatal_error("doc_attn_mask must be a dict {enabled, reset_positions, bos_token_id} or true")
+        self.doc_attn_mask_enabled = bool(_dm.get('enabled', False))
+        self.doc_pos_reset = bool(_dm.get('reset_positions', False))
+        self.doc_bos_token_id = int(_dm.get('bos_token_id', 32000))
+        if self.doc_attn_mask_enabled or self.doc_pos_reset:
+            if self.gdn_enabled:
+                fatal_error(
+                    "doc_attn_mask/reset_positions are not supported with gdn_enabled — GDN's "
+                    "recurrent state crosses document boundaries (FLA varlen state reset not "
+                    "implemented). Disable one.")
+            if float(getattr(self, 'dropout', 0.0)) > 0.0:
+                fatal_error(
+                    "doc_attn_mask requires dropout: 0.0 — the FlexAttention path has no "
+                    "attention-dropout argument, so dropout>0 would silently change semantics "
+                    "between masked and unmasked layers.")
+            if getattr(self, 'attn_res_enabled', False):
+                fatal_error(
+                    "doc_attn_mask with attn_res_enabled is untested (block-residual retrieval "
+                    "mixes representations across the window between attention calls). Validate "
+                    "separately before combining.")
+
     def handle_arguments(self, args: argparse.Namespace):
         """Update settings based on command line arguments."""
         if args.run_name:
@@ -5890,7 +5919,16 @@ if __name__ == "__main__":
         attn_res_block_size=getattr(settings, 'attn_res_block_size', 8),
         # Auxiliary prediction heads
         aux_head_layers=_aux_head_layers,
+        # Document attention masking (branch doc-mask)
+        doc_attn_mask=settings.doc_attn_mask_enabled,
+        doc_pos_reset=settings.doc_pos_reset,
+        bos_token_id=settings.doc_bos_token_id,
     )
+    if settings.doc_attn_mask_enabled or settings.doc_pos_reset:
+        logger.print_and_log(
+            f"  ] [doc-mask] attention mask: {'ON (causal AND same-doc, FlexAttention)' if settings.doc_attn_mask_enabled else 'off'}"
+            f" | RoPE reset at BOS: {'ON' if settings.doc_pos_reset else 'off'}"
+            f" | BOS id: {settings.doc_bos_token_id}")
 
     # ----------------------- Save Settings Config File -----------------------
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
