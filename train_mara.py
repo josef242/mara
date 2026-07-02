@@ -1924,15 +1924,25 @@ def train_loop(
                 _dm_bos_seen += int((x == settings.doc_bos_token_id).sum())
                 _dm_windows_seen += x.shape[0]
                 if step == 20 and micro_step == grad_accum_steps - 1:
+                    # Judge on the GLOBAL count: ranks read DISJOINT data, so one rank can
+                    # locally see zero separators (books-heavy draw) while others see many.
+                    # A single-rank fatal_error would strand the other ranks in the step's
+                    # collectives (barrier vs all_reduce mismatch -> NCCL timeout); the
+                    # all-reduced verdict fires identically on every rank.
+                    if ddp:
+                        _dm_t = torch.tensor([_dm_bos_seen, _dm_windows_seen],
+                                             device=device, dtype=torch.int64)
+                        dist.all_reduce(_dm_t)
+                        _dm_bos_seen, _dm_windows_seen = int(_dm_t[0]), int(_dm_t[1])
                     if _dm_bos_seen == 0:
                         fatal_error(
                             f"doc_attn_mask: bos_token_id={settings.doc_bos_token_id} NEVER appeared "
-                            f"in {_dm_windows_seen} windows — the mask/position-reset is a silent "
-                            f"no-op. The llama stream separates documents with id 1.")
+                            f"in {_dm_windows_seen} windows (all ranks) — the mask/position-reset is "
+                            f"a silent no-op. The llama stream separates documents with id 1.")
                     logger.print_and_log(
                         f"  ] [doc-mask] stream check OK: {_dm_bos_seen} separators in "
                         f"{_dm_windows_seen} windows (~{_dm_bos_seen / max(_dm_windows_seen, 1):.2f} "
-                        f"docs-started/window at T={settings.T})")
+                        f"docs-started/window at T={settings.T}, all ranks)")
                     _dm_stream_check = False
             if _repl_data:
                 # broadcast rank0's batch to all ranks (token-id int tensors)
@@ -4061,6 +4071,14 @@ def resume_training(model, optimizer, train_loader, ddp_rank, settings, grad_acc
     # STEP 4: Set next training step and resume confirmation
     # ---------------------------------------------------------------------------
     start_step = shard_step + 1
+    if start_step >= settings.max_steps:
+        # resuming a checkpoint saved at the final step: nothing left to train — exit
+        # gracefully instead of IndexError-ing on the schedule lookup below
+        logger.print_and_log(
+            f"  ] Resumed @ step {start_step}: run already complete "
+            f"(max_steps={settings.max_steps}); training loop will no-op.")
+        dist.barrier()
+        return start_step, total_tokens_processed
     lrc = get_lr(start_step, settings)
     gac = grad_accum_schedule[start_step]
     logger.print_and_log(f"  ] Resumed @ step {start_step}:  LR: {lrc:.6e} Grad Accum Steps: {gac}")
@@ -4821,6 +4839,15 @@ def build_user_defined_schedule(ga_schedule, max_steps, tok_per_micro, ddp_rank)
 
     # Sort schedule by step (in case user didn't provide them in order)
     sorted_schedule = sorted(ga_schedule, key=lambda x: x[0])
+
+    # A schedule that starts past step 0 would leave grad_accum=0 for the leading
+    # steps: the micro-batch loop never runs, optimizer.step() fires on empty grads,
+    # and the log shows ls: 0.000000 — silent no-training. Fail at build time.
+    if not sorted_schedule or sorted_schedule[0][0] != 0:
+        fatal_error(
+            f"ga_schedule must start at step 0 (first waypoint is "
+            f"{sorted_schedule[0][0] if sorted_schedule else 'MISSING'}) — steps before the "
+            f"first waypoint would train NOTHING (grad_accum=0) while logging ls: 0.")
 
     # Calculate GA values and print validation table
     schedule_points = []
