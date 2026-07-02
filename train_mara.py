@@ -5701,6 +5701,24 @@ class Settings:
                 logger.print_and_log(
                     f"  ] [swa] NOTE: window ({self.swa_window}) >= T ({self.T}) — local "
                     f"layers degenerate to full causal; the feature is a no-op at this T.")
+            if float(getattr(self, 'dropout', 0.0)) > 0.0:
+                fatal_error(
+                    "swa requires dropout: 0.0 — local layers route through FlexAttention "
+                    "(no attention-dropout argument) while global layers use SDPA with "
+                    "dropout_p, so dropout>0 silently trains a mixed dropout pattern.")
+            if bool(getattr(self, 'resume_training', False)):
+                logger.print_and_log(
+                    "  ] [swa] WARNING: resuming with swa enabled — swa.{enabled, window, "
+                    "global_interleave} MUST match the run being resumed (no automatic "
+                    "mismatch guard yet); flipping them mid-run silently changes every "
+                    "local layer's receptive field.")
+            _ah = getattr(self, 'auxiliary_heads', None) or {}
+            if isinstance(_ah, dict) and _ah.get('enabled', False) \
+                    and not _ah.get('compute_inactive_layers', True):
+                fatal_error(
+                    "swa with SCS partial-depth training is unsupported: active_layers "
+                    "truncation can run an all-local layer prefix (the global layers land in "
+                    "the truncated tail), silently removing long-range attention entirely.")
 
     def handle_arguments(self, args: argparse.Namespace):
         """Update settings based on command line arguments."""
