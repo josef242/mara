@@ -829,7 +829,9 @@ def parse_wd_rules(wd_config, model):
                     param_wds[id(p)] = (p, wd_val)
                 elif name == 'out' and n.startswith('output.'):
                     param_wds[id(p)] = (p, wd_val)
-                elif name == 'all' and 'layers.' in n:
+                elif name == 'all' and ('layers.' in n or n.startswith('mtp.')):
+                    # the MTP module (proj + its block) is body-like: it rides the
+                    # 'all' body rule (its norms stay WD=0 via _is_norm above)
                     param_wds[id(p)] = (p, wd_val)
         else:
             # [start, end, value_or_schedule]
@@ -859,7 +861,7 @@ def parse_wd_rules(wd_config, model):
                 b = "emb (add a [emb, <wd>] rule)"
             elif n.startswith('output.') or n.endswith('output.weight'):
                 b = "head (add a [out, <wd>] rule)"
-            elif 'layers.' in n:
+            elif 'layers.' in n or n.startswith('mtp.'):
                 b = "body (add [all, <wd>] or a layer-range rule)"
             else:
                 b = "other"
@@ -2086,6 +2088,8 @@ def train_loop(
             if zloss_enabled:
                 dist.all_reduce(zloss_accum, op=dist.ReduceOp.AVG)
                 dist.all_reduce(logZ_accum, op=dist.ReduceOp.AVG)
+            if settings.mtp_enabled:
+                dist.all_reduce(mtp_accum, op=dist.ReduceOp.AVG)
 
         # Moonlight-style: unified LR for all param groups
         # With rms_scale=True, the 0.2*sqrt(max(A,B)) scaling in Muon
@@ -4448,7 +4452,7 @@ def _apply_per_submodule_compile(model, compile_mode, logger):
     # Each layer has distinct compiled submodules. Dynamo's cache needs one
     # entry per unique module at each call site. Default limit (8) is too
     # small when num_layers > 8, causing spurious recompile warnings.
-    torch._dynamo.config.cache_size_limit = max(16, len(model.layers) + 4)
+    torch._dynamo.config.cache_size_limit = max(16, len(model.layers) + 8)
 
     has_moe = any(getattr(l, 'moe_enabled', False) for l in model.layers)
     if has_moe:
@@ -4483,6 +4487,18 @@ def _apply_per_submodule_compile(model, compile_mode, logger):
             n_moe += 1
         if not is_moe:
             n_dense += 1
+
+    # MTP module: compile its block per-submodule exactly like a dense trunk layer
+    # (per-submodule, NOT whole-block — the block uses inline cp.checkpoint). Without
+    # this the MTP block runs eager, and under doc-mask a BOS-carrying micro-batch
+    # hits EAGER flex_attention: measured 99 ms / +4.7 GiB vs 3 ms / 73 MiB compiled
+    # at skiff shapes (SM86) — recomputed AGAIN in the AC backward.
+    _mtp = getattr(model, 'mtp', None)
+    if _mtp is not None:
+        for attr_name in list(_mtp.block._modules.keys()):
+            setattr(_mtp.block, attr_name,
+                    torch.compile(_mtp.block._modules[attr_name], mode=compile_mode))
+        _mtp.proj = torch.compile(_mtp.proj, mode=compile_mode)
 
     n_attn = len(model.layers) - n_gdn  # softmax attention layers
     logger.print_and_log(f"Compiling model (per-submodule, mode={compile_mode})...")
