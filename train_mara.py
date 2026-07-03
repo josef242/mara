@@ -33,13 +33,8 @@ from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
 )
 
-# Use absolute path to ensure we get common_fsdp2, not common.
-# doc-mask branch: pair with the common_fsdp2-docmask WORKTREE so the branch pair
-# (mara_fsdp2-docmask + common_fsdp2-docmask) is self-consistent regardless of what
-# the main trees have checked out. Falls back to ../common_fsdp2 off-branch.
-common_path = '../common_fsdp2-docmask'
-if not os.path.isdir(common_path):
-    common_path = '../common_fsdp2'
+# Use absolute path to ensure we get common_fsdp2, not common
+common_path = '../common_fsdp2'
 if common_path not in sys.path:
     sys.path.insert(0, common_path)  # insert at the beginning to prioritize
 

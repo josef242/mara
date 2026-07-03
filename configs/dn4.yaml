@@ -29,7 +29,7 @@ ga_schedule:
   - [14_500, 3_000_000]
   - [17_000, 4_000_000]
 B: 12
-T: 2048
+T: 2048                         # Bump to 4k at 10k or 11k steps!
 max_steps: 200_000
 eval_iters: 2
 val_step: 100
