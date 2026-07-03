@@ -3050,6 +3050,22 @@ def train_loop(
                 if head_gauge_enabled and cg_diag is not None:
                     cg_diag['head_ubar_pre'] = getattr(optimizer, '_last_head_ubar_pre', None)
                     cg_diag['head_ubar_post'] = getattr(optimizer, '_last_head_ubar_post', None)
+                # MTP val-cadence snapshot (z-loss pattern): all-reduced t+2 CE, the
+                # plan-ahead gap vs main CE, and the module's aggregate weight norm
+                # (DTensor .norm() reduces globally; runs on ALL ranks — collective).
+                mtp_diag = None
+                if settings.mtp_enabled:
+                    _raw_m = model._orig_mod if hasattr(model, '_orig_mod') else model
+                    _mtp_mod = getattr(_raw_m, 'mtp', None)
+                    _mtp_wn = None
+                    if _mtp_mod is not None:
+                        _mtp_wn = float(torch.sqrt(sum(
+                            (p.norm() ** 2).to(torch.float32)
+                            for p in _mtp_mod.parameters())).item())
+                    _mtp_loss_v = float(mtp_accum.item())
+                    _main_v = float(main_loss_accum.item())
+                    mtp_diag = {'loss': _mtp_loss_v, 'gap': _mtp_loss_v - _main_v,
+                                'lambda': settings.mtp_loss_weight, 'w_norm': _mtp_wn}
                 snapshot = diagnostics.log_diagnostics(
                     step, settings.nas_path, total_tokens_processed,
                     awd_data=awd_diag, moe_data=moe_diag,
@@ -3057,6 +3073,7 @@ def train_loop(
                     zloss_data=zloss_diag,
                     rc_data=rc_diag,
                     cg_data=cg_diag,
+                    mtp_data=mtp_diag,
                 )
                 diagnostics.print_summary(snapshot, logger, awd_data=awd_diag, moe_data=moe_diag)
                 # Body relative-step pdr = ||dW||/||W|| (Math Brief #6 annealing experiment).
