@@ -46,15 +46,18 @@
 # stopping is a decision, not a failure. Gates: 2k (clip check), 12k (engage),
 # ~17.8k (dn2 end-of-life head readout), 24k (freeze), 30-40k (declare).
 #
-# PRE-LAUNCH CHECKLIST (code, not config — must land before ignition):
-#   [ ] merge doc-mask branch → main (this config lives on the branch today)
-#   [ ] mtp.* name-matcher exclusions (controller body-pdr set, clip groups,
-#       lr_mods type matchers) — only if mtp flips on
-#   [ ] shard-orbit review: W=8 × stories S=60 shares 15-shard orbits between
-#       rank pairs (diversity tax, not correctness) — fix or accept explicitly
-#   [ ] FSDP2 gradient-sync fix (no_sync is dead code; GA ramps to ~20 micro-
-#       steps → real comms waste) — needs numerics validation first
-#   [ ] Bob Test eval battery wired to checkpoints
+# PRE-LAUNCH LEDGER (resolved 2026-07-03):
+#   [x] mtp: ADOPTED (−13.3 mnats > floor) and INCLUDED in the tangent/
+#       controller regime by design (see controller block comment) — the
+#       "exclusions" turned out to be the wrong direction; no code needed
+#   [x] shard orbits: ACCEPTED for launch — W=8 × stories S=60 shares 15-shard
+#       orbits between rank pairs; uniform coverage, diversity tax only.
+#       Revisit at the first natural restart (e.g. the ~11k T-bump).
+#   [~] merge doc-mask → main: launch runs from the branch worktree (the
+#       proven festival pattern); merge follows once the wizard is stable
+#   [~] FSDP2 gradient-sync fix: DEFERRED (pure throughput, retrofittable at
+#       any restart; matters most once GA ramps — target the T-bump restart)
+#   [~] Bob Test battery: post-launch measurement tool; checkpoints wait
 run_name: wizard101
 seed: 42
 
@@ -135,8 +138,13 @@ tangent_project_preserve_norm: false
 tangent_project_strength: [[0, 0.0], [12_000, 0.0], [24_000, 1.0]]
 
 # Shadow-norm FFN pdr controller (dn4-identical; self-anchoring — no knots).
-# NOTE: if mtp flips on, land the mtp.* exclusions first (checklist) so the
-# controller/clip/lr_mods name matchers don't absorb the MTP block as body.
+# MTP-INCLUSION DECISION (2026-07-03, deliberate): the MTP block's matrices are
+# Muon-group params, so they are tangent-projected AND frozen with the trunk;
+# coherently, the controller's FFN WD law covers mtp.block.feed_forward and
+# acts_on_attn glides mtp.block.attention like trunk attn. Exclusion would let
+# an unfrozen Muon module grow radially through the frozen tail — the real bug.
+# BOOT-WATCH: controller Sn should read 306 (101×3 trunk + 3 mtp FFN); the
+# mtp+controller composition is untested live (skiff arms ran controller-free).
 ffn_pdr_controller:
   enabled: true
   m_min_full: 0.30
@@ -182,9 +190,9 @@ swa:                            # ADOPTED: loss-neutral; 76 local / 25 global at
   window: 512                   # inference KV. Gen exact only ≤ window (warned).
   global_interleave: 4
 
-mtp:                            # ⏳ PENDING skiff-dm-mtp verdict — flip enabled
-  enabled: false                # deliberately after the morning read. If ON:
-  loss_weight: 0.3              # land the mtp.* matcher exclusions first.
+mtp:                            # ADOPTED 2026-07-03: −13.3 mnats vs swa control at
+  enabled: true                 # matched steps (40/40 negative, > the ±9 mnat
+  loss_weight: 0.3              # floor), <1% step cost, spec-decode head free.
 
 transition_health_guard: true
 
