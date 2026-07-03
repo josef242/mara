@@ -1,0 +1,211 @@
+# ============================================================================
+# wizard101 — THE run. 101 layers. Starts weak, levels up, casts spells. 🧙
+# ============================================================================
+#
+# LINEAGE: dn4's head/body-hygiene recipe (Q10/Q11/Q12, Math-approved) rebuilt
+# from scratch on TRUE RoPE + the 2026-07 feature-festival winners. dn4 was
+# killed at step ~2.5k when the meta-init RoPE corruption was discovered
+# (to_empty() destroyed the freqs buffers; every prior FSDP2 run trained on a
+# cos-envelope encoding instead of rotary — see memory: rope-corruption-finding).
+# wizard101 is the FIRST run in this lab with a working relative-position ruler.
+# Boot MUST show: [freqs-check] cos ok: True | sin ok: True.
+#
+# FESTIVAL WINNERS (skiff-scale paired A/Bs, seed-identical arms, noise floor
+# measured ±9 mnats; every feature adversarially reviewed):
+#   - doc_attn_mask + reset_positions: −15.5 mnats vs control (> floor), faster.
+#   - swa hybrid 3:1 W=512: loss-neutral, payoff back-loaded to 4k+/inference.
+#   - mtp (DeepSeek t+2): alignment verified; arm verdict PENDING — flip the
+#     block below deliberately once skiff-dm-mtp completes.
+#
+# PRE-REGISTERED PREDICTIONS (vs the envelope-encoded dn lineage):
+#   1. Disproportionate val gains on code_python/code_c vs stories (relative
+#      position is the addressing mechanism code leans on hardest).
+#   2. Bob Test: position-CONSISTENT state-tracking answers (recency retrieval
+#      needs the (p−m) primitive the envelope could not express).
+#   3. At the planned 4k T-bump: possibly a brief adaptation TRANSIENT before
+#      the gain (unseen relative distances to learn — the envelope's "free"
+#      instant T-extension was a symptom of the bug). DO NOT PANIC at a wobble.
+#
+# HEAD THESIS (unchanged from dn4): preventive gauge hygiene from step 0 keeps
+# the head near healthy birth geometry — Lever 1 on throughout, Lever 2 built
+# but staged off. dn4's 2.5k steps already showed gauge ||mu|| pinned at 8.5e-6.
+# BODY THESIS (unchanged): grow freely 0-12k (~9B tok), anneal f 0→1 over
+# 12k-24k, frozen after, under the self-anchoring shadow-norm controller. The
+# controller discovers its own reference online (no hand-fit knots), which is
+# exactly what makes the recipe robust to the encoding change.
+#
+# PLANNED MID-RUN CHANGE (pre-registered, dn2-proven mechanics): T-bump
+# 2048→4096 at ~step 11,000 (~8.3B tok) — restart with B: 6, T: 4096 (keeps
+# B·T/rank; token-based ga_schedule unaffected). Sanctioned slot: ≥1k steps
+# BEFORE the 12k controller engagement so S snapshots clean. FORBIDDEN inside
+# 12k-24k (would confound the anneal telemetry).
+#
+# HORIZON (honest arithmetic): 200k steps ≈ 750B tokens ≈ years on rig-30.
+# max_steps stays 200k because the cosine shape needs it, but the THESES are
+# adjudicated by ~step 30-40k — after that this is a production pretrain, and
+# stopping is a decision, not a failure. Gates: 2k (clip check), 12k (engage),
+# ~17.8k (dn2 end-of-life head readout), 24k (freeze), 30-40k (declare).
+#
+# PRE-LAUNCH CHECKLIST (code, not config — must land before ignition):
+#   [ ] merge doc-mask branch → main (this config lives on the branch today)
+#   [ ] mtp.* name-matcher exclusions (controller body-pdr set, clip groups,
+#       lr_mods type matchers) — only if mtp flips on
+#   [ ] shard-orbit review: W=8 × stories S=60 shares 15-shard orbits between
+#       rank pairs (diversity tax, not correctness) — fix or accept explicitly
+#   [ ] FSDP2 gradient-sync fix (no_sync is dead code; GA ramps to ~20 micro-
+#       steps → real comms waste) — needs numerics validation first
+#   [ ] Bob Test eval battery wired to checkpoints
+run_name: wizard101
+seed: 42
+
+# ===== schedules / batch (dn4-identical; token-based → T-bump-proof) =====
+ga_schedule:
+  - [0, 125_000]
+  - [2_000, 250_000]
+  - [4_000, 500_000]
+  - [7_000, 1_000_000]
+  - [10_500, 2_000_000]
+  - [14_500, 3_000_000]
+  - [17_000, 4_000_000]
+B: 12                       # → 6 at the ~11k T-bump (B·T/rank preserved)
+T: 2048                     # → 4096 at the ~11k T-bump
+max_steps: 200_000
+eval_iters: 2
+val_step: 100
+save_step: 250
+
+data_type: bf16
+FSDP_param_dtype: bf16
+FSDP_reduce_dtype: bf16
+FSDP_buffer_dtype: bf16
+reshard_after_forward: true
+
+# FRESH FROM SCRATCH — the whole point, for the third and final time.
+resume_training: false
+
+# clip: the validated scratch-start setting (dn4 restart proved 1.5 at warmup
+# end: 15% clipped vs 48% at 1.0; judge by median + %clipped, not mean)
+clip_warmup: 2.0
+clip_standard: 1.5
+track_gpm: true
+track_clip_groups: true
+
+use_keel: true
+keel_alpha: null
+cfg_layers: 101
+cfg_heads: 32
+cfg_kv_heads: 16
+cfg_embd: 2048
+cfg_intermediate: 5120
+
+norm_eps: 1.0e-05
+dropout: 0.0
+use_activation_checkpointing: true
+qk_norm_mode: "before_rope"
+tie_word_embeddings: false      # untied — required for the head levers
+rope_theta: 500_000.0           # for the first time, this knob actually does something
+moe_enabled: false
+
+compile_model: true             # REQUIRED (doc-mask + swa fatal without it)
+compile_mode: default
+
+lr_schedule_type: "cosine"
+max_lr: 3.0e-04
+min_lr: 3.0e-05
+warmup_steps: 2000
+
+optimizer_type: normuon_fsdp2
+beta1: 0.9
+beta2: 0.95
+# body WD: controller owns FFN WD via the radial-budget law; flat base covers
+# attn + pre-engagement; emb/head pinned 0.02 (NO aggressive head-WD — DO-NOT).
+# The 'all' rule also covers mtp.* (body-like) since the festival WD fix.
+weight_decay:
+  - [emb, 0.02]
+  - [out, 0.02]
+  - [all, 0.002]
+muon_momentum: 0.95
+muon_ns_steps: 5
+normuon_beta2: 0.99
+muon_adam_state_dtype: fp32     # required by head_gauge_projection
+
+# ===== body recipe: LATE grow-then-clamp (dn4-identical) =====
+tangent_project: true
+tangent_project_preserve_norm: false
+tangent_project_strength: [[0, 0.0], [12_000, 0.0], [24_000, 1.0]]
+
+# Shadow-norm FFN pdr controller (dn4-identical; self-anchoring — no knots).
+# NOTE: if mtp flips on, land the mtp.* exclusions first (checklist) so the
+# controller/clip/lr_mods name matchers don't absorb the MTP block as body.
+ffn_pdr_controller:
+  enabled: true
+  m_min_full: 0.30
+  m_max: 1.0
+  rho: 0.20
+  lambda_max: 0.02
+  lambda_min: 0.002
+  k_ema_alpha: 0.25
+  rate_down: 0.05
+  rate_up: 0.02
+  glide_gain: 1.25
+  freeze_handoff: false
+  acts_on_attn: true
+  reference:
+    mode: auto_shadow_growth
+
+auxiliary_heads:
+  enabled: false                # failed at head control (dn2); stays out
+
+# ===== head hygiene (dn4-identical) =====
+head_gauge_projection:
+  enabled: true
+  init_row_center: true
+
+z_loss:                         # Lever 2: built, validated, STAGED OFF.
+  enabled: false                # escalation trigger: logZ_c leaving the KEEL
+  target: centered              # band (~>100) at the 17.8k gate or beyond
+  tau: 128
+  alpha: 1.0e-5
+  backend: fp32_accum
+
+row_center_head:
+  enabled: false                # superseded by head_gauge_projection
+
+# ===== FESTIVAL WINNERS =====
+doc_attn_mask:                  # ADOPTED: −15.5 mnats + faster (verified BOS id)
+  enabled: true
+  reset_positions: true
+  bos_token_id: 1
+
+swa:                            # ADOPTED: loss-neutral; 76 local / 25 global at
+  enabled: true                 # 101 layers; payoff at 4k bulk + extension +
+  window: 512                   # inference KV. Gen exact only ≤ window (warned).
+  global_interleave: 4
+
+mtp:                            # ⏳ PENDING skiff-dm-mtp verdict — flip enabled
+  enabled: false                # deliberately after the morning read. If ON:
+  loss_weight: 0.3              # land the mtp.* matcher exclusions first.
+
+transition_health_guard: true
+
+# ===== data (dn4-identical mix) =====
+tok_kind: llama
+tok_path: ../tokenizers/llama_tokenizer
+special_tokens: ../../notebooks/datasets/tokenized/llama/tokenizer_config.json
+data_root_path: ../../notebooks/datasets/tokenized/llama/
+groups:
+  - [stories,      [[0, 28.0]]]
+  - [ao3,          [[0, 12.0]]]
+  - [books,        [[0, 28.0]]]
+  - [preselect,    [[0, 11.0]]]
+  - [code_python,  [[0, 6.0]]]
+  - [code_c,       [[0, 6.0]]]
+  - [edufineweb_1.5TT, [[0, 9.0]]]
+
+gen_log_file: gen_log.txt
+train_log_file: train_log.txt
+val_log_file: val_log.txt
+server_port: 8889
+
+nas_root: /home/josef/brainbox/checkpoints/current/
+local_checkpoint_root: ~/checkpoints/
