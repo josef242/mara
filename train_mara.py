@@ -3587,6 +3587,40 @@ def trigger_checkpoint_sync(settings, ddp_rank, step=None):
     except Exception as e:
         logger.print_and_log(f"  ] [R{ddp_rank}] WARNING: checkpoint sync failed: {e}", False)
 
+# Fields baked into the trained weights that MUST match across a resume. strict
+# state_dict loading already catches param SHAPE/NAME changes (dim, n_layers,
+# mtp on/off via missing keys, aux heads), but NOT behavioral flips that reuse
+# the same params — swa.window, swa.global_interleave, the doc-mask flags —
+# which silently change what the model computes. (checkpoint-config key,
+# settings attr, human label). Extend this list to guard more silent-semantics
+# fields (e.g. rope_theta, qk_norm_mode) as they get persisted to the config.
+_RESUME_MUST_MATCH = [
+    ('doc_attn_mask',         'doc_attn_mask_enabled', 'doc_attn_mask.enabled'),
+    ('doc_pos_reset',         'doc_pos_reset',         'doc_attn_mask.reset_positions'),
+    ('bos_token_id',          'doc_bos_token_id',      'doc_attn_mask.bos_token_id'),
+    ('swa_enabled',           'swa_enabled',           'swa.enabled'),
+    ('swa_window',            'swa_window',            'swa.window'),
+    ('swa_global_interleave', 'swa_global_interleave', 'swa.global_interleave'),
+    ('mtp_enabled',           'mtp_enabled',           'mtp.enabled'),
+]
+
+
+def _resume_config_mismatches(ckpt_config, settings):
+    """Return [(label, checkpoint_value, live_value), ...] for resume-critical
+    fields that DIFFER between a checkpoint's saved config and the live settings.
+    Fields absent from the checkpoint config (older checkpoints saved before the
+    field was persisted) are skipped — we can't verify what we didn't save."""
+    out = []
+    for ck_key, attr, label in _RESUME_MUST_MATCH:
+        if ck_key not in ckpt_config:
+            continue
+        ck_val = ckpt_config[ck_key]
+        cur_val = getattr(settings, attr, None)
+        if ck_val != cur_val:
+            out.append((label, ck_val, cur_val))
+    return out
+
+
 # Resume the state of our model and training environment for all of our processes
 def resume_training(model, optimizer, train_loader, ddp_rank, settings, grad_accum_schedule, awd=None, body_lr_ctrl=None):
     logger.print_and_log(f"Resuming training from {settings.resume_checkpoint_path}:")
@@ -3625,6 +3659,25 @@ def resume_training(model, optimizer, train_loader, ddp_rank, settings, grad_acc
             config["inner_dim"] = config["hidden_dim"]
             del config["hidden_dim"]
             logger.print_and_log("  ] Converted legacy hidden_dim to inner_dim in checkpoint")
+
+        # Resume mismatch guard: architecture/semantics fields baked into the
+        # trained weights must match the checkpoint. Behavioral flips (swa.window,
+        # doc-mask flags) reuse the same params, so strict weight-loading below
+        # would NOT catch them — they'd silently corrupt the run. Abort loudly
+        # instead. (This replaces the old advisory "make sure you didn't change
+        # these" warnings with an actual check.)
+        _mm = _resume_config_mismatches(config, settings)
+        if _mm:
+            _lines = "\n".join(
+                f"      {label}: checkpoint={ck!r}  live-config={cur!r}"
+                for label, ck, cur in _mm)
+            fatal_error(
+                "Resume ABORTED — these fields differ from the checkpoint being "
+                "resumed. They are baked into the trained weights; changing them "
+                "mid-run silently corrupts the model (and strict weight-loading "
+                "does NOT catch behavioral flips like swa.window):\n" + _lines +
+                "\n    Restore these values in the config to match the checkpoint, "
+                "or start a fresh run (new run_name, no resume).")
 
     # FSDP2: Use set_model_state_dict to load and distribute weights
     logger.print_and_log("  ] Distributing model weights across ranks...")
@@ -5734,11 +5787,8 @@ class Settings:
                     "doc_attn_mask requires compile_model: true — uncompiled flex_attention falls "
                     "back to a score-materializing math path (multi-GB transients per layer, OOM "
                     "at production shapes). Compile, or disable the mask while bisecting.")
-            if bool(getattr(self, 'resume_training', False)):
-                logger.print_and_log(
-                    "  ] [doc-mask] WARNING: resuming with doc_attn_mask/reset_positions set — "
-                    "these flags MUST match the run being resumed (no automatic mismatch guard "
-                    "yet); flipping them mid-run silently changes attention semantics.")
+            # (resume mismatch is now caught actively in resume_training via
+            # _resume_config_mismatches — no advisory warning needed here.)
 
         # --- swa (branch doc-mask, festival feature 2): hybrid sliding-window attention.
         # Local layers attend a causal window of `window` tokens (composes with the doc
@@ -5776,12 +5826,6 @@ class Settings:
                     "swa requires dropout: 0.0 — local layers route through FlexAttention "
                     "(no attention-dropout argument) while global layers use SDPA with "
                     "dropout_p, so dropout>0 silently trains a mixed dropout pattern.")
-            if bool(getattr(self, 'resume_training', False)):
-                logger.print_and_log(
-                    "  ] [swa] WARNING: resuming with swa enabled — swa.{enabled, window, "
-                    "global_interleave} MUST match the run being resumed (no automatic "
-                    "mismatch guard yet); flipping them mid-run silently changes every "
-                    "local layer's receptive field.")
             _ah = getattr(self, 'auxiliary_heads', None) or {}
             if isinstance(_ah, dict) and _ah.get('enabled', False) \
                     and not _ah.get('compute_inactive_layers', True):
@@ -5815,10 +5859,6 @@ class Settings:
             if self.mtp_loss_weight <= 0.0:
                 fatal_error(f"mtp.loss_weight must be > 0 (got {self.mtp_loss_weight}); "
                             f"to disable mtp set enabled: false")
-            if bool(getattr(self, 'resume_training', False)):
-                logger.print_and_log(
-                    "  ] [mtp] WARNING: resuming with mtp enabled — the checkpoint must "
-                    "contain the mtp module params (mtp cannot be flipped across a resume).")
 
     def handle_arguments(self, args: argparse.Namespace):
         """Update settings based on command line arguments."""
