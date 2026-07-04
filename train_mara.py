@@ -3423,6 +3423,19 @@ def save_model(model, optimizer, model_config, step, ddp_rank, ddp_local_rank, t
             # rebuild at inference time picks them up and the state-dict load
             # is clean (no "unexpected keys" warning for aux_heads.*.{norm,linear}.weight).
             'aux_head_layers': list(getattr(model_config, 'aux_head_layers', []) or []),
+            # Festival features (doc-mask / SWA / MTP) — REQUIRED at inference:
+            # without these, neo_common rebuilds a plain-attention model — SWA
+            # checkpoints would generate under full-causal semantics (silently
+            # wrong) and the MTP module's weights would be dropped (no
+            # speculative decoding). neo_common also carries a run-dir-yaml
+            # fallback for checkpoints saved before this whitelist entry.
+            'doc_attn_mask': getattr(model_config, 'doc_attn_mask', False),
+            'doc_pos_reset': getattr(model_config, 'doc_pos_reset', False),
+            'bos_token_id': getattr(model_config, 'bos_token_id', 32000),
+            'swa_enabled': getattr(model_config, 'swa_enabled', False),
+            'swa_window': getattr(model_config, 'swa_window', 512),
+            'swa_global_interleave': getattr(model_config, 'swa_global_interleave', 4),
+            'mtp_enabled': getattr(model_config, 'mtp_enabled', False),
         }
         # SCS knobs — recorded so a forensic tool / dashboard can tell
         # whether a checkpoint was produced under scaffold and with which
