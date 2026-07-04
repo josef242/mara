@@ -3461,7 +3461,13 @@ def save_model(model, optimizer, model_config, step, ddp_rank, ddp_local_rank, t
             "max_lr": settings.max_lr,
             "cpu_offload": getattr(settings, 'cpu_offload', False),
             "scs_settings": scs_settings_snapshot,
-            "checkpoint_version": "3.0",            # FSDP2 checkpoint format
+            # 4.0 = FSDP2 format + trained under the 2026-07-02 RoPE meta-init
+            # fix (freqs recomputed in init_weights) AND self-describes festival
+            # fields (doc-mask/SWA/MTP) above. Inference keys legacy-RoPE
+            # (envelope) compat off this: < 4.0 (or missing rope_fixed) is
+            # treated as the pre-fix CORRUPTED era. See neo_common.
+            "checkpoint_version": "4.0",
+            "rope_fixed": True,                     # explicit, unambiguous marker
         }
         checkpoint_path = os.path.join(settings.local_checkpoint_dir, f"model_step_{step:06d}.pt")
         logger.print_and_log(f"  ] Saving model checkpoint to {checkpoint_path}...")
@@ -5889,15 +5895,26 @@ class Settings:
                 source_dict = yaml.safe_load(source_text) or {}
             except yaml.YAMLError:
                 source_dict = {}
+            def _yaml_safe(v):
+                # Convert tuples -> lists (recursively) so yaml.dump never emits
+                # the !!python/tuple tag. safe_load REFUSES that tag, which was
+                # silently breaking inference-side festival-feature recovery
+                # (an empty restart_steps tuple crashed the config parse ->
+                # SWA/MTP dropped -> generation went full-causal).
+                if isinstance(v, tuple):
+                    return [_yaml_safe(x) for x in v]
+                if isinstance(v, list):
+                    return [_yaml_safe(x) for x in v]
+                if isinstance(v, dict):
+                    return {k: _yaml_safe(x) for k, x in v.items()}
+                return v
             derived = {}
             for key, value in vars(self).items():
                 if key.startswith('_'):
                     continue
                 if key in source_dict:
                     continue
-                if key == "groups" and isinstance(value, list):
-                    value = [[g[0], g[1]] if isinstance(g, tuple) else g for g in value]
-                derived[key] = value
+                derived[key] = _yaml_safe(value)
 
             with open(yaml_path, 'w') as f:
                 f.write(header)
