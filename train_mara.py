@@ -329,6 +329,50 @@ def get_zloss_alpha(step: int, settings) -> float:
     return alpha
 
 
+def get_mtp_lambda(step: int, total_tokens: int, settings) -> float:
+    """Effective MTP loss weight (lambda) at absolute global `step` /
+    `total_tokens`. Pure function of (progress + static mtp config) -> resume-safe
+    like get_zloss_alpha (keys off step/total_tokens that round-trip through the
+    checkpoint; NO new checkpoint state).
+
+    Default: the constant settings.mtp_loss_weight (current, unchanged behavior).
+    An optional mtp.loss_weight_schedule block overrides it with a PIECEWISE
+    schedule — matching the DeepSeek-V3 / GLM recipe of a high lambda early that
+    steps down late (e.g. 0.3 for the first N tokens, then 0.1):
+        key:    'tokens' (default; DeepSeek/GLM specify lambda by TOKEN count,
+                which is robust to batch-size / T changes) or 'step'.
+        points: [[x0, l0], [x1, l1], ...]  breakpoints (sorted by x).
+        shape:  'step' (default) = piecewise-constant step-hold: lambda is the
+                value of the last breakpoint whose threshold <= x (DeepSeek's
+                hard 0.3->0.1 step-down); 'linear' = linear interp between points.
+    Outside the point range lambda is clamped to the first/last point's value.
+    Returns 0.0 when MTP is disabled.
+    """
+    if not getattr(settings, 'mtp_enabled', False):
+        return 0.0
+    base = float(getattr(settings, 'mtp_loss_weight', 0.3))
+    sched = getattr(settings, 'mtp_loss_weight_schedule', None)
+    pts = sched.get('points') if isinstance(sched, dict) else None
+    if not pts:
+        return base
+    key = sched.get('key', 'tokens')
+    shape = sched.get('shape', 'step')
+    x = float(total_tokens if key == 'tokens' else step)
+    pts = sorted(([float(t), float(v)] for t, v in pts), key=lambda p: p[0])
+    if x <= pts[0][0]:
+        return pts[0][1]
+    if x >= pts[-1][0]:
+        return pts[-1][1]
+    for i in range(1, len(pts)):
+        if x < pts[i][0]:
+            x0, v0 = pts[i - 1]
+            x1, v1 = pts[i]
+            if shape == 'linear' and x1 > x0:
+                return v0 + (v1 - v0) * (x - x0) / (x1 - x0)
+            return v0   # step-hold: value carried from the left breakpoint
+    return pts[-1][1]
+
+
 def _row_center_cfg(settings):
     """Normalize the row_center_head config to a dict with keys
     {enabled: bool, warmup: dict|None}. Accepts BOTH the flat bool form
@@ -1858,6 +1902,9 @@ def train_loop(
         logZ_accum = torch.zeros((), device=device)
         logZ_p95_last = 0.0          # last micro-step's logZ 95th pctile (snapshot)
         zloss_alpha_eff = get_zloss_alpha(step, settings)
+        # Effective MTP lambda at this step (constant by default; scheduled if a
+        # loss_weight_schedule is configured). Computed once per step, resume-safe.
+        mtp_lambda_eff = get_mtp_lambda(step, total_tokens_processed, settings)
         zloss_diag = None            # snapshot dict for diagnostics.jsonl (None when z-loss off)
         rc_diag = None               # row-center snapshot for diagnostics.jsonl (None when off)
         # Per-step aux loss bookkeeping. Schedule weights are evaluated once
@@ -2051,7 +2098,7 @@ def train_loop(
                     raw_for_mtp = fwd_model._orig_mod if hasattr(fwd_model, '_orig_mod') else fwd_model
                     _mtp_sel = getattr(raw_for_mtp, '_last_mtp_loss', None)
                     if _mtp_sel is not None:
-                        total_loss = total_loss + settings.mtp_loss_weight * _mtp_sel
+                        total_loss = total_loss + mtp_lambda_eff * _mtp_sel
                         mtp_accum += _mtp_sel.detach().float() / grad_accum_steps
 
                 # Apply the same truncation weighting + grad-accum normalisation
@@ -3060,7 +3107,7 @@ def train_loop(
                     _mtp_loss_v = float(mtp_accum.item())
                     _main_v = float(main_loss_accum.item())
                     mtp_diag = {'loss': _mtp_loss_v, 'gap': _mtp_loss_v - _main_v,
-                                'lambda': settings.mtp_loss_weight, 'w_norm': _mtp_wn}
+                                'lambda': mtp_lambda_eff, 'w_norm': _mtp_wn}
                 snapshot = diagnostics.log_diagnostics(
                     step, settings.nas_path, total_tokens_processed,
                     awd_data=awd_diag, moe_data=moe_diag,
@@ -5841,13 +5888,18 @@ class Settings:
         if _mt is True:
             _mt = {'enabled': True}
         if not isinstance(_mt, dict):
-            fatal_error("mtp must be a dict {enabled, loss_weight} or true")
-        _mt_known = {'enabled', 'loss_weight'}
+            fatal_error("mtp must be a dict {enabled, loss_weight, loss_weight_schedule} or true")
+        _mt_known = {'enabled', 'loss_weight', 'loss_weight_schedule'}
         _mt_typos = set(_mt) - _mt_known
         if _mt_typos:
             fatal_error(f"mtp: unknown key(s) {sorted(_mt_typos)} — known: {sorted(_mt_known)}")
         self.mtp_enabled = bool(_mt.get('enabled', False))
         self.mtp_loss_weight = float(_mt.get('loss_weight', 0.3))
+        # Optional lambda schedule (inert unless present) — evaluated per step by
+        # get_mtp_lambda. DeepSeek-V3 / GLM step lambda DOWN late in pretraining
+        # (e.g. 0.3 then 0.1); this exposes that without changing the constant
+        # default. See get_mtp_lambda for the schema.
+        self.mtp_loss_weight_schedule = _mt.get('loss_weight_schedule', None)
         if self.mtp_enabled:
             if self.gdn_enabled:
                 fatal_error("mtp is not supported with gdn_enabled (the MTP block would land "
@@ -5859,6 +5911,23 @@ class Settings:
             if self.mtp_loss_weight <= 0.0:
                 fatal_error(f"mtp.loss_weight must be > 0 (got {self.mtp_loss_weight}); "
                             f"to disable mtp set enabled: false")
+            _sc = self.mtp_loss_weight_schedule
+            if _sc is not None:
+                if not isinstance(_sc, dict) or not _sc.get('points'):
+                    fatal_error("mtp.loss_weight_schedule must be a dict with 'points': "
+                                "[[x, lambda], ...] (x = tokens or step)")
+                if _sc.get('key', 'tokens') not in ('tokens', 'step'):
+                    fatal_error(f"mtp.loss_weight_schedule.key must be 'tokens' or 'step' "
+                                f"(got {_sc.get('key')!r})")
+                if _sc.get('shape', 'step') not in ('step', 'linear'):
+                    fatal_error(f"mtp.loss_weight_schedule.shape must be 'step' or 'linear' "
+                                f"(got {_sc.get('shape')!r})")
+                try:
+                    _pts = [[float(a), float(b)] for a, b in _sc['points']]
+                except (TypeError, ValueError):
+                    fatal_error("mtp.loss_weight_schedule.points must be [[x, lambda], ...] numbers")
+                if any(v <= 0.0 for _, v in _pts):
+                    fatal_error("mtp.loss_weight_schedule lambdas must all be > 0")
 
     def handle_arguments(self, args: argparse.Namespace):
         """Update settings based on command line arguments."""
@@ -6235,9 +6304,14 @@ if __name__ == "__main__":
             f"{settings.cfg_layers - _n_glob} local / {_n_glob} global layers "
             f"(every {settings.swa_global_interleave}th global)")
     if settings.mtp_enabled:
+        _lam_desc = f"lambda={settings.mtp_loss_weight} (constant)"
+        if settings.mtp_loss_weight_schedule:
+            _sc = settings.mtp_loss_weight_schedule
+            _lam_desc = (f"lambda SCHEDULED ({_sc.get('shape', 'step')} over "
+                         f"{_sc.get('key', 'tokens')}): {_sc.get('points')}")
         logger.print_and_log(
             f"  ] [mtp] DeepSeek-style sequential t+2 module: 1 extra block + shared "
-            f"norm/head, lambda={settings.mtp_loss_weight} (headline ls:/val stay pure t+1 CE)")
+            f"norm/head, {_lam_desc} (headline ls:/val stay pure t+1 CE)")
 
     # ----------------------- Save Settings Config File -----------------------
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
