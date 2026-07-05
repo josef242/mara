@@ -373,6 +373,29 @@ def get_mtp_lambda(step: int, total_tokens: int, settings) -> float:
     return pts[-1][1]
 
 
+def _estimate_total_tokens(settings):
+    """Rough total training tokens over the run: sum over the ga_schedule
+    intervals of (interval steps * per-step token budget), through max_steps.
+    Budget-based (ignores the early 1-batch floor), so it's world-size-independent
+    and a slight UNDER-estimate — fine for an order-of-magnitude reachability
+    check on token-keyed schedules. Returns None if the inputs aren't available.
+    """
+    ga = getattr(settings, 'ga_schedule', None)
+    max_steps = int(getattr(settings, 'max_steps', 0) or 0)
+    if not ga or not max_steps:
+        return None
+    try:
+        pts = sorted(([int(s), float(b)] for s, b in ga), key=lambda p: p[0])
+    except (TypeError, ValueError):
+        return None
+    tot = 0.0
+    for i, (s0, bud) in enumerate(pts):
+        s1 = min(pts[i + 1][0] if i + 1 < len(pts) else max_steps, max_steps)
+        if s1 > s0:
+            tot += (s1 - s0) * bud
+    return tot if tot > 0 else None
+
+
 def _row_center_cfg(settings):
     """Normalize the row_center_head config to a dict with keys
     {enabled: bool, warmup: dict|None}. Accepts BOTH the flat bool form
@@ -5928,6 +5951,23 @@ class Settings:
                     fatal_error("mtp.loss_weight_schedule.points must be [[x, lambda], ...] numbers")
                 if any(v <= 0.0 for _, v in _pts):
                     fatal_error("mtp.loss_weight_schedule lambdas must all be > 0")
+                # Reachability sanity (non-fatal): a breakpoint beyond the run's
+                # reach looks configured but silently NEVER fires (the exact
+                # footgun of pasting DeepSeek's literal 10T onto a ~500B run).
+                # Compare the LAST breakpoint to the run's estimated extent —
+                # token budget for key='tokens', max_steps for 'step'.
+                _key = _sc.get('key', 'tokens')
+                _last_bp = max(x for x, _ in _pts)
+                _extent = (_estimate_total_tokens(self) if _key == 'tokens'
+                           else (float(self.max_steps) if getattr(self, 'max_steps', 0) else None))
+                _unit = 'tokens' if _key == 'tokens' else 'steps'
+                if _extent and _last_bp > _extent:
+                    logger.print_and_log(
+                        f"  ] [mtp] WARNING: loss_weight_schedule's last breakpoint "
+                        f"({_last_bp:.3g} {_unit}) is BEYOND this run's estimated extent "
+                        f"(~{_extent:.3g} {_unit}) — the lambda step-down will NEVER fire; "
+                        f"lambda stays {_pts[0][1]} the whole run. Scale the breakpoint to "
+                        f"this run's budget (DeepSeek/GLM stepped down at ~68%).")
 
     def handle_arguments(self, args: argparse.Namespace):
         """Update settings based on command line arguments."""
