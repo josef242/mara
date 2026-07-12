@@ -617,6 +617,20 @@ def _find_rowcenter_zloss_overlap(settings):
     return None
 
 
+def _validate_schedule_knots(schedule, ctx):
+    """Boot-time guard for [[step, value], ...] schedules: steps must be
+    strictly ascending. interpolate_lr_mod assumes this — on unsorted input it
+    silently clamps to the wrong knot for every step below the misplaced first
+    entry, and duplicate steps ZeroDivisionError MID-RUN when the step enters
+    that segment (audit 2026-07-11). No-op for scalar values."""
+    if not (isinstance(schedule, list) and schedule
+            and isinstance(schedule[0], (list, tuple))):
+        return
+    steps = [s for s, _ in schedule]
+    if any(b <= a for a, b in zip(steps, steps[1:])):
+        fatal_error(f"{ctx}: schedule steps must be strictly ascending, got {steps}")
+
+
 def interpolate_lr_mod(schedule, step):
     """Linear interpolation of lr_mod schedule. Returns scale factor (1.0 = normal)."""
     if step <= schedule[0][0]:
@@ -819,8 +833,13 @@ def parse_lr_mods(lr_mods_config, model):
         return n.endswith('bias') or ('norm' in n.lower() and n.endswith('weight'))
 
     def _match_type(n, ptype):
-        is_attn = 'attention.' in n and 'norm' not in n
-        is_ffn = 'feed_forward.' in n
+        # GDN hybrid layers hold their attention under gdn_attn.*, MoE layers
+        # their FFN under moe.* (experts / shared_experts / router) — all body
+        # params that must ride the same type filters. Pre-2026-07-11 these
+        # names silently escaped even ptype='all' (75% of attention layers on
+        # a 3:1 GDN hybrid kept scale 1.0 with no warning).
+        is_attn = ('attention.' in n or 'gdn_attn.' in n) and 'norm' not in n
+        is_ffn = ('feed_forward.' in n or '.moe.' in n) and 'norm' not in n
         if ptype == 'all':
             return is_attn or is_ffn
         elif ptype == 'attn':
@@ -828,6 +847,9 @@ def parse_lr_mods(lr_mods_config, model):
         elif ptype == 'ffn':
             return is_ffn
         return False
+
+    for entry in lr_mods_config:
+        _validate_schedule_knots(entry[-1], f"lr_mods entry {entry[:-1]}")
 
     for entry in lr_mods_config:
         if isinstance(entry[0], str) and len(entry) == 2:
@@ -879,6 +901,9 @@ def parse_wd_rules(wd_config, model):
 
     def _is_norm(n):
         return n.endswith('bias') or ('norm' in n.lower() and n.endswith('weight'))
+
+    for entry in wd_config:
+        _validate_schedule_knots(entry[-1], f"weight_decay rule {entry[:-1]}")
 
     for entry in wd_config:
         if isinstance(entry[0], str):
@@ -2007,6 +2032,19 @@ def train_loop(
                             f"doc_attn_mask: bos_token_id={settings.doc_bos_token_id} NEVER appeared "
                             f"in {_dm_windows_seen} windows (all ranks) — the mask/position-reset is "
                             f"a silent no-op. The llama stream separates documents with id 1.")
+                    # Upper rail: a wrong-but-FREQUENT id (an ordinary vocab token) doesn't
+                    # trip the zero check — it shows up as absurd separator DENSITY instead.
+                    # Real corpora average well above 64 tokens/doc; a common vocab token
+                    # recurs every ~20-100 tokens. Same all-reduced verdict as above, so it
+                    # fires identically on every rank.
+                    _dm_rate = _dm_bos_seen / max(_dm_windows_seen, 1)
+                    if _dm_rate > settings.T / 64 and not settings.doc_bos_allow_mismatch:
+                        fatal_error(
+                            f"doc_attn_mask: bos_token_id={settings.doc_bos_token_id} appears "
+                            f"{_dm_rate:.1f} times/window (T={settings.T}) — a mean document "
+                            f"under 64 tokens is implausible; this id is almost certainly an "
+                            f"ordinary vocab token, not the document separator. Check the "
+                            f"[bos-check] boot banner / tokenizer.bos_id.")
                     logger.print_and_log(
                         f"  ] [doc-mask] stream check OK: {_dm_bos_seen} separators in "
                         f"{_dm_windows_seen} windows (~{_dm_bos_seen / max(_dm_windows_seen, 1):.2f} "
@@ -2022,15 +2060,28 @@ def train_loop(
                 torch.save({'x': x.detach().cpu(), 'y': y.detach().cpu(),
                             'step': step, 'shape': tuple(x.shape)}, _tokpath)
                 logger.print_and_log(f"[WD-DUMP] saved rank0 microbatch tokens (shape {tuple(x.shape)}, OPAQUE) -> {_tokpath}")
-            # Avoid gradient synchronization on intermediate micro-steps
-            # (big speedup with FSDP/DDP when grad_accum_steps > 1)
+            # Avoid gradient synchronization on intermediate micro-steps.
+            # DDP exposes no_sync(); FSDP2 (fully_shard) does NOT — it exposes
+            # set_requires_gradient_sync() (the WD-probe block below always knew
+            # this; the hot path's hasattr probes silently matched neither, so
+            # reduce-scatter fired on EVERY micro-step since the FSDP2 port —
+            # audit 2026-07-11, wizard101 pre-launch ledger item). OPT-IN via
+            # fsdp_defer_grad_sync because deferral accumulates UNSHARDED bf16
+            # grads on every rank (~world_size x the sharded grad memory) — a
+            # real memory/comms trade; enable when GA is large and VRAM allows.
             sync_ctx = nullcontext()
-            if ddp and micro_step < grad_accum_steps - 1:
-                # torch.compile may wrap the module; handle both cases robustly
-                if hasattr(model, "no_sync"):
-                    sync_ctx = model.no_sync()
-                elif hasattr(model, "_orig_mod") and hasattr(model._orig_mod, "no_sync"):
-                    sync_ctx = model._orig_mod.no_sync()
+            if ddp:
+                _root = model._orig_mod if hasattr(model, "_orig_mod") else model
+                _is_last_micro = micro_step >= grad_accum_steps - 1
+                if hasattr(_root, "set_requires_gradient_sync"):  # FSDP2 root
+                    if getattr(settings, 'fsdp_defer_grad_sync', False):
+                        # Must flip True BEFORE the last micro-step's backward.
+                        _root.set_requires_gradient_sync(_is_last_micro)
+                elif not _is_last_micro:
+                    if hasattr(model, "no_sync"):
+                        sync_ctx = model.no_sync()
+                    elif hasattr(_root, "no_sync"):
+                        sync_ctx = _root.no_sync()
 
             with sync_ctx:
                 # Optionally bypass torch.compile on truncated steps to avoid
@@ -2207,22 +2258,34 @@ def train_loop(
                 scale = interpolate_lr_mod(schedule, step)
                 lr_scale_overrides[id(param)] = scale
 
-            # For standalone Adam: apply scales via param_group lr
+            # For standalone Adam: apply scales via param_group lr. A group has
+            # exactly ONE lr, so this is sound only when every param in the
+            # group agrees on the scale — which the boot-time filter guarantees
+            # (only emb/out/[all, all] rules survive for non-Muon optimizers).
+            # Verify agreement instead of trusting the first scaled param
+            # (pre-2026-07-11: first-match + break silently rescaled whole
+            # groups from partial rules).
             if settings.optimizer_type not in FSDP2_MUON_FAMILY:
                 for param_group in optimizer.param_groups:
                     wd_group = param_group.get('wd_group', 'default')
                     if wd_group == 'norm_bias':
                         continue  # norms always unscaled
-                    for p in param_group['params']:
-                        scale = lr_scale_overrides.get(id(p), 1.0)
-                        if scale != 1.0:
-                            new_lr = scheduled_lr * scale
-                            group_lr = param_group.get('lr')
-                            if isinstance(group_lr, torch.Tensor):
-                                group_lr.fill_(new_lr)
-                            else:
-                                param_group['lr'] = torch.tensor(new_lr)
-                            break
+                    scales = {lr_scale_overrides.get(id(p), 1.0)
+                              for p in param_group['params']}
+                    if len(scales) > 1:
+                        fatal_error(
+                            f"lr_mods: param group '{wd_group}' has mixed lr scales "
+                            f"{sorted(scales)} under a non-Muon optimizer — a group has a "
+                            f"single lr. Restrict lr_mods to emb/out/[all, all] forms, or "
+                            f"use a Muon-family optimizer for per-layer lr.")
+                    scale = next(iter(scales))
+                    if scale != 1.0:
+                        new_lr = scheduled_lr * scale
+                        group_lr = param_group.get('lr')
+                        if isinstance(group_lr, torch.Tensor):
+                            group_lr.fill_(new_lr)
+                        else:
+                            param_group['lr'] = torch.tensor(new_lr)
 
         # ── SCS lr_scale_overrides (must run AFTER lr_mod_entries so SCS's
         #    freeze of output.weight / inactive layers can't be silently
@@ -3501,11 +3564,12 @@ def save_model(model, optimizer, model_config, step, ddp_rank, ddp_local_rank, t
             # fallback for checkpoints saved before this whitelist entry.
             'doc_attn_mask': getattr(model_config, 'doc_attn_mask', False),
             'doc_pos_reset': getattr(model_config, 'doc_pos_reset', False),
-            'bos_token_id': getattr(model_config, 'bos_token_id', 32000),
+            'bos_token_id': model_config.bos_token_id,
             'swa_enabled': getattr(model_config, 'swa_enabled', False),
             'swa_window': getattr(model_config, 'swa_window', 512),
             'swa_global_interleave': getattr(model_config, 'swa_global_interleave', 4),
             'mtp_enabled': getattr(model_config, 'mtp_enabled', False),
+            'mtp_doc_boundary_mask': getattr(model_config, 'mtp_doc_boundary_mask', False),
         }
         # SCS knobs — recorded so a forensic tool / dashboard can tell
         # whether a checkpoint was produced under scaffold and with which
@@ -3672,7 +3736,50 @@ _RESUME_MUST_MATCH = [
     ('swa_window',            'swa_window',            'swa.window'),
     ('swa_global_interleave', 'swa_global_interleave', 'swa.global_interleave'),
     ('mtp_enabled',           'mtp_enabled',           'mtp.enabled'),
+    # mtp.doc_boundary_mask is deliberately NOT here: it's a loss-SHAPING knob
+    # (same family as the schedulable mtp lambda), not a baked-into-weights
+    # structural flip. Enabling it mid-run at a checkpoint boundary is a
+    # sanctioned operation (Josef, 2026-07-13) — future steps simply stop
+    # training the ~1-row-per-doc cross-document MTP supervision. The [mtp]
+    # boot banner prints the flag state so a copied-config flip is visible.
 ]
+
+
+def _reassert_group_hparams(optimizer, settings):
+    """Resume-time refresh of config-owned optimizer hyperparams.
+
+    A checkpoint restore re-installs the SAVED param_group values, so any
+    hyperparam the config is allowed to change across a resume must be
+    explicitly re-asserted afterward. Adam-family keys go to Adam groups only
+    (betas injected into Muon groups was the pollution the full-consolidation
+    path had to strip), Muon keys to Muon groups only. Groups without a
+    'use_muon' key (standalone Adam-family optimizers) count as Adam."""
+    for pg in optimizer.param_groups:
+        if pg.get('use_muon', False):
+            pg['momentum'] = settings.muon_momentum
+            if 'beta2' in pg:  # NorMuon second-moment decay
+                pg['beta2'] = getattr(settings, 'normuon_beta2', pg['beta2'])
+            pg.pop('betas', None)  # strip pre-fix pollution from old checkpoints
+        else:
+            pg['betas'] = (settings.beta1, settings.beta2)
+
+
+def _apply_scalar_wd_to_groups(optimizer, new_wd):
+    """Resume-time scalar weight_decay refresh: set new_wd on EVERY non-norm
+    param group. The checkpoint restore re-installs the old scalar on each
+    group, so all of them need the update — a first-match-then-break here
+    (the pre-2026-07-11 behavior) silently left every later group on the old
+    value while logging success. Returns {old_value: group_count} of what
+    actually changed, for logging."""
+    updated = {}
+    for pg in optimizer.param_groups:
+        if pg.get('wd_group') == 'norm_bias':
+            continue
+        old = pg.get('weight_decay', 0.0)
+        if old != new_wd:
+            pg['weight_decay'] = new_wd
+            updated[old] = updated.get(old, 0) + 1
+    return updated
 
 
 def _resume_config_mismatches(ckpt_config, settings):
@@ -3748,6 +3855,42 @@ def resume_training(model, optimizer, train_loader, ddp_rank, settings, grad_acc
                 "does NOT catch behavioral flips like swa.window):\n" + _lines +
                 "\n    Restore these values in the config to match the checkpoint, "
                 "or start a fresh run (new run_name, no resume).")
+
+        # Advisory, deliberately NOT fatal (loss-shaping knob, sanctioned to flip
+        # mid-run — Josef 2026-07-13): self-document mtp.doc_boundary_mask flips
+        # in the run log, since the [mtp] boot banner can land before the file
+        # logger attaches and the mismatch guard intentionally ignores this field.
+        _ck_dbm = config.get('mtp_doc_boundary_mask', None)
+        _live_dbm = bool(getattr(settings, 'mtp_doc_boundary_mask', False))
+        if _ck_dbm is None and _live_dbm:
+            logger.print_and_log(
+                "  ] [mtp] doc_boundary_mask: ON — checkpoint pre-dates the field, so "
+                "the loss-shaping change takes effect at THIS resume. Expect a small "
+                "instant DOWN-step in the mtp: channel (hardest rows leave the mean); "
+                "headline ls:/val unaffected.", r0_only=True)
+        elif _ck_dbm is not None and bool(_ck_dbm) != _live_dbm:
+            logger.print_and_log(
+                f"  ] [mtp] doc_boundary_mask FLIPPED across resume: checkpoint="
+                f"{bool(_ck_dbm)} → live={_live_dbm} (deliberate loss-shaping change; "
+                f"the mtp: channel steps accordingly, headline ls:/val unaffected).",
+                r0_only=True)
+
+    # Tokenizer identity (audit 2026-07-11: saved since checkpoint v3.x but never
+    # verified). A swapped tokenizer with the same rounded vocab size loads
+    # strict-clean and silently trains on garbage token semantics — kind must
+    # match. Path may legitimately move (NAS remaps), so it only warns.
+    _ck_tok_kind = checkpoint.get('tok_kind')
+    if _ck_tok_kind is not None and _ck_tok_kind != settings.tok_kind:
+        fatal_error(
+            f"Resume ABORTED — tokenizer kind changed: checkpoint={_ck_tok_kind!r} "
+            f"live-config={settings.tok_kind!r}. Token ids are baked into the "
+            f"trained embeddings.")
+    _ck_tok_path = checkpoint.get('tok_path')
+    if _ck_tok_path and _ck_tok_path != getattr(settings, 'tok_path', None):
+        logger.print_and_log(
+            f"  ] WARNING: tok_path differs from checkpoint ({_ck_tok_path!r} -> "
+            f"{settings.tok_path!r}) — fine if the same tokenizer moved; verify "
+            f"if unexpected (tok_kind matches: {settings.tok_kind}).")
 
     # FSDP2: Use set_model_state_dict to load and distribute weights
     logger.print_and_log("  ] Distributing model weights across ranks...")
@@ -3981,18 +4124,18 @@ def resume_training(model, optimizer, train_loader, ddp_rank, settings, grad_acc
 
         # Update weight_decay per group if changed (scalar mode only; rules mode uses _wd per step)
         if isinstance(settings.weight_decay, (int, float)):
-            for param_group in optimizer.param_groups:
-                if param_group.get('wd_group') == 'norm_bias':
-                    continue
-                old_wd = param_group.get('weight_decay', 0.0)
-                if old_wd != settings.weight_decay:
-                    param_group['weight_decay'] = settings.weight_decay
-                    logger.print_and_log(f"  ] Updated weight_decay: {old_wd} \u2192 {settings.weight_decay}", r0_only=True)
-                    break  # all non-norm groups share the same scalar
+            for _old, _n in _apply_scalar_wd_to_groups(optimizer, settings.weight_decay).items():
+                logger.print_and_log(
+                    f"  ] Updated weight_decay: {_old} \u2192 {settings.weight_decay} "
+                    f"({_n} param group(s))", r0_only=True)
 
-        # Also update betas if they've changed
-        for param_group in optimizer.param_groups:
-            param_group['betas'] = (settings.beta1, settings.beta2)
+        # Re-assert schedule-owned hyperparams over the checkpoint-restored
+        # param_groups (the restore re-installs whatever was saved; only lr and
+        # wd had explicit re-asserts before — audit 2026-07-11: changing
+        # muon_momentum across a resume was silently ignored, and betas were
+        # being injected into MUON groups, polluting them with a foreign key
+        # the consolidation path then had to strip).
+        _reassert_group_hparams(optimizer, settings)
 
     torch.cuda.empty_cache()
 
@@ -5816,7 +5959,8 @@ class Settings:
             _dm = {'enabled': True}
         if not isinstance(_dm, dict):
             fatal_error("doc_attn_mask must be a dict {enabled, reset_positions, bos_token_id} or true")
-        _dm_known = {'enabled', 'reset_positions', 'bos_token_id', 'allow_reset_without_mask'}
+        _dm_known = {'enabled', 'reset_positions', 'bos_token_id', 'allow_reset_without_mask',
+                     'allow_bos_mismatch'}
         _dm_typos = set(_dm) - _dm_known
         if _dm_typos:
             # silent-ignore would default the feature OFF — the worst direction for a typo
@@ -5828,7 +5972,17 @@ class Settings:
         # special token, which never occurs in pretokenized data. A wrong id makes both
         # features a silent no-op; the trainer also stream-checks this in-loop (fatal by
         # ~step 20 if the configured id never appears).
+        # An EXPLICIT bos_token_id is cross-checked against tokenizer.bos_id at
+        # boot ([bos-check]); when OMITTED the trainer ADOPTS tokenizer.bos_id
+        # there. The 1 below is a pre-tokenizer-load placeholder, never trusted
+        # on its own.
         self.doc_bos_token_id = int(_dm.get('bos_token_id', 1))
+        self.doc_bos_token_id_explicit = 'bos_token_id' in _dm
+        # Escape hatch for the boot-time tokenizer.bos_id cross-check and the
+        # in-loop separator-density rail: set true ONLY when deliberately keying
+        # the mask to a separator other than the tokenizer's canonical BOS
+        # (e.g. mid-training data separated by an extended special token).
+        self.doc_bos_allow_mismatch = bool(_dm.get('allow_bos_mismatch', False))
         if self.doc_pos_reset and not self.doc_attn_mask_enabled \
                 and not bool(_dm.get('allow_reset_without_mask', False)):
             fatal_error(
@@ -5911,13 +6065,21 @@ class Settings:
         if _mt is True:
             _mt = {'enabled': True}
         if not isinstance(_mt, dict):
-            fatal_error("mtp must be a dict {enabled, loss_weight, loss_weight_schedule} or true")
-        _mt_known = {'enabled', 'loss_weight', 'loss_weight_schedule'}
+            fatal_error("mtp must be a dict {enabled, loss_weight, loss_weight_schedule, "
+                        "doc_boundary_mask} or true")
+        _mt_known = {'enabled', 'loss_weight', 'loss_weight_schedule', 'doc_boundary_mask'}
         _mt_typos = set(_mt) - _mt_known
         if _mt_typos:
             fatal_error(f"mtp: unknown key(s) {sorted(_mt_typos)} — known: {sorted(_mt_known)}")
         self.mtp_enabled = bool(_mt.get('enabled', False))
         self.mtp_loss_weight = float(_mt.get('loss_weight', 0.3))
+        # Optional (default OFF = pre-2026-07-13 behavior, keeps live runs
+        # byte-identical): ignore MTP loss rows whose 2-token window crosses a
+        # document boundary. Without this, under doc_attn_mask the MTP head
+        # trains "predict doc B's first content token from doc-A hidden state
+        # + B's BOS embedding" at every boundary — exactly the cross-document
+        # supervision the mask exists to remove (~1 row per document).
+        self.mtp_doc_boundary_mask = bool(_mt.get('doc_boundary_mask', False))
         # Optional lambda schedule (inert unless present) — evaluated per step by
         # get_mtp_lambda. DeepSeek-V3 / GLM step lambda DOWN late in pretraining
         # (e.g. 0.3 then 0.1); this exposes that without changing the constant
@@ -6263,6 +6425,43 @@ if __name__ == "__main__":
     if special_tokens_path:
         logger.print_and_log(f"  ] Special tokens = {special_tokens_path}")
 
+    # [bos-check] Cross-check the doc-mask separator id against the tokenizer's
+    # canonical BOS. pre_tokenize builds shards with add_bos=True, so the stream's
+    # document separator IS tokenizer.bos_id by construction. The in-loop stream
+    # check only catches an id that NEVER appears; a wrong-but-FREQUENT id (e.g.
+    # llama's 1 reused on cl100k data, where 1 is an ordinary vocab token) passes
+    # it and silently resets mask/positions at garbage boundaries. Fatal here at
+    # boot, before any compute. doc_attn_mask.allow_bos_mismatch opts out for
+    # deliberately non-BOS-separated data.
+    if settings.doc_attn_mask_enabled or settings.doc_pos_reset \
+            or getattr(settings, 'mtp_doc_boundary_mask', False):
+        # mtp.doc_boundary_mask keys off the same separator id, so it gets the
+        # same validation/adoption even if the doc-mask flags are off.
+        _tok_bos = int(getattr(enc, 'bos_id', -1))
+        if not settings.doc_bos_token_id_explicit:
+            # Config omitted the id: derive it from the universal call rather
+            # than trusting any literal. The adopted value flows into the model
+            # args, the saved run-dir yaml, and the checkpoint config below.
+            settings.doc_bos_token_id = _tok_bos
+            logger.print_and_log(
+                f"  ] [bos-check] config omitted doc_attn_mask.bos_token_id — adopted "
+                f"tokenizer.bos_id = {_tok_bos} ({settings.tok_kind})")
+        elif settings.doc_bos_token_id == _tok_bos:
+            logger.print_and_log(
+                f"  ] [bos-check] doc separator id {settings.doc_bos_token_id} "
+                f"== tokenizer.bos_id: OK")
+        elif settings.doc_bos_allow_mismatch:
+            logger.print_and_log(
+                f"  ] [bos-check] WARNING: doc separator id {settings.doc_bos_token_id} "
+                f"!= tokenizer.bos_id {_tok_bos} — allowed by allow_bos_mismatch")
+        else:
+            fatal_error(
+                f"doc_attn_mask.bos_token_id={settings.doc_bos_token_id} != tokenizer.bos_id="
+                f"{_tok_bos} (tok_kind={settings.tok_kind}). pre_tokenize bakes tokenizer.bos_id "
+                f"into the shards as the document separator, so these must match. Set "
+                f"bos_token_id: {_tok_bos}, or doc_attn_mask.allow_bos_mismatch: true if a "
+                f"non-BOS separator is truly intended.")
+
     # ----------------------- Auxiliary prediction heads -----------------------
     # Parse auxiliary_heads YAML block. We only need the layer list here to
     # build the model; per-head weight schedules are re-parsed inside train_loop.
@@ -6330,6 +6529,7 @@ if __name__ == "__main__":
         swa_global_interleave=settings.swa_global_interleave,
         # Multi-token prediction (branch doc-mask, festival feature 3)
         mtp_enabled=settings.mtp_enabled,
+        mtp_doc_boundary_mask=settings.mtp_doc_boundary_mask,
     )
     if settings.doc_attn_mask_enabled or settings.doc_pos_reset:
         logger.print_and_log(
@@ -6351,7 +6551,8 @@ if __name__ == "__main__":
                          f"{_sc.get('key', 'tokens')}): {_sc.get('points')}")
         logger.print_and_log(
             f"  ] [mtp] DeepSeek-style sequential t+2 module: 1 extra block + shared "
-            f"norm/head, {_lam_desc} (headline ls:/val stay pure t+1 CE)")
+            f"norm/head, {_lam_desc} (headline ls:/val stay pure t+1 CE) | "
+            f"doc_boundary_mask: {'ON — cross-doc boundary rows excluded' if settings.mtp_doc_boundary_mask else 'off'}")
 
     # ----------------------- Save Settings Config File -----------------------
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -6381,6 +6582,16 @@ if __name__ == "__main__":
         f"| cos absmax {_bc.abs().max():.4f} (ref {_rc.abs().max():.4f}) "
         f"| sin absmax {_bs.abs().max():.4f} | sin==ref_COS: {torch.allclose(_bs, _rc, atol=1e-2)} "
         f"| row1[:4] {_bc[1, :4].tolist()} ref {_rc[1, :4].tolist()}")
+    if not (_cos_ok and _sin_ok):
+        # FATAL, matching every other boot rail ([bos-check], resume guard, doc-mask
+        # stream check): this is the guard for the exact class that silently corrupted
+        # every pre-2026-07-02 meta-init run (RoPE trained as a cos-envelope). An
+        # advisory log line among hundreds is how it stayed hidden the first time.
+        fatal_error(
+            f"[freqs-check] RoPE freqs buffers do not match a freshly computed table "
+            f"(cos ok: {_cos_ok}, sin ok: {_sin_ok}). A buffer survived to_empty() "
+            f"without re-init — refusing to train without functional RoPE. See the "
+            f"banner line above for the corruption signature.")
 
     # Z-loss is a trainer/loss-path concern, not a ModelArgs/architecture knob,
     # so set the backend flag on the raw module post-build (before per-submodule
@@ -6734,12 +6945,16 @@ if __name__ == "__main__":
                             logger.print_and_log(
                                 f"WARNING: lr_mods rule [all, {e[1]}] ignored "
                                 f"(attn/ffn differentiation requires Muon optimizer)", r0_only=True)
-                    elif e[2] == 'all':
-                        effective_rules.append(e)  # [start, end, all, ...] — maps to default group
                     else:
+                        # Layer-range rules (any type, incl. 'all') cannot be honored:
+                        # a non-Muon param group has exactly ONE lr, and a layer range
+                        # is a strict subset of the group. Pre-2026-07-11 the 'all'
+                        # form was accepted here and the runtime fallback silently
+                        # rescaled the WHOLE group from its first matched param.
                         logger.print_and_log(
-                            f"WARNING: lr_mods rule '{e[2]}' for layers {e[0]}-{e[1]} ignored "
-                            f"(attn/ffn differentiation requires Muon optimizer)", r0_only=True)
+                            f"WARNING: lr_mods layer-range rule {e[:3]} ignored "
+                            f"(per-layer lr requires a Muon-family optimizer; a non-Muon "
+                            f"param group has a single lr)", r0_only=True)
 
             if effective_rules:
                 lr_mod_entries = parse_lr_mods(effective_rules, model)
@@ -6750,6 +6965,30 @@ if __name__ == "__main__":
     wd_entries = None
     has_wd_schedules = False
     if isinstance(settings.weight_decay, list):
+        # MuonSphere ignores weight decay on its Muon params BY DESIGN (radius is
+        # projection-controlled; WD would fight it) and reads no wd_overrides on
+        # that branch. Rules mode always includes body-targeting rules (the
+        # coverage guard requires them), so sphere + rules = guaranteed silent
+        # no-op on every Muon param. Refuse, like the SCS x sphere guard above.
+        if settings.optimizer_type in {"muonsphere_fsdp2", "normuon_sphere_fsdp2"}:
+            fatal_error(
+                f"weight_decay RULES are incompatible with optimizer_type="
+                f"'{settings.optimizer_type}': MuonSphere applies NO weight decay to "
+                f"Muon params by design, so body rules would be silently inert. Use a "
+                f"scalar weight_decay (applies to the Adam-side params only), or a "
+                f"non-sphere Muon optimizer.")
+        # Rules mode zeroes the optimizer's base WD and relies on the optimizer
+        # reading the wd_overrides side-dict. These optimizers never read it —
+        # the whole model would silently train with WD=0 (the long-documented
+        # AdamW-family trap, now enforced; audit 2026-07-11).
+        _WD_RULES_BLIND = {'adamw', 'adamw_8bit', 'adamw_16bit', 'adafactor'}
+        if settings.optimizer_type in _WD_RULES_BLIND:
+            fatal_error(
+                f"weight_decay RULES require an optimizer that reads the wd_overrides "
+                f"side-dict; '{settings.optimizer_type}' does not (side-dict-capable: "
+                f"Muon families, adamc/adamc_8bit/adamc_16bit). With rules the base WD "
+                f"is forced to 0.0, so the entire model would silently train with NO "
+                f"weight decay. Use a scalar weight_decay or a capable optimizer.")
         wd_entries = parse_wd_rules(settings.weight_decay, model)
         has_wd_schedules = any(isinstance(wd_val, list) for _, wd_val in wd_entries)
         if ddp_rank == 0:
