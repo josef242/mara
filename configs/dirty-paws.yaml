@@ -1,0 +1,189 @@
+# ============================================================================
+# dirty-paws 🐾 — 1.57B KEEL raw-audio twin of baby-wizard (mu-law, vocab 257)
+# ============================================================================
+# STATUS: DRAFT, review-ready except boot-probe-contingent items. Everything is
+#   baby-wizard.yaml VERBATIM except the sanctioned modality deltas (Rook 181 +
+#   Amendments, Josef-approved). Twin comparison requires bit-parity of the
+#   body/optimizer/telemetry — do NOT touch anything not marked [AUDIO-DELTA].
+#
+# RESOLVED (Rook rulings 189/191/193/194): tangent ramp (C, event-keyed), MTP λ (17B tok),
+#   ga_schedule (ga=3, budget-coupled), max_steps 33025, LR verbatim, mixture LOCKED,
+#   tokenizer stub (raw_audio) BUILT. Gate-1 PASSED (12k speaker-specific babble).
+# REMAINING BEFORE LAUNCH:
+#   [TODO-DATA]  shard paths — audio data downloading; prepare_audio speaker-exclusion pass.
+#   builds: event-keyed tangent coupling (#4); surgical warm-start loader (Gate 2).
+#   boot-probe (on-rig, post baby-wizard shutdown): peak VRAM + measured tok/s (confirms the
+#     262k micro-floor -> the derived step anchors) + controller engage/freeze observation.
+#   Gate-2: warm-start A/B, 1.0B tok/arm, picks init.
+#
+# MEMORY (verified arithmetic, 8x3060 12GB, FSDP2, AC every layer, mb=1):
+#   32k mb1 ~10.2/12GB FITS (~1.8GB headroom). 64k mb1 ~15.7GB does NOT fit —
+#   64k is a LATE T-bump via activation-offload/seq-parallel, not native. Ladder:
+#   32k(launch) -> 40k(native ceiling) -> 48k(marginal) -> 64k(offload).
+# ============================================================================
+run_name: dirty-paws
+seed: 42
+
+# ===== schedules / batch (token-based -> T-bump-proof) =====
+# RULED (Rook msg 193/194): operating batch = ga=3 = 786,432 tok/step — BUDGET-COUPLED,
+# sized so 25B runs ~33k steps (NOT baby-wizard's 3M, which would give only ~9k steps and
+# break the step-physics invariants). Reached at 3.3% of budget (0.82B tok) per the
+# token-fraction rule, held to 25B. TOKENS are the invariant; STEP anchors are derived
+# under the 262k micro-floor (mb1*32k*8) and re-derive if the boot probe changes tok/micro.
+ga_schedule:
+  - [0, 262_144]        # ga=1  262k/step; @ 0 tok
+  - [1_426, 524_288]    # ga=2  524k/step; @ 373.9M tok (1.5% of budget)
+  - [2_280, 786_432]    # ga=3  786k/step OPERATING; @ 821.6M tok (3.3%), held to 25B
+B: 1                         # [AUDIO-DELTA] micro-batch/rank (was 4). 32k activation memory forces mb1.
+T: 32768                     # [AUDIO-DELTA] 32k = 4.096s @ 8kHz (was 4096). 64k later via T-bump.
+max_steps: 33_025            # RULED: derived from 25B budget + ga=3 trajectory. IS the cosine
+                             # decay length (train_mara.py:255) -> LR reaches min_lr at the true
+                             # run end. Provisional on the 262k micro-floor; re-derive post-boot-probe.
+eval_iters: 2
+val_step: 100
+save_step: 250
+
+data_type: bf16
+FSDP_param_dtype: bf16
+FSDP_reduce_dtype: bf16
+FSDP_buffer_dtype: bf16
+reshard_after_forward: true  # already baby-wizard's value; required on 12GB cards
+
+resume_training: false       # [AUDIO-DELTA] Gate-2 decides: scratch OR --warm-start-from baby-wizard body
+# resume_step: 0
+
+# clip: baby-wizard scratch-start settings (verbatim)
+clip_warmup: 2.0
+clip_standard: 1.5
+track_gpm: true
+track_clip_groups: true
+
+use_keel: true
+keel_alpha: null
+cfg_layers: 62
+cfg_heads: 14
+cfg_kv_heads: 14
+cfg_embd: 1344
+cfg_intermediate: 3360
+
+norm_eps: 1.0e-05
+dropout: 0.0
+use_activation_checkpointing: true   # REQUIRED at 32k (memory) + festival
+qk_norm_mode: "before_rope"
+tie_word_embeddings: false
+rope_theta: 500_000.0        # [AUDIO-DELTA-NULL] keep baby-wizard's 5e5: twin-parity AND 64k-proof (2*pi*5e5>>64k)
+moe_enabled: false
+
+compile_model: true          # REQUIRED (doc-mask + swa fatal without it); recompiles per seq-len
+compile_mode: default
+
+lr_schedule_type: "cosine"
+max_lr: 3.5e-04
+min_lr: 3.5e-05
+warmup_steps: 1500           # ABSOLUTE (step-physics), verbatim per schedule-transplant policy
+
+optimizer_type: normuon_fsdp2
+beta1: 0.9
+beta2: 0.95
+weight_decay:
+  - [emb, 0.02]
+  - [out, 0.02]
+  - [all, 0.002]
+muon_momentum: 0.95
+muon_ns_steps: 5
+normuon_beta2: 0.99
+muon_adam_state_dtype: fp32  # required by head_gauge_projection
+
+# ===== body recipe: LATE grow-then-clamp =====
+tangent_project: true
+tangent_project_preserve_norm: false
+# RULED (Rook msg 189, option C w/ anchors): step-physics floor, not raw run-fraction.
+# Invariants: engage = 2*warmup = 3000; ramp_start = engage+500 = 3500; ramp_end = freeze
+# = 5500 (= 25% of a ~22k-step / 25B run). ⚠️ assumes the auto_shadow_growth controller's
+# EMERGENT engage/freeze lands near 3000/5500 on audio — VERIFY at boot probe (msg 190).
+# If final budget != 25B, freeze re-derives (invariant: freeze <= 30% of run).
+tangent_project_strength: [[0, 0.0], [3_500, 0.0], [5_500, 1.0]]
+
+ffn_pdr_controller:
+  enabled: true
+  m_min_full: 0.30
+  m_max: 1.0
+  rho: 0.20
+  lambda_max: 0.02
+  lambda_min: 0.002
+  k_ema_alpha: 0.25
+  rate_down: 0.05
+  rate_up: 0.02
+  glide_gain: 1.25
+  freeze_handoff: false
+  acts_on_attn: true
+  reference:
+    mode: auto_shadow_growth
+
+auxiliary_heads:
+  enabled: false
+
+# ===== head hygiene (baby-wizard-identical) =====
+head_gauge_projection:
+  enabled: true
+  init_row_center: true
+
+z_loss:
+  enabled: false
+  target: centered
+  tau: 128
+  alpha: 1.0e-5
+  backend: fp32_accum
+
+row_center_head:
+  enabled: false
+
+# ===== FESTIVAL WINNERS (verbatim except BOS id) =====
+doc_attn_mask:
+  enabled: true
+  reset_positions: true
+  bos_token_id: 256          # [AUDIO-DELTA] token 256 = clip-boundary BOS (was 1). [bos-check]+density-rail retarget automatically.
+
+swa:                          # verbatim: at 62L -> 47 local / 15 global
+  enabled: true
+  window: 512                 # NOTE (log, do not act): 512 tok = 64ms audio vs ~400 words text. Audio-W = phase-2 ablation.
+  global_interleave: 4
+
+mtp:
+  enabled: true
+  loss_weight: 0.3
+  loss_weight_schedule:
+     key: tokens
+     shape: step
+     # [AUDIO-DELTA] re-proportioned 68% of 25B = 17B tok (verbatim was 380B, never reached on a 25B run)
+     points: [[0, 0.3], [17_000_000_000, 0.1]]
+
+transition_health_guard: true
+health_guard_warmup_steps: 2000
+
+# ===== data: AUDIO (mu-law shards) =====
+# Mixture WEIGHTS LOCKED (Rook msg 189 — changes need a reason on thread 176).
+# [TODO-DATA] shard PATHS still pending prepare_audio output (BOS-256 + cross-corpus
+# speaker-exclusion). group names = prepare_audio --group values. CommonVoice TRAIN-ONLY.
+tok_kind: raw_audio          # RawAudioTokenizer (built): vocab 257 = 0-255 mu-law + BOS 256;
+                             # pad_id 257 = never-occurring sentinel (loss ignores NOTHING —
+                             # code 0 is real audio, so baby-wizard's llama pad_id can't transplant).
+                             # len 257 -> round_up(,1024) = 1024 model vocab (767 dead rows, ~0.13%).
+tok_path: 256                # mu-law levels (RawAudioTokenizer ignores it as a filepath)
+# special_tokens: (none — raw audio)
+data_root_path: ../../notebooks/datasets/tokenized/audio/     # [TODO-DATA]
+groups:
+  - [librilight,   [[0, 45.0]]]
+  - [libritts_r,   [[0, 20.0]]]
+  - [librispeech,  [[0, 10.0]]]
+  - [mls_english,  [[0, 10.0]]]
+  - [commonvoice,  [[0, 10.0]]]     # TRAIN-ONLY (no speaker-disjoint val)
+  - [vctk,         [[0, 5.0]]]
+
+gen_log_file: gen_log.txt
+train_log_file: train_log.txt
+val_log_file: val_log.txt
+server_port: 8890
+
+nas_root: /home/josef/brainbox/checkpoints/current/
+local_checkpoint_root: ~/checkpoints/

@@ -1,0 +1,195 @@
+# ============================================================================
+# baby-wizard — the apprentice. 62 layers, raised PURELY on narrative. 🧙👶
+# ============================================================================
+#
+# PURPOSE: rig-31's resident wizard — the full wizard101 recipe (true RoPE +
+# doc-mask/reset + hybrid SWA + MTP + head/body hygiene) at ~1.57B params on a
+# narrative-only diet. The purest test of the "motivation is the compression
+# key" data bet — and the config whose festival calibration transfers most
+# directly (the skiff arms ran exactly these three groups).
+#
+# SHAPE (deliberate): 62L × 1344 × 14 MHA heads (MHA-not-GQA is house style in
+# smalls: kv-head diversity > cache savings at this scale). FFN 3360 = the
+# family 2.5× ratio — the CHEAP width (activations scale with embd×layers, not
+# FFN). head_dim 96. All Muon dim-0s divide by 4/6/8 ranks (fail-fast-proof).
+#
+# VRAM (rig-31 has 8GB cards — the binding constraint): per-rank estimate at
+# world_size 8, B=6/rank: master 0.62 + opt 0.7 + grads 0.3 + AC activations
+# ~2.4 + overhead ≈ 5.6GB of 8GB. FIRST ACTION once OCR abdicates: 25-step
+# boot probe, read peak VRAM. Fallback if >7.2GB: B: 6→4 (token-based
+# ga_schedule auto-compensates via GA; token budget unchanged).
+#
+# SPICE 🌶️: max_lr 3.5e-4 at 62 layers (dn2 ran 3.0e-4 at 69L). Armor: KEEL +
+# clip 1.5. GATE at steps 1500-1900 (warmup ends 1500 here): if median
+# pre-clip nrm stays >1.1 or clipped-frac >60%, restart from ckpt at 3.0e-4.
+#
+# T-BUMP AT ~7k (Josef's slot — PRE-engagement, exactly ≥1k before the 8k
+# engage so the shadow S snapshots clean): 2048→4096 with B: 6→3 (B·T/rank
+# preserved; VRAM-neutral; token-based ga_schedule unaffected). NOTE: under
+# SWA the old "early T-bump is wasteful" economics are obsolete — 47/62
+# layers are windowed (T-independent cost); only the 15 global layers pay
+# quadratic. Expect little immediate GAIN at ~1.7B tok (dn2 evidence: young
+# models can't exploit >2k context yet) and possibly a small true-RoPE
+# adaptation transient — the payoff accrues as the model matures. FORBIDDEN
+# zone unchanged: never bump inside the 8k-16k anneal.
+#
+# GATES: 1.5k (clip+spice) → 7k (T-bump) → 8k engage (~2.0B tok ≈ 1.3
+# tok/param, proportionally matched to wizard101's 9B/4.6B) → 16k freeze
+# (m NOT pegged at 0.30) → horizon honesty: max_steps 200k is the cosine's
+# shape, not a promise.
+run_name: baby-wizard
+seed: 42
+
+# ===== schedules / batch (token-based → T-bump-proof) =====
+ga_schedule:
+  - [0, 150_000]
+  - [4_000, 250_000]
+  - [5_000, 500_000]        # Based on batch size the 0->4k step was a no-op, so I pulled the 8k step down to 5k
+  - [10_000, 1_000_000]
+  - [15_000, 2_000_000]
+  - [20_000, 3_000_000]
+B: 4                        # per rank; reduce at the ~7250 T-bump (B·T preserved)
+T: 4096                      # → 4096 at ~7250 (pre-engagement slot; see header)
+max_steps: 200_000
+eval_iters: 2
+val_step: 100
+save_step: 250
+
+data_type: bf16
+FSDP_param_dtype: bf16
+FSDP_reduce_dtype: bf16
+FSDP_buffer_dtype: bf16
+reshard_after_forward: true
+
+resume_training: true      # fresh from scratch — a new soul, not a retrofit
+resume_step: 7_250
+resume_data_reset: continue         # Modes are: continue (no reset), soft (reset pct window - change in pct), hard (reset all)
+
+# clip: the validated scratch-start setting (judge by median + %clipped)
+clip_warmup: 2.0
+clip_standard: 1.5
+track_gpm: true
+track_clip_groups: true
+
+use_keel: true
+keel_alpha: null
+cfg_layers: 62
+cfg_heads: 14               # MHA (kv == q): house style in small models
+cfg_kv_heads: 14
+cfg_embd: 1344
+cfg_intermediate: 3360      # family 2.5× ratio (was 1.67× draft); ÷4/6/8 ✓
+
+norm_eps: 1.0e-05
+dropout: 0.0
+use_activation_checkpointing: true
+qk_norm_mode: "before_rope"
+tie_word_embeddings: false  # untied — required for the head levers
+rope_theta: 500_000.0
+moe_enabled: false
+
+compile_model: true         # REQUIRED (doc-mask + swa fatal without it)
+compile_mode: default
+
+lr_schedule_type: "cosine"
+max_lr: 3.5e-04             # 🌶️ — see SPICE gate in header (steps 1500-1900)
+min_lr: 3.5e-05
+warmup_steps: 1500
+
+optimizer_type: normuon_fsdp2
+beta1: 0.9
+beta2: 0.95
+# body WD: controller owns FFN WD via the radial-budget law; flat base covers
+# attn + pre-engagement; emb/head pinned 0.02. 'all' also covers mtp.* (body).
+weight_decay:
+  - [emb, 0.02]
+  - [out, 0.02]
+  - [all, 0.002]
+muon_momentum: 0.95
+muon_ns_steps: 5
+normuon_beta2: 0.99
+muon_adam_state_dtype: fp32 # required by head_gauge_projection
+
+# ===== body recipe: LATE grow-then-clamp (token-proportional rescale) =====
+tangent_project: true
+tangent_project_preserve_norm: false
+tangent_project_strength: [[0, 0.0], [8_500, 0.0], [16_000, 1.0]]
+
+# Shadow-norm FFN pdr controller (self-anchoring — no knots). MTP matrices are
+# Muon-group → tangent-projected + frozen with the trunk; the controller's FFN
+# WD law covers mtp.block.feed_forward and acts_on_attn glides its attention
+# (the wizard101 inclusion decision). BOOT-WATCH: Sn should read 189
+# (62×3 trunk + 3 mtp FFN); [swa] banner should read 47 local / 15 global.
+ffn_pdr_controller:
+  enabled: true
+  m_min_full: 0.30
+  m_max: 1.0
+  rho: 0.20
+  lambda_max: 0.02
+  lambda_min: 0.002
+  k_ema_alpha: 0.25
+  rate_down: 0.05
+  rate_up: 0.02
+  glide_gain: 1.25
+  freeze_handoff: false
+  acts_on_attn: true
+  reference:
+    mode: auto_shadow_growth
+
+auxiliary_heads:
+  enabled: false            # failed at head control (dn2); stays out
+
+# ===== head hygiene (wizard101-identical) =====
+head_gauge_projection:
+  enabled: true
+  init_row_center: true
+
+z_loss:                     # Lever 2: built, validated, STAGED OFF
+  enabled: false            # trigger: logZ_c leaving the KEEL band (~>100)
+  target: centered
+  tau: 128
+  alpha: 1.0e-5
+  backend: fp32_accum
+
+row_center_head:
+  enabled: false            # superseded by head_gauge_projection
+
+# ===== FESTIVAL WINNERS (all three; calibrated on THIS exact data mix) =====
+doc_attn_mask:              # ADOPTED: −15.5 mnats + faster (BOS id verified)
+  enabled: true
+  reset_positions: true
+
+swa:                        # ADOPTED: loss-neutral; 47 local / 15 global at 62L
+  enabled: true
+  window: 512
+  global_interleave: 4
+
+mtp:                        # ADOPTED: −13.3 mnats > floor; <1% cost; free
+  enabled: true             # spec-decode head
+  loss_weight: 0.3
+  loss_weight_schedule:
+     key: tokens          # DeepSeek/GLM specify λ by token count (robust to T-bumps)
+     shape: step          # piecewise-constant step-hold (the frontier's hard step-down)
+     points: [[0, 0.3], [380_000_000_000, 0.1]]   # 0.3 → 0.1 at 380B tok (~68% of baby-wizard's ~558B run, DeepSeek-proportional)
+
+
+transition_health_guard: true
+health_guard_warmup_steps: 2000
+
+# ===== data: NARRATIVE-PURE (the bet, undiluted) =====
+tok_kind: llama
+tok_path: ../tokenizers/llama_tokenizer
+special_tokens: ../../notebooks/datasets/tokenized/llama/tokenizer_config.json
+data_root_path: ../../notebooks/datasets/tokenized/llama/
+groups:
+  # - [stories,      [[0, 100.0]]]
+  - [stories,      [[0, 40.0]]]
+  - [ao3,          [[0, 20.0]]]
+  - [books,        [[0, 40.0]]]
+
+gen_log_file: gen_log.txt
+train_log_file: train_log.txt
+val_log_file: val_log.txt
+server_port: 8889
+
+nas_root: /home/josef/brainbox/checkpoints/current/
+local_checkpoint_root: ~/checkpoints/

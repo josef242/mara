@@ -34,11 +34,21 @@
 # controller discovers its own reference online (no hand-fit knots), which is
 # exactly what makes the recipe robust to the encoding change.
 #
-# PLANNED MID-RUN CHANGE (pre-registered, dn2-proven mechanics): T-bump
-# 2048→4096 at ~step 11,000 (~8.3B tok) — restart with B: 6, T: 4096 (keeps
-# B·T/rank; token-based ga_schedule unaffected). Sanctioned slot: ≥1k steps
-# BEFORE the 12k controller engagement so S snapshots clean. FORBIDDEN inside
-# 12k-24k (would confound the anneal telemetry).
+# MID-RUN CHANGE (executed 2026-07-07): T-bump 2048→4096 at step 7250
+# (~2.8B tok) — restart with B: 6, T: 4096 (keeps B·T/rank; token-based
+# ga_schedule unaffected). MOVED UP from the pre-registered ~11k slot: 68% of
+# the mix is long-doc (stories/ao3/books; stories typically >4k), so T=2048
+# taxes most of the corpus via cold chunk restarts (doc-reset chops long docs
+# into context-less 2k pieces). baby-wizard's step-7250 bump validated the
+# mechanics and showed the instant cold-chunk refund. Still well before the
+# 12k engagement (S snapshots clean); 12k-24k forbidden zone untouched.
+# PRE-REGISTERED HEALTH CHECK (this mix makes the bump a natural experiment):
+# the instant val drop must be group-DIFFERENTIATED — books/ao3/stories drop
+# beyond trend (cold-chunk refund = measurement change, not model change);
+# code_python/code_c/edufineweb (short docs, never chunked) move at trend
+# only. Short-doc groups dropping sharply at the bump would be REAL evidence
+# of a positional problem. Expect NO adaptation transient: 76/101 layers are
+# SWA W=512 (zero new relative distances); theta=500k makes 2x mild.
 #
 # HORIZON (honest arithmetic): 200k steps ≈ 750B tokens ≈ years on rig-30.
 # max_steps stays 200k because the cosine shape needs it, but the THESES are
@@ -70,8 +80,8 @@ ga_schedule:
   - [10_500, 2_000_000]
   - [14_500, 3_000_000]
   - [17_000, 4_000_000]
-B: 12                       # → 6 at the ~11k T-bump (B·T/rank preserved)
-T: 2048                     # → 4096 at the ~11k T-bump
+B: 6                        # halved at the step-7250 T-bump (B·T/rank preserved)
+T: 4096                     # bumped from 2048 at step 7250 (see MID-RUN CHANGE header)
 max_steps: 200_000
 eval_iters: 2
 val_step: 100
@@ -84,7 +94,9 @@ FSDP_buffer_dtype: bf16
 reshard_after_forward: true
 
 # FRESH FROM SCRATCH — the whole point, for the third and final time.
-resume_training: false
+resume_training: true
+resume_step: 9_750
+resume_data_reset: continue         # Modes are: continue (no reset), soft (reset pct window - change in pct), hard (reset all)
 
 # clip: the validated scratch-start setting (dn4 restart proved 1.5 at warmup
 # end: 15% clipped vs 48% at 1.0; judge by median + %clipped, not mean)
@@ -183,7 +195,6 @@ row_center_head:
 doc_attn_mask:                  # ADOPTED: −15.5 mnats + faster (verified BOS id)
   enabled: true
   reset_positions: true
-  bos_token_id: 1
 
 swa:                            # ADOPTED: loss-neutral; 76 local / 25 global at
   enabled: true                 # 101 layers; payoff at 4k bulk + extension +
@@ -193,6 +204,15 @@ swa:                            # ADOPTED: loss-neutral; 76 local / 25 global at
 mtp:                            # ADOPTED 2026-07-03: −13.3 mnats vs swa control at
   enabled: true                 # matched steps (40/40 negative, > the ±9 mnat
   loss_weight: 0.3              # floor), <1% step cost, spec-decode head free.
+  doc_boundary_mask: true       # ADOPTED 2026-07-13 @ resume from step 9750: exclude the
+                                # ~1-row-per-doc cross-doc MTP rows (targets[i]==BOS). Loss-
+                                # shaping only (not resume-guarded); expect a small instant
+                                # DOWN-step in the mtp: channel (hardest rows leave the
+                                # mean) — headline ls:/val untouched.
+  loss_weight_schedule:
+     key: tokens          # DeepSeek/GLM specify λ by token count (robust to T-bumps)
+     shape: step          # piecewise-constant step-hold (the frontier's hard step-down)
+     points: [[0, 0.3], [512_000_000_000, 0.1]]   # 0.3 → 0.1 at 512B tok (~68% of wizard101's ~753B run, DeepSeek-proportional)
 
 transition_health_guard: true
 
