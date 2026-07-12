@@ -1,8 +1,103 @@
-# mara_fsdp2 — Configuration Reference
+# mara_fsdp2 — KEEL / NorMuon FSDP2 Training
 
-Complete reference for every training-config setting (KEEL architecture + NorMuon optimizer, FSDP2). Runs are driven by YAML files in `configs/`; every key is loaded onto the `Settings` object in `train_mara.py` (class at ~line 4931), which fills defaults and validates. Each entry below gives the setting's **type**, **default**, **values/constraints**, **what it does** (grounded in the code), **interactions**, and a real **example**.
+Custom LLM pretraining: KEEL architecture (Highway-style Post-LN, arXiv:2601.19895)
+trained with the NorMuon optimizer under FSDP2, on the Cedar Park rigs. Runs are
+driven by YAML files in `configs/`; the shared model/optimizer/data modules live in
+the sibling repo `../common_fsdp2`. The bulk of this document is the
+**Configuration Reference** (contents below) — every YAML key, grounded in the code.
 
-> Generated from a source-grounded pass over `train_mara.py`, the shared modules in `common_fsdp2/`, and the example configs. Line citations refer to those files.
+## Repository Map
+
+| path | what lives there |
+|---|---|
+| `train_mara.py` | trainer: Settings, training loop, resume, boot rails ([bos-check], [freqs-check], resume mismatch guard) |
+| `configure_optimizers.py` | optimizer construction, param groups, `wd_group` tags |
+| `consolidate_optimizer.py` | offline optimizer-shard consolidation |
+| `adaptive_wd.py` | Adaptive Weight Decay (PID w_rms controller) |
+| `inference.py` | generation entry point (spec-decode engine lives in common's neo_common) |
+| `configs/` | run configs; `_optimizer_reference.yaml` documents the optimizer block |
+| `tests/` | pytest suite (see below); `tests/manual/` = torchrun-only scripts |
+| `tools/` | offline probes, diagnostics, data tooling (see below) |
+| `scripts/` | rig operations: `go.sh` launch, fan/power control, env setup, `check_flash_attn.py` |
+| `docs/` | ACTIVE design docs + canonical findings (see below); `docs/archive/` = closed investigations |
+| `audio/` | raw-audio mu-law LM side-track (dirty-paws precursor) |
+| `../common_fsdp2/` | `model_v2.py`, `muon_fsdp2.py`, optimizers, dataloader, tokenizer_abstraction |
+
+## Test Suite
+
+Real pytest, created alongside the 2026-07 deep audit. Full details, tiers, and
+conventions: **[tests/README.md](tests/README.md)**. The short version:
+
+```bash
+# local box (torch 2.9 cu128; flex/fla tests skip cleanly):
+python -m pytest                       # from the repo root
+python -m pytest -m "not slow"         # skip the ~4-min spec-decode script; ~25 s
+
+# rigs (full tier; code is NAS-shared — nothing to sync):
+ssh rig-31 "cd ~/valhalla/code/mara_fsdp2 && ~/miniconda3/envs/trainenv/bin/python -m pytest"
+```
+
+Markers: `gpu` (auto-skip w/o CUDA), `slow`, `dist` (needs `RUN_DIST=1` + torchrun),
+`legacy` (subprocess wrapper over pre-suite scripts). `tests/manual/` holds
+torchrun-only scripts (`test_gdn.py`, `test_row_center_dist.py`) that pytest
+deliberately does not collect. Convention worth knowing: a test pinning a KNOWN
+bug is `xfail(strict=True)` with the audit date in its reason — when the fix
+lands, the xpass ERRORS and forces promotion to a plain assert. Key nets:
+`test_meta_init.py` (poisoned-storage sweep — the RoPE-corruption regression
+class), `test_kv_cache_parity.py` (decode==full-forward + exact RoPE relative
+invariance with a corruption oracle), `test_moe.py`, `test_muon_math.py`,
+`test_train_parsing.py` (trainer parsers/resume guards).
+
+## Tools
+
+All offline — none are imported by the trainer at runtime.
+
+| tool | purpose | how to run |
+|---|---|---|
+| `tools/rechunk_doc_aligned.py` | rebuild river-chopped token shards into DOCUMENT-ALIGNED shards with orbit-coprime counts (fixes the no-BOS shard-seam franken-docs under doc-mask) | offline vs a data tree; requires an explicit `--bos_id` (llama=1) BY DESIGN — see the BOS rule below. Switch trees only at a fresh run / deliberate restart |
+| `tools/pdr_controller_sim.py` | offline stability/robustness simulation of the FFN pdr controller math (Math Brief #7) — no GPU | `python tools/pdr_controller_sim.py` |
+| `tools/spike_debugger.py` | loss-spike capture harness (`SpikeDebugger` class): saves offending batches + state around a spike for post-mortem | import + wrap in a probe loop; usage example in its trailing docstring |
+| `tools/zloss_variants_rig.py` | z-loss option-D 4-variant precision gate + real-shape memory | `python tools/zloss_variants_rig.py` — ON A RIG |
+| `tools/zloss_diagnostic_rig.py` | gradient-correctness diagnostic: option-D vs fp32 analytic truth | `python tools/zloss_diagnostic_rig.py` — ON A RIG |
+| `tools/zloss_mem_isolated.py` | per-variant peak memory, each in a fresh subprocess (defragments the comparison) | `python tools/zloss_mem_isolated.py` — ON A RIG |
+| `tools/lr_schedule_probe.py` | plot/verify plateau LR schedule shapes (matplotlib) | `python tools/lr_schedule_probe.py` locally |
+| `tools/ptt_cutpoint_analysis.py` | Progressive Tail Truncation cut-point distribution statistics | `python tools/ptt_cutpoint_analysis.py` |
+
+## Documentation (`docs/`)
+
+Active docs are the canonical conclusions plus everything governing current/next
+runs. Closed investigations live in `docs/archive/` (policy in its README: a doc
+archives when its investigation is closed and its conclusion is captured in an
+active doc, the code, or the test suite).
+
+| doc | why it matters |
+|---|---|
+| `AUDIT_2026-07-11.md` | the 2026-07 deep-guts audit: findings, fixes, rulings, what's deliberately open — the "what changed and why" record for this codebase's hardening |
+| `WD_WASTE_ANALYSIS.md` | canonical conclusion of the body-norm-ramp saga: the radial lean is the post-Newton-Schulz UPDATE (not grad/data/sharding) — the basis for tangent projection |
+| `SHADOW_NORM_PDR_CONTROLLER_SPEC.md` | the live body-growth controller spec (shadow-norm, radial-budget WD law) |
+| `MATH_AGENT_Q11_self_anchoring_pdr_controller.md` | self-anchoring controller ruling — governs the 12k engagement (no hand-fit knots; lr-track reference) |
+| `MATH_AGENT_Q12_partial_f_progressive_engagement.md` | partial-f progressive engagement — governs the 12k→24k tangent-projection anneal |
+| `PDR_CONTROLLER_STATE_BRIEF.md` | controller state summary going into the engagement window |
+| `KV3_CONTROLLER_DESIGN.md` | kv3 controller design (referenced from train_mara) |
+| `DN4_HEAD_HYGIENE_SPEC.md` | the head levers: applied-update gauge projection (Lever 1, live) + centered z-loss deadband (Lever 2, staged) |
+| `GPM.md` | gpm telemetry reference (the `gpm:` train-log field) |
+| `festival_features.md` | doc-mask / SWA / MTP: telemetry reference for the 2026-07 feature-festival winners |
+| `mtp_multistep_recurrent.md` | multi-step recurrent MTP design (GLM-5.2-style drafter) — designed, not built |
+| `moe.md` | MoE planning doc (Phase 1 replicated + Phase 2 EP) — the KEEL-MoE track's starting point |
+
+**House rule worth stating once:** the BOS token id comes from the tokenizer
+abstraction (`tokenizer.bos_id`) and NOWHERE else. Configs may state it only as a
+cross-checked assertion ([bos-check] fatals on mismatch); omitted, it is adopted
+from the tokenizer at boot. Offline tools that cannot load a tokenizer require it
+explicitly, by design.
+
+---
+
+# Configuration Reference
+
+Complete reference for every training-config setting. Every YAML key is loaded onto the `Settings` object in `train_mara.py` (class at ~line 5250), which fills defaults and validates. Each entry gives the setting's **type**, **default**, **values/constraints**, **what it does** (grounded in the code), **interactions**, and a real **example**.
+
+> Generated from a source-grounded pass over `train_mara.py`, the shared modules in `common_fsdp2/`, and the example configs. Line citations are anchors from the doc's last full pass, not gospel — sections are re-verified for SUBSTANCE after each maintenance round (last: 2026-07-13).
 
 ## Contents
 
@@ -23,6 +118,7 @@ Complete reference for every training-config setting (KEEL architecture + NorMuo
 15. [Auxiliary Heads & Staged Interventions](#auxiliary-heads--staged-interventions)
 16. [Progressive Tail Truncation](#progressive-tail-truncation)
 17. [Telemetry, Tracking & Health Guards](#telemetry-tracking--health-guards)
+18. [Festival Features: Doc-Mask, SWA & MTP](#festival-features-doc-mask-swa--mtp)
 
 ---
 
@@ -381,7 +477,7 @@ Under `ga_schedule`, each requested `global_batch_tokens` is converted to an int
 ### `ga_schedule`
 - **Type:** list of `[step, global_batch_tokens]` pairs (schedule/ramp)
 - **Default:** unset → falls back to legacy automatic mode (`train_mara.py:4875`, `4885`)
-- **Values/constraints:** Each entry is `[start_step, desired_global_batch_in_tokens]`. Pairs are sorted by step internally, so out-of-order entries are tolerated (`train_mara.py:4793`). Each value is converted to an integer GA count `max(1, round(desired_batch / tok_per_micro))` — so a desired batch smaller than `tok_per_micro` clamps to GA=1, and the realized batch is re-quantized to `actual_ga * tok_per_micro`.
+- **Values/constraints:** Each entry is `[start_step, desired_global_batch_in_tokens]`. Pairs are sorted by step internally, so out-of-order entries are tolerated (`train_mara.py:4793`), but the FIRST waypoint must be step 0 — a later-starting schedule is a boot `fatal_error` (leading steps would otherwise train at grad_accum=0). Each value is converted to an integer GA count `max(1, round(desired_batch / tok_per_micro))` — so a desired batch smaller than `tok_per_micro` clamps to GA=1, and the realized batch is re-quantized to `actual_ga * tok_per_micro`.
 - **What it does:** Defines a **step-function ramp of effective batch size**. `build_user_defined_schedule()` (`train_mara.py:4784`) holds each pair's GA value from its `start_step` until the next pair's step (last pair holds to `max_steps`), producing a per-step `grad_accum_schedule` array of length `max_steps`. The training loop reads `grad_accum_steps = grad_accum_schedule[step]` each step (`train_mara.py:1865`) and runs that many micro-batches. The **final** GA value sets `settings.total_batch_size = grad_accum_schedule[-1] * tok_per_micro` (`train_mara.py:4884`). On resume, GA is re-indexed from `grad_accum_schedule[start_step]` (`train_mara.py:4035`). When present and non-empty, this fully overrides `target_batch_size`/`min_batch_size`/`ramp_percent`.
 - **Interacts with:** `B`, `T`, `world_size` (set `tok_per_micro`, hence the realized batch and the ramp's GA counts); `max_steps` (schedule length / final hold); `output_lr_batch_adjust` (derives an output-head LR schedule from this ramp, `train_mara.py:5780-5811`); makes the legacy `target_batch_size`/`min_batch_size`/`ramp_percent` inert.
 - **Example (from `configs/dn4.yaml:23-30`):**
@@ -735,18 +831,18 @@ Weight decay in this trainer is controlled by a single top-level key, `weight_de
   - **Coverage guard (rules form only):** when `weight_decay` is a list, the optimizer's base WD is forced to `0.0`, so any non-norm param not matched by *some* rule would silently get WD=0. `parse_wd_rules` rejects this: every non-norm param must be covered by at least one rule or it's a `fatal_error` (train_mara.py:848-867), reporting which bucket (emb / head / body) is uncovered. An explicit `[emb, 0.0]` counts as coverage — only the *silent* rule-less zero is rejected.
   - **Norms/biases always WD=0:** `_is_norm(n)` (name ends in `bias`, or contains `norm` (case-insensitive) and ends in `weight`) params are skipped by every rule and never decayed (train_mara.py:813-814, 821, 839). In scalar mode the same exclusion is enforced by a dedicated `norm_bias` param group pinned at `weight_decay: 0.0` (configure_optimizers.py:573, 621).
 - **What it does:**
-  - **Scalar form:** the value is handed to `configure_optimizers(weight_decay=...)` (train_mara.py:6173) and lives on the optimizer param groups. No `wd_overrides` are populated. On **resume**, the restore path reconciles the saved param-group WD to the current scalar setting (train_mara.py:3766-3775): it iterates non-`norm_bias` groups once, updates `param_group['weight_decay']` if it changed, and breaks after the first (all non-norm groups share the same scalar). This is a one-time resume-time reconciliation, not a per-step live update.
+  - **Scalar form:** the value is handed to `configure_optimizers(weight_decay=...)` (train_mara.py:6173) and lives on the optimizer param groups. No `wd_overrides` are populated. On **resume**, the restore path reconciles the saved param-group WD to the current scalar setting via `_apply_scalar_wd_to_groups` (train_mara.py:3767): the new value is set on EVERY non-`norm_bias` group (a pre-2026-07-11 bug updated only the first group and silently left the rest on the checkpoint's old value while logging success). The same resume pass re-asserts schedule-owned hyperparams by family — `muon_momentum`/`normuon_beta2` into Muon groups, `betas` into Adam groups only (`_reassert_group_hparams`, which also strips stray `betas` keys the old code injected into Muon groups). This is a one-time resume-time reconciliation, not a per-step live update.
   - **Rules form:** `parse_wd_rules` walks `model.named_parameters()` and, with *last-matching-rule-wins* semantics (train_mara.py:807, 841), maps each entry to the concrete params it targets, returning `(param, value_or_schedule)` tuples. `weight_decay` is then passed to the optimizer as `0.0` (train_mara.py:6173) and the real per-param values are written into the `wd_overrides` side-dict *every training step* (train_mara.py:2180-2185). If the value is a schedule list, it is linearly interpolated by step via `interpolate_lr_mod` (train_mara.py:553-565, 2183); scalar values are written verbatim (train_mara.py:2185). The optimizers (Muon/NorMuon body path + emb/head Adam paths under `normuon_fsdp2`) read `self.wd_overrides.get(id(p), group["weight_decay"])` at step time (muon_fsdp2.py:464, 528, 743, 797).
   - **Target semantics** (from the matcher, train_mara.py:823-841):
     - `emb` → params whose name contains `tok_embeddings` (input embedding table).
     - `out` → params whose name starts with `output.` (the LM head / output projection). Note: if `tie_word_embeddings=True` there is no `output.` param, so an `[out, ...]` rule matches nothing — cover the head via `emb` in that case.
-    - `all` → every param whose name contains `layers.` (i.e. the transformer *body*: attention + FFN matrices — NOT emb/head). This is a common gotcha: `all` means "all body layers," not "all params." dn3.yaml:117-119 documents this explicitly.
+    - `all` → every param whose name contains `layers.` OR starts with `mtp.` (the MTP block is body-like and rides the `all` rule; its norms stay WD=0 via the norm exclusion). This is a common gotcha: `all` means "all body layers," not "all params." dn3.yaml:117-119 documents this explicitly.
     - `[start, end, value]` → body params in the inclusive layer-index range `start..end` (regex `layers.(\d+).`, train_mara.py:833-838); norms in-range still excluded.
 - **Interacts with:**
   - **`adaptive_wd`** — AWD is initialized with the scalar `base_wd` (0.0 when rules are active, train_mara.py:6285) and the shared `wd_overrides` dict, and *multiplies* the per-param WD on top of the rule/scalar values each check interval (train_mara.py:6286, 2187-2191).
   - **`ffn_pdr_controller` / shadow-norm controller** — when engaged, the controller OWNS the FFN body-matrix WD via its radial-budget λ and writes into the same `wd_overrides` *after* the WD-rules and AWD writers (train_mara.py:2193-2201), silently overriding any WD schedule that targets FFN. `Settings.__init__` emits a loud footgun warning (a raw `print` banner) if you set an `all`/layer-range WD *schedule* while a shadow-mode controller is active (train_mara.py:5231-5253) — a flat base WD is fine (covers attention + pre-engagement window), but a schedule on FFN is silently replaced. Tune FFN WD via the controller knobs (rho, lambda_max, lambda_min) instead.
   - **`cautious_weight_decay`** — a separate optimizer flag (default `False`, train_mara.py:6183) that gates cautious-WD behavior inside the optimizer; orthogonal to the target/schedule mechanics here.
-  - **`optimizer_type`** — under `normuon_fsdp2`, both the Muon body path and the emb/head Adam paths read `wd_overrides`, so all three targets (emb/out/all) take effect (dn3.yaml:118-119). Per project memory, plain AdamW/AdamW8bit/AdamW16bit do NOT read `wd_overrides`, so rules-form WD is silently ignored for those optimizers.
+  - **`optimizer_type`** — under `normuon_fsdp2`, both the Muon body path and the emb/head Adam paths read `wd_overrides`, so all three targets (emb/out/all) take effect (dn3.yaml:118-119). Rules-form WD **requires** a side-dict-capable optimizer, and since 2026-07-11 this is enforced at boot: `adamw`/`adamw_8bit`/`adamw_16bit`/`adafactor` never read `wd_overrides` (the whole model would silently train at WD=0) and are a `fatal_error` with rules; `muonsphere_fsdp2`/`normuon_sphere_fsdp2` are likewise fatal (MuonSphere applies no WD to Muon params by design, so body rules would be silently inert). Side-dict-capable: the non-sphere Muon families and adamc/adamc_8bit/adamc_16bit.
 - **Example:**
   - Rules with a mid-run body taper (from `configs/dn3.yaml:120-123`):
     ```yaml
@@ -776,7 +872,7 @@ Two independent-but-coupled knobs for shaping learning rate below the global LR 
 ### `lr_mods`
 - **Type:** list (of rule entries; each rule ends in a `[[step, mult], ...]` waypoint schedule — a **list of `[step, mult]` pairs**, not a bare scalar)
 - **Default:** `None` (`train_mara.py:5020-5021` — set to `None` if the key is absent; no LR modification)
-- **Values/constraints:** Each entry is one of three shapes, parsed in `parse_lr_mods` (`train_mara.py:737-797`): `[name, schedule]` where `name` ∈ {`emb`, `out`} (emb → params whose name contains `tok_embeddings`; out → params whose name starts with `output.`); `[all, type, schedule]` where `type` ∈ {`attn`, `ffn`, `all`} across all layers (the literal first element is conventionally `all` and is otherwise ignored); `[start, end, type, schedule]` for an inclusive layer-index range. `type` matching (`_match_type`): `attn` = names containing `attention.` and not `norm`; `ffn` = names containing `feed_forward.`; `all` = attn OR ffn. Norms/biases are never scaled (the `[all, type]` path guards them via `_is_norm`, and in the range/`attn` paths norms simply don't match the type filter). The trailing `schedule` **must be a list of `[step, mult]` waypoints** — `interpolate_lr_mod` (`train_mara.py:553-565`) indexes `schedule[0][0]`, so a bare scalar multiplier is NOT supported here (unlike `weight_decay` rules, whose apply site at `train_mara.py:2182-2185` does `isinstance(wd_val, list)`; the lr_mods apply site at `train_mara.py:2086` has no such guard and would raise on a scalar). Multipliers are direct factors (1.0 = normal, 0.5 = half LR). Schedule waypoints are linearly interpolated and held flat before the first / after the last step. **Last matching rule wins** per param (`param_schedules` dict keyed by `id(param)`). Optimizer support (`train_mara.py:6241-6264`): full for the FSDP2 Muon family (`{muon_fsdp2, normuon_fsdp2, muonsphere_fsdp2, normuon_sphere_fsdp2}`); standalone Adam family gets `emb`/`out` rules plus any rule whose `type` is `all` (both the `[all, all, ...]` form and the `[start, end, all, ...]` range form) — attn/ffn-specific rules are logged and ignored because Adam groups can't differentiate within one param group; DION family is unsupported entirely (warning logged, whole feature ignored).
+- **Values/constraints:** Each entry is one of three shapes, parsed in `parse_lr_mods` (`train_mara.py:737-797`): `[name, schedule]` where `name` ∈ {`emb`, `out`} (emb → params whose name contains `tok_embeddings`; out → params whose name starts with `output.`); `[all, type, schedule]` where `type` ∈ {`attn`, `ffn`, `all`} across all layers (the literal first element is conventionally `all` and is otherwise ignored); `[start, end, type, schedule]` for an inclusive layer-index range. `type` matching (`_match_type`, extended 2026-07-11 — GDN and MoE body params previously escaped even `all`): `attn` = names containing `attention.` or `gdn_attn.` and not `norm`; `ffn` = names containing `feed_forward.` or `.moe.` and not `norm`; `all` = attn OR ffn. Norms/biases are never scaled (the `[all, type]` path guards them via `_is_norm`, and in the range/`attn` paths norms simply don't match the type filter). The trailing `schedule` **must be a list of `[step, mult]` waypoints** — `interpolate_lr_mod` (`train_mara.py:553-565`) indexes `schedule[0][0]`, so a bare scalar multiplier is NOT supported here (unlike `weight_decay` rules, whose apply site at `train_mara.py:2182-2185` does `isinstance(wd_val, list)`; the lr_mods apply site at `train_mara.py:2086` has no such guard and would raise on a scalar). Multipliers are direct factors (1.0 = normal, 0.5 = half LR). Schedule waypoints are linearly interpolated and held flat before the first / after the last step. **Last matching rule wins** per param (`param_schedules` dict keyed by `id(param)`). Optimizer support: full for the FSDP2 Muon family (`{muon_fsdp2, normuon_fsdp2, muonsphere_fsdp2, normuon_sphere_fsdp2}`); standalone Adam family gets `emb`/`out` rules plus the `[all, all, ...]` form only — attn/ffn-specific rules AND all layer-range rules (any type, including `all`) are logged and rejected, since a non-Muon param group has a single lr and a layer subset cannot be scaled independently (pre-2026-07-11 the range-`all` form was accepted and silently rescaled the WHOLE group from its first matched param; the runtime now also fatals if a group ends up with mixed scales); DION family is unsupported entirely (warning logged, whole feature ignored). Schedule knots must be strictly ascending in step — validated at parse (`_validate_schedule_knots`), boot `fatal_error` otherwise (unsorted knots previously mis-clamped silently; duplicates ZeroDivisionError'd mid-run). The same knot validation applies to `weight_decay` rule schedules.
 - **What it does:** Builds a per-parameter `scale` each step and writes it into `lr_scale_overrides[id(param)]` (`train_mara.py:2083-2087`). For Muon params the optimizer applies this scale in `Fsdp1dWork.finish` (`muon_fsdp2.py:454-455`, `462-463`) — **after** Newton-Schulz orthogonalization in `start()`. This matters: NS normalizes the update's magnitude, so scaling the *gradient* would be cancelled by NS; only a post-NS `lr_scale` actually changes Muon's step size (`effective_lr = group["lr"] * lr_scale`). The same `effective_lr` also multiplies the weight-decay term (`muon_fsdp2.py:463-477`), so a rule scaling a Muon param cools its WD by the same factor, and `lr_scale = 0.0` freezes the param entirely (no update, no WD-driven decay) — an invariant SCS relies on. For standalone Adam, scales are instead pushed onto the param-group `lr` (`train_mara.py:2089-2104`).
 - **Interacts with:** `output_lr_batch_adjust` (auto-appends an `[out, schedule]` entry into `lr_mods` at `train_mara.py:5799-5801`; hard-conflicts with a manual `[out, ...]` rule — see below); SCS (runs after `lr_mods` at `train_mara.py:2106+` and can override managed params during scaffold/warmup, but defers to `lr_mods` when its own scale is 1.0); `ffn_pdr_controller` / `body_lr_controller` (writes the same `lr_scale_overrides` for FFN body params — kv3 replaced kv2's open-loop `lr_mods` FFN anneal with this closed-loop controller); `weight_decay` (shared effective-LR coupling on Muon). Not supported with DION.
 - **Example:** (from `configs/kv2.yaml`, live multi-target use)
@@ -912,6 +1008,14 @@ These knobs control the numeric precision of compute vs. communication, how FSDP
 - **What it does:** When true, the FSDP2 setup builds a `CPUOffloadPolicy(pin_memory=True)` (`train_mara.py:4502-4503`) and passes it as `offload_policy=` to every `fully_shard(...)` call — inner MoE experts, outer transformer layers, aux heads, and the root model (`train_mara.py:4512-4521`). This keeps sharded params/grads/optimizer-state on pinned host memory, and FSDP streams them to the GPU on demand (H2D) during forward/backward. Model materialization then targets CPU: `mat_device = "cpu"` and `model.to_empty(device="cpu")` (`train_mara.py:4524-4528`). Because only params are managed by FSDP on CPU, all model buffers (RoPE freqs, `expert_bias`, etc.) are explicitly walked and moved back to the GPU afterward (`train_mara.py:4531-4544`). At startup, when enabled, it logs "CPU offload enabled (pin_memory=True)" (`4505-4506`) and the training-config banner prints "CPU Offload = ON (params, grads, optimizer states on CPU)" (`6162-6163`). The flag is also persisted into the checkpoint metadata (`train_mara.py:3375`).
 - **Interacts with:** All `fully_shard` wraps (shares `offload_policy` with `mp_policy` / `reshard_after_forward`). Trades GPU memory for host-device transfer bandwidth (enables larger models per GPU at a throughput cost). Avoid with `adamw_8bit`/`adamc_8bit` (torchao device-mismatch bug, warned at `6164-6165`). Note: checkpoint save/restore separately use `StateDictOptions(..., cpu_offload=True)` at `train_mara.py:3241`, `3574`, `3747` — that is an unconditional state-dict offload for gathering the full state dict on CPU and is NOT gated by this setting.
 - **Example:** `cpu_offload: true`
+
+### `fsdp_defer_grad_sync`
+- **Type:** bool
+- **Default:** `False` (read via `getattr(settings, 'fsdp_defer_grad_sync', False)` inside the micro-batch loop; added 2026-07-13)
+- **Values/constraints:** `True`/`False`. FSDP2 (`fully_shard`) roots only — DDP runs keep their `no_sync()` context automatically.
+- **What it does:** Defers gradient reduce-scatter to the LAST micro-step of each accumulation window via `set_requires_gradient_sync()` on the FSDP2 root. Historical note: `fully_shard` roots never exposed `no_sync()`, so the old hasattr-probed fast path silently matched nothing and reduce-scatter fired on EVERY micro-step since the FSDP2 port (audit 2026-07-11; the math was still correct — per-microstep averaged grads accumulate to the same total). **OPT-IN because deferral is a memory trade:** unsynced grads accumulate UNSHARDED on every rank (~world_size × the sharded grad memory). Enable when grad-accum counts are large and VRAM allows; the comms saving scales with GA.
+- **Interacts with:** `ga_schedule` (the win scales with GA count); GPU memory headroom (at multi-B-param scale on 24 GB cards, check before enabling); no effect at GA=1.
+- **Example:** `fsdp_defer_grad_sync: true` (deferred item from wizard101's pre-launch ledger — "matters most once GA ramps")
 
 ---
 
@@ -1662,7 +1766,7 @@ Token-choice top-K MoE with DeepSeek-style sigmoid routing, an optional always-o
 - **Type:** float
 - **Default:** `0.0`
 - **Values/constraints:** `0.0` disables capacity dropping (all tokens processed); `>0` caps tokens per expert. Typical `1.0`-`1.5`. Training-only — eval never drops (`if self.capacity_factor > 0 and self.training`, `model_v2.py:1137`).
-- **What it does:** Enables capacity-based token dropping in training. Per-expert capacity = `ceil(capacity_factor * N * top_k / num_experts)` (`model_v2.py:1139-1141`); overflow tokens (lowest-scoring for that expert) are dropped, kept-scores are unbiased-rescaled (`scale = (sum_all/sum_keep).clamp(max=10.0)`) to preserve expected magnitude, and dropped slots get a sentinel expert id (`model_v2.py:1136-1173`). Crucially it also enables the *padded-BMM* compiled training path (static `(E, capacity, dim)` shapes via `_bmm_capacity`, `model_v2.py:1183-1189`); with `0.0` there is no fixed capacity and experts run the dynamic-shape for-loop path (`use_bmm = self._bmm_capacity is not None and self.training`, `1189`). Dropped-token % is logged as the `drp` tag (`train_mara.py:2662`).
+- **What it does:** Enables capacity-based token dropping in training. Per-expert capacity = `ceil(capacity_factor * N * top_k / num_experts)` (`model_v2.py:1139-1141`); overflow tokens (lowest-scoring for that expert) are dropped — a dropped slot simply loses its contribution (the residual stream still carries the token), and dropped slots get a sentinel expert id. There is NO survivor rescale: the old batch-global `sum_all/sum_keep` compensation was per-token biased (tokens with zero drops had their combine weights inflated by OTHER tokens' overflow) and was removed 2026-07-13 after reference research — Switch/GShard/DeepSeek-V2 never rescale survivors, and DeepSeek-V3 drops nothing at all (aux-loss-free balancing, which `moe_load_balance_coeff` provides here, keeps steady-state drops near zero). Crucially it also enables the *padded-BMM* compiled training path (static `(E, capacity, dim)` shapes via `_bmm_capacity`, `model_v2.py:1183-1189`); with `0.0` there is no fixed capacity and experts run the dynamic-shape for-loop path (`use_bmm = self._bmm_capacity is not None and self.training`, `1189`). Dropped-token % is logged as the `drp` tag (`train_mara.py:2662`).
 - **Interacts with:** `moe_top_k`, `moe_num_experts` (both in the capacity formula), `ep_degree` (`_bmm_capacity = per_rank_cap * ep_degree`), batch/seq (N = tokens per step).
 - **Example:** `moe_capacity_factor: 1.25` (both real MoE configs); `0.0` = no dropping (default)
 
@@ -1970,3 +2074,42 @@ Opt-in diagnostic and monitoring knobs. Each adds a Dashboard-parseable field to
 - **What it does:** Suppresses the grad-norm half of the health guard for the first N steps (train_mara.py:2785). During LR warmup — from-scratch or a fresh resume — grad-norm is expectedly high and noisy, so warning every step there is pure noise that trains you to ignore the line before a real spike. Set it to roughly cover your LR-ramp / early-noise window (kv2 uses 1000, keelhaul 150, dn3 7100). Note: it gates **only** the grad-norm check, not the val-cadence geometry (eff_rank / spec_conc) check.
 - **Interacts with:** `transition_health_guard` (no effect unless that is on); `warmup_steps` (the LR ramp this window is meant to cover).
 - **Example:** `health_guard_warmup_steps: 1000` (kv2.yaml:72). Note dn4.yaml enables the guard but omits this key, so it defaults to `100`.
+
+---
+
+## Festival Features: Doc-Mask, SWA & MTP
+
+The 2026-07 feature-festival winners (skiff-scale paired A/Bs, seed-identical arms, ±9 mnat noise floor; telemetry reference: `docs/festival_features.md`). All three are OFF by default — flags-off behavior is byte-identical to pre-festival main. All three are in the **resume mismatch guard** (`_RESUME_MUST_MATCH`): flipping `doc_attn_mask.enabled`/`reset_positions`/`bos_token_id`, `swa.*`, or `mtp.enabled` across a resume is a boot `fatal_error`, because they change what the model computes while reusing the same params (strict weight-loading cannot catch the flip). Unknown keys inside any of the three blocks are a boot fatal (typo guard — a silently-ignored typo would default the feature OFF, the worst direction).
+
+### `doc_attn_mask` (block)
+- **Type:** dict `{enabled, reset_positions, bos_token_id, allow_bos_mismatch, allow_reset_without_mask}` (or bare `true` ≡ `{enabled: true}`)
+- **Default:** absent → both features off.
+- **Values/constraints:** `enabled` (bool): confine attention within document boundaries in packed windows (FlexAttention block mask). `reset_positions` (bool): restart RoPE positions at each BOS. `reset_positions` without `enabled` is fatal unless `allow_reset_without_mask: true` (it would train cross-document attention over aliased positions — a geometry matching neither baseline nor treatment). Incompatible with `gdn_enabled` and with `dropout > 0` (both fatal). Requires `compile_model: true` (flex kernels).
+- **`bos_token_id` — the BOS house rule applies:** the document separator IS `tokenizer.bos_id` by construction (`pre_tokenize` bakes it into the shards). OMIT the key and the trainer ADOPTS `tokenizer.bos_id` at boot (`[bos-check]` banner); an EXPLICIT value is a cross-checked assertion — mismatch with the tokenizer is a boot fatal unless `allow_bos_mismatch: true` (for deliberately non-BOS-separated data). Two in-loop rails back this up: a fatal if the id NEVER appears in the stream (~step 20), and a density rail (a separator appearing more than once per 64 tokens is almost certainly an ordinary vocab token).
+- **What it does / adoption verdict:** −15.5 mnats vs control at matched steps, plus faster steps. Adopted for wizard101 from step 0.
+- **Example:** (wizard101.yaml) `doc_attn_mask: {enabled: true, reset_positions: true}` — id omitted, adopted from the llama tokenizer (1).
+
+### `swa` (block)
+- **Type:** dict `{enabled, window, global_interleave}` (or bare `true`)
+- **Default:** absent → off (all layers global/full-causal).
+- **Values/constraints:** `window` (int, tokens): causal attention window for LOCAL layers. `global_interleave` (int, default 4): every Nth layer (at `layer_id % N == N-1`) stays GLOBAL/full-length; the rest are windowed. Composes with the doc mask (window AND same-doc AND causal). The MTP block always rides the GLOBAL mask and gets a full-length cache. Generation is exact only for contexts ≤ window on local layers (warned at load).
+- **What it does / adoption verdict:** loss-neutral at skiff scale; the payoff is back-loaded — long-context bulk, T-extension, and inference KV memory (local layers keep `min(T, window)`-slot ring caches). Adopted for wizard101 (76 local / 25 global at 101 layers, W=512).
+- **Example:** `swa: {enabled: true, window: 512, global_interleave: 4}`
+
+### `mtp` (block)
+- **Type:** dict `{enabled, loss_weight, loss_weight_schedule, doc_boundary_mask}` (or bare `true`)
+- **Default:** absent → off.
+- **Values/constraints:** DeepSeek-V3-style sequential t+2 multi-token prediction: ONE extra transformer block + shared norm/head, trained as an auxiliary objective. `loss_weight` (float λ, default 0.3, must be > 0 when enabled). `loss_weight_schedule` (optional dict `{key: tokens|step, shape: step|linear, points: [[x, λ], ...]}`): piecewise λ — the DeepSeek/GLM recipe steps λ down late (e.g. 0.3 → 0.1); `shape: step` is a hard step-down applied exactly AT the breakpoint; token-keyed schedules are robust to T-bumps and are reachability-checked at boot against the run's estimated total tokens. Incompatible with `gdn_enabled` and `auxiliary_heads` (fatal). Headline `ls:`/val stay pure t+1 CE; the MTP CE logs separately as `mtp=`.
+- **`doc_boundary_mask`** (bool, default `false`): exclude MTP rows whose 2-token window crosses a document boundary (`targets[i] == BOS` — the row would predict the NEXT doc's first content token from prev-doc state). Deliberately NOT in the resume guard — it is a loss-SHAPING knob (λ-schedule family), sanctioned to flip ON mid-run at a checkpoint boundary; the resume path logs an advisory line and the `[mtp]` boot banner prints the flag state. Expect a small instant DOWN-step in the `mtp:` channel at the flip (the hardest rows leave the mean); headline metrics don't move. Setting it (alone) also triggers the `[bos-check]` tokenizer adoption.
+- **What it does / adoption verdict:** −13.3 mnats vs SWA control at matched steps, <1% step cost, and the t+2 head doubles as a free self-speculative-decoding drafter at inference. Adopted for wizard101; `doc_boundary_mask` ON from the step-9750 resume (2026-07-13).
+- **Example:** (wizard101.yaml)
+  ```yaml
+  mtp:
+    enabled: true
+    loss_weight: 0.3
+    loss_weight_schedule:
+      key: tokens
+      shape: step
+      points: [[0, 0.3], [512_000_000_000, 0.1]]
+    doc_boundary_mask: true
+  ```

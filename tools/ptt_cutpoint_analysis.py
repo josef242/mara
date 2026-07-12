@@ -1,10 +1,13 @@
 """
 Statistical analysis of Progressive Tail Truncation cut-point distributions.
 
-Usage: python test_ptt.py
+Usage: python tools/ptt_cutpoint_analysis.py   (from the repo root)
+(Formerly root-level test_ptt.py; its one real test lives on, asserting, in
+tests/test_tail_truncation.py.)
 """
+import os
 import sys
-sys.path.insert(0, '../common_fsdp2')
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'common_fsdp2'))
 
 from tail_truncation import ProgressiveTailTruncation
 
